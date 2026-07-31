@@ -76,6 +76,9 @@ int main(int argc, char** argv) {
     serialController.setTouchCallback([&audioEngine](int pad, bool pressed) {
         audioEngine.handleTouch(pad, pressed);
     });
+    serialController.setModeCallback([&audioEngine](bool descriptive) {
+        audioEngine.handleModeChange(descriptive);
+    });
 
     std::cout << std::endl;
 
@@ -102,12 +105,11 @@ int main(int argc, char** argv) {
     while (guiManager.isRunning()) {
         audioEngine.processMidiMessages();   // Poll for MIDI input
 
-        // Poll serial multiple times to reduce latency (GUI runs at ~60Hz = 16ms)
-        // Reading 4x per frame gives ~4ms effective latency
-        for (int i = 0; i < 4; i++) {
-            serialController.processMessages();
-        }
+        // Serial is drained by SerialController's own reader thread now;
+        // processMessages() is a no-op stub kept for source compatibility.
+        serialController.processMessages();
 
+        audioEngine.updateController();      // LEDs, scrub-then-resume timer
         guiManager.processFrame();
     }
 

@@ -38,6 +38,10 @@ struct VelocityCurve {
 // Callback types for events from the Teensy
 using EncoderCallback = std::function<void(int encoder, long delta, float rpm, float velocityMultiplier)>;
 using TouchCallback = std::function<void(int pad, bool pressed)>;
+// Fires when the firmware announces its display mode: descriptive == true
+// means the DAW should respond to user inputs; false = diagnostic mode
+// where the DAW must ignore all touch/encoder events.
+using ModeCallback = std::function<void(bool descriptive)>;
 
 class SerialController {
 public:
@@ -59,6 +63,7 @@ public:
     // Set callbacks for events
     void setEncoderCallback(EncoderCallback cb) { m_encoderCallback = cb; }
     void setTouchCallback(TouchCallback cb) { m_touchCallback = cb; }
+    void setModeCallback(ModeCallback cb) { m_modeCallback = cb; }
 
     // Test page state (read by GUI)
     bool isTouched(int pad) const { return (pad >= 0 && pad < 36) ? m_touchState[pad] : false; }
@@ -90,6 +95,7 @@ private:
     // Callbacks
     EncoderCallback m_encoderCallback;
     TouchCallback m_touchCallback;
+    ModeCallback m_modeCallback;
 
     // Touch state (for test page display)
     bool m_touchState[36] = {};

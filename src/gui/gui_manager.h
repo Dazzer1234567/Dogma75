@@ -65,6 +65,15 @@ private:
 
     // Waveform scroll mode
     bool m_waveformScrolling;
+    // When m_waveformScrolling is off, this controls whether the view still
+    // auto-pages (jumps to keep the playhead on screen) or stays put and lets
+    // the playhead drift off the right edge.
+    bool m_waveformAutoPage;
+    // Zoom-anchor stickiness: once a zoom operation decides whether to pin
+    // the playhead or the view centre, it stays with that choice until the
+    // user reverses direction.
+    int  m_lastZoomDirection = 0;      // +1 zoom-in, -1 zoom-out, 0 = fresh
+    bool m_zoomAnchorPinPlayhead = true;
 
     // Waveform vertical zoom (amplitude scaling) and track height
     float m_waveformVerticalZoom;  // 1.0 = normal, 2.0 = 2x amplitude

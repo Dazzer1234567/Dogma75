@@ -124,6 +124,7 @@ public:
         if (markerIndex >= 0 && markerIndex < 4) {
             m_markerPositions[markerIndex] = position;
             m_markerEnabled[markerIndex] = true;
+            m_markerEverSet[markerIndex] = true;
         }
     }
     size_t getMarkerPosition(int markerIndex) const {
@@ -132,8 +133,22 @@ public:
     bool isMarkerEnabled(int markerIndex) const {
         return (markerIndex >= 0 && markerIndex < 4) ? m_markerEnabled[markerIndex] : false;
     }
+    bool markerEverSet(int markerIndex) const {
+        return (markerIndex >= 0 && markerIndex < 4) ? m_markerEverSet[markerIndex] : false;
+    }
     void clearMarker(int markerIndex) {
         if (markerIndex >= 0 && markerIndex < 4) m_markerEnabled[markerIndex] = false;
+    }
+    // Enable a marker: if it's never been placed, position it at the given
+    // fraction of the current viewport; otherwise restore the preserved
+    // position saved before it was last cleared.
+    void enableMarkerAtDefault(int markerIndex, double fractionFromLeft);
+
+    // GUI pushes the current viewport range each frame so the reader thread
+    // can compute first-time marker positions relative to what's on screen.
+    void setViewportRange(size_t startFrame, size_t visibleFrames) {
+        m_viewStartFrame.store(startFrame);
+        m_viewVisibleFrames.store(visibleFrames);
     }
 
     // Serial controller reference (set by main.cpp)
@@ -143,6 +158,15 @@ public:
     // Called by SerialController callbacks (via main.cpp wiring)
     void handleEncoderDelta(int encoder, long delta, float rpm, float velocityMultiplier);
     void handleTouch(int pad, bool pressed);
+    // Firmware tells us its display mode. In diagnostic mode we ignore all
+    // touch/encoder inputs so the controller does not affect DAW state —
+    // it's purely for the user to identify which button is which.
+    void handleModeChange(bool descriptive);
+
+    // Called from the main loop each frame. Mirrors internal state onto
+    // the controller's LEDs (play LED, orange encoder-enable LED) and
+    // handles the scrub-then-resume timer.
+    void updateController();
 
 private:
     // MIDI helper methods (extracted from processMidiMessages)
@@ -198,6 +222,13 @@ private:
     // Markers
     size_t m_markerPositions[4];
     bool m_markerEnabled[4];
+    bool m_markerEverSet[4] = {false, false, false, false};
+
+    // Current viewport snapshot (pushed by GUI each frame via
+    // setViewportRange). Used to compute first-time default marker positions
+    // as a fraction of what's on screen.
+    std::atomic<size_t> m_viewStartFrame{0};
+    std::atomic<size_t> m_viewVisibleFrames{0};
 
     // Encoder velocity tracking (for MIDI park encoders)
     double m_lastEncoderTime[4];
@@ -221,6 +252,102 @@ private:
 
     // View scroll request (consumed by GUI each frame)
     std::atomic<long> m_viewScrollDelta;
+
+    // Cached LED-3 (play) state. Compared against live isPlaying() in
+    // updateController() so we only send corrections when the firmware's
+    // predictive toggle diverges from what the DAW knows to be true.
+    // Starts at -1 (unknown) so the first tick after DAW startup always
+    // force-syncs the LED to actual play state — needed because the user
+    // can toggle LED 3 locally on the controller while the DAW is down.
+    int m_lastPlayLedState = -1;
+
+    // Loop-left mode (pad 20 / LED 4). When enabled AND marker 0 is set,
+    // pressing play jumps to marker 0 before starting playback.
+    std::atomic<bool> m_loopLeftEnabled{false};
+    int m_lastLoopLeftLedState = -1;  // same -1 startup-sync trick as LED 3
+
+    // The other three mode toggles. Their LEDs mirror DAW state the same way
+    // as loop-left; behavior is TBD (specify what each mode should do when
+    // enabled and we'll wire it in the same place as loop-left's jump-to-marker).
+    std::atomic<bool> m_recordLeftEnabled{false};    // pad 21 / LED 5 (marker 1)
+    std::atomic<bool> m_recordRightEnabled{false};   // pad 22 / LED 6 (marker 2)
+    std::atomic<bool> m_loopRightEnabled{false};     // pad 23 / LED 7 (marker 3)
+    int m_lastRecordLeftLedState  = -1;
+    int m_lastRecordRightLedState = -1;
+    int m_lastLoopRightLedState   = -1;
+
+    // Clear-markers mode. Firmware runs a continuous fade-flash on LEDs
+    // 3/4/5/6/7 while this is true; pad presses re-route to marker clearing
+    // instead of the normal toggles. Entered by modifier + play (pad 26 held
+    // + pad 19 pressed), exited by tapping pad 26 again.
+    std::atomic<bool> m_clearMode{false};
+
+    // Pad 24 pan-modifier. While held, E2 pans the timeline instead of
+    // zooming. Firmware lights LED 8 directly on press/release.
+    std::atomic<bool> m_panModifierHeld{false};
+
+    // Pad 3 held state — combines with pad 23 to toggle the OLED display
+    // mode on the controller (firmware also tracks this locally). While
+    // pad 3 is down, a pad 23 press does NOT toggle loop-right on the DAW
+    // side either — it's consumed by the display-mode toggle.
+    std::atomic<bool> m_pad3Held{false};
+
+    // Pad 14 / pad 15 held state. Combined with pad 19 (play) to set the
+    // on-stop-return-to-start flag: 14+19 turns it ON, 15+19 turns it OFF.
+    // These are absolute set commands, not toggles.
+    std::atomic<bool> m_pad14Held{false};
+    std::atomic<bool> m_pad15Held{false};
+
+    // When true, stopping playback (for any reason) returns the playhead to
+    // wherever it was when play() started. Captured in play() as
+    // m_playStartPosition and applied in updateController() on the play->
+    // stop transition.
+    std::atomic<bool>   m_returnToStartOnStop{false};
+    std::atomic<size_t> m_playStartPosition{0};
+    bool                m_wasPlayingLastTick = false;
+
+    // Timed OLED revert. Set to a future steady-clock ms count when a
+    // firmware-controlled banner (e.g. display-mode switch) needs to auto-
+    // revert to the current playback state after some delay. 0 = no revert
+    // pending. Checked every updateController() tick.
+    std::atomic<int64_t> m_oledRevertAtMs{0};
+
+    // Firmware-announced display mode. When true, DAW ignores every
+    // touch/encoder input — the controller is being used purely as a
+    // button-name identifier and must not affect DAW state. Defaults to
+    // true because the firmware boots in diagnostic mode; a MODE:DESC
+    // message flips it to false as soon as the DAW connects.
+    std::atomic<bool> m_diagnosticMode{true};
+
+    // One-shot: push the initial playback state ("STOPPED") to the OLED
+    // once, as soon as the DAW is fully up. Firmware silently ignores this
+    // in diagnostic mode (its own DIAG header remains), so it only affects
+    // the descriptive-mode display.
+    bool m_startupOledPushed = false;
+
+    // Push "PLAYING" / "STOPPED" onto the OLED (both display modes) via
+    // DISPFORCE so the revert works regardless of diag/desc setting.
+    void pushPlaybackStateToOled();
+
+public:
+    // Push a full two-line OLED state. Either line can be an empty string /
+    // single space to blank it. Sends both lines so the screen never carries
+    // a stale mixed message from a previous event. Truncated to 21 chars
+    // per line by the firmware. Silently drops if there's no serial link.
+    void oledShow(const char* line1, const char* line2);
+    // Same, but held on screen for ~3 s in descriptive mode (ignored in
+    // diagnostic mode). Any subsequent touch/encoder activity clears the
+    // hold immediately.
+    void oledShowHold(const char* line1, const char* line2);
+    // Force-write both lines regardless of display mode. For interactive
+    // modes where the OLED is a live status board (e.g. clear-markers).
+    void oledShowForce(const char* line1, const char* line2);
+
+    // Scrub-then-resume: E1 movement while playing pauses playback and
+    // arms a resume that fires 100 ms after the last movement.
+    std::atomic<bool> m_scrubResumePending{false};
+    std::atomic<double> m_lastScrubMoveTime{0.0};  // steady_clock seconds
+    static constexpr double SCRUB_RESUME_DELAY_S = 0.100;
 
     // Serial controller (owned by main, not by us)
     SerialController* m_serialController;

@@ -83,10 +83,14 @@ bool mpr121Init(uint8_t addr) {
     mpr121WriteRegister(addr, 0x80, 0x63);
     delay(10);
 
-    // Set touch/release thresholds for all 12 electrodes
+    // Set touch/release thresholds for all 12 electrodes. Lowered from 12/6
+    // so that marginal side-touches still register when the modifier pad is
+    // being held (holding another pad shifts the whole-chip baseline and cuts
+    // the effective delta at other pads). If this causes false triggers, back
+    // off toward 8/4.
     for (uint8_t i = 0; i < 12; i++) {
-        mpr121WriteRegister(addr, 0x41 + i * 2, 12);  // Touch threshold
-        mpr121WriteRegister(addr, 0x42 + i * 2, 6);   // Release threshold
+        mpr121WriteRegister(addr, 0x41 + i * 2, 6);   // Touch threshold
+        mpr121WriteRegister(addr, 0x42 + i * 2, 3);   // Release threshold
     }
 
     // MHD, NHD, NCL, FDL - filtering
@@ -294,54 +298,82 @@ char oledLine2[22] = "";
 bool oledLine1Changed = false;
 bool oledLine2Changed = false;
 
-// Single-pass line renderer: clears + draws in one go with large I2C chunks
-void oledDrawLine(uint8_t row, const char* text) {
-    int len = strlen(text);
-    if (len > 21) len = 21;
-    uint8_t startCol = (128 - len * 6) / 2;
-    uint8_t endCol = startCol + len * 6;
+// --- Non-blocking OLED renderer ---
+// A full line render is 32 I2C chunks of 64 bytes each. At 400 kHz that's
+// ~1.6 ms per chunk => ~50 ms if done in one call, which starved serial and
+// touch handling and made LED commands feel laggy and variable. The renderer
+// below emits ONE chunk per oledStep() call, so the main loop always stays
+// responsive to incoming serial commands within ~1.6 ms of any chunk boundary.
+uint8_t oledDrawing = 0;      // 0=idle, 1=line1, 2=line2
+uint8_t oledDrawStep = 0;     // 0..31
+char    oledRenderBuf[22];    // snapshot so mid-render text updates don't tear
+uint8_t oledRenderRow = 0;    // top physical row of the line being drawn
+uint8_t oledRenderLen = 0;
+uint8_t oledRenderStart = 0;
+uint8_t oledRenderEnd = 0;
 
-    oledSetWindow(0x00, 0x7F, row, row + 15);
+void oledStep() {
+    if (!oledFound) return;
 
-    for (int fontRow = 0; fontRow < 8; fontRow++) {
-        for (int dup = 0; dup < 2; dup++) {  // vertical 2x
-            // Stream full 128-column row in 2 chunks of 64
-            for (int chunk = 0; chunk < 128; chunk += 64) {
-                Wire2.beginTransmission(OLED_ADDR);
-                Wire2.write(0x40);
-                for (int i = 0; i < 64; i++) {
-                    uint8_t col = chunk + i;
-                    if (col >= startCol && col < endCol) {
-                        int ci = (col - startCol) / 6;
-                        int pi = (col - startCol) % 6;
-                        if (pi < 5 && ci < len) {
-                            char c = text[ci];
-                            if (c >= 'a' && c <= 'z') c -= 32;
-                            if (c < 32 || c > 90) c = 32;
-                            uint8_t on = (font5x7[c - 32][pi] >> fontRow) & 1 ? 0xF : 0;
-                            Wire2.write((on << 4) | on);
-                        } else {
-                            Wire2.write(0x00);
-                        }
-                    } else {
-                        Wire2.write(0x00);
-                    }
-                }
-                Wire2.endTransmission();
+    // Idle: latch new work if a line is dirty.
+    if (oledDrawing == 0) {
+        const char* src = nullptr;
+        if (oledLine1Changed) {
+            oledLine1Changed = false;
+            oledDrawing = 1;
+            oledRenderRow = 8;
+            src = oledLine1;
+        } else if (oledLine2Changed) {
+            oledLine2Changed = false;
+            oledDrawing = 2;
+            oledRenderRow = 40;
+            src = oledLine2;
+        } else {
+            return;
+        }
+        strncpy(oledRenderBuf, src, sizeof(oledRenderBuf) - 1);
+        oledRenderBuf[sizeof(oledRenderBuf) - 1] = '\0';
+        oledRenderLen = strlen(oledRenderBuf);
+        if (oledRenderLen > 21) oledRenderLen = 21;
+        oledRenderStart = (128 - oledRenderLen * 6) / 2;
+        oledRenderEnd = oledRenderStart + oledRenderLen * 6;
+        oledDrawStep = 0;
+        oledSetWindow(0x00, 0x7F, oledRenderRow, oledRenderRow + 15);
+    }
+
+    // Emit one 64-byte chunk. Step encodes (fontRow, dup, chunkHalf):
+    //   fontRow = step / 4   dup = (step/2) % 2   chunkHalf = step % 2
+    // Only fontRow matters for the pixel calculation; the OLED's column
+    // auto-increment consumes the bytes into the right position in the
+    // pre-set window.
+    int fontRow = oledDrawStep / 4;
+    int chunkOffset = (oledDrawStep % 2) * 64;
+
+    Wire2.beginTransmission(OLED_ADDR);
+    Wire2.write(0x40);
+    for (int i = 0; i < 64; i++) {
+        uint8_t col = chunkOffset + i;
+        if (col >= oledRenderStart && col < oledRenderEnd) {
+            int ci = (col - oledRenderStart) / 6;
+            int pi = (col - oledRenderStart) % 6;
+            if (pi < 5 && ci < oledRenderLen) {
+                char c = oledRenderBuf[ci];
+                if (c >= 'a' && c <= 'z') c -= 32;
+                if (c < 32 || c > 90) c = 32;
+                uint8_t on = (font5x7[c - 32][pi] >> fontRow) & 1 ? 0xF : 0;
+                Wire2.write((on << 4) | on);
+            } else {
+                Wire2.write(0x00);
             }
+        } else {
+            Wire2.write(0x00);
         }
     }
-}
+    Wire2.endTransmission();
 
-void oledUpdateDisplay() {
-    if (!oledFound) return;
-    if (oledLine1Changed) {
-        oledLine1Changed = false;
-        oledDrawLine(8, oledLine1);
-    }
-    if (oledLine2Changed) {
-        oledLine2Changed = false;
-        oledDrawLine(40, oledLine2);
+    oledDrawStep++;
+    if (oledDrawStep >= 32) {
+        oledDrawing = 0;  // finished; next call will latch new work if pending
     }
 }
 
@@ -368,6 +400,148 @@ bool pca9685Init() {
     // completely.
     pca9685WriteRegister(0x01, 0x00);
     return true;
+}
+
+// Forward declaration so ledSet() and flashStep() can call it before the
+// definition further down.
+void pca9685SetPWM(uint8_t channel, uint16_t value);
+
+// Convenience wrapper: LED ON/OFF for open-drain wiring (PWM=0 sinks, 4095 = high-Z).
+inline void ledSet(uint8_t channel, bool on) {
+    pca9685SetPWM(channel, on ? 0 : 4095);
+}
+
+// ---- Local UI state owned by the firmware ----
+// These give the controller instant LED response without a USB round-trip to
+// the DAW. The DAW can still override any LED via LED:N:ON/OFF, and the
+// mirror below is kept in sync when it does so.
+// pad 24 is a momentary pan-modifier now: LED 8 lights only while it's held.
+// No persistent state to track locally beyond the LED itself.
+bool playLedLocal     = false; // pad 19 -> LED 3. Just predictive; DAW is authoritative.
+bool loopLeftLocal    = false; // pad 20 -> LED 4. Just predictive; DAW is authoritative.
+bool recordLeftLocal  = false; // pad 21 -> LED 5. Just predictive; DAW is authoritative.
+bool recordRightLocal = false; // pad 22 -> LED 6. Just predictive; DAW is authoritative.
+bool loopRightLocal   = false; // pad 23 -> LED 7. Just predictive; DAW is authoritative.
+bool modifierHeld     = false; // pad 26. Also tracked DAW-side; we mirror here to
+                               // decide whether pad 19 should flash-reject instead
+                               // of toggling the play LED.
+
+// OLED display mode. In diagnostic mode (default) the firmware writes raw
+// "BUTTON N ON" / "ENCODER N: delta" lines on every touch/encoder event. In
+// descriptive mode the firmware stops auto-updating the OLED and only shows
+// text the DAW pushes via DISP:1:text / DISP:2:text. Toggle with pad 3 held
+// + pad 23 pressed.
+bool     displayMode     = false; // false = diagnostic, true = descriptive
+bool     pad3Held        = false;
+// Held-state trackers for the "on-stop behaviour" combos. Pad 14 + play sets
+// return-to-start-on-stop; pad 15 + play sets keep-position-on-stop. While
+// either is held, a pad 19 press does NOT toggle LED 3 — the press is
+// consumed by the DAW as a mode command.
+bool     pad14Held       = false;
+bool     pad15Held       = false;
+// OLED write-lock. Two flavours:
+//   HARD (isSoft = false): mode-switch banner; blocks everything for its
+//                          duration regardless of user activity.
+//   SOFT (isSoft = true):  DISPHOLD text from the DAW; blocks other writes,
+//                          but any touch/encoder event on the controller
+//                          clears the lock so the next event's feedback can
+//                          appear immediately.
+uint32_t oledLockUntilMs = 0;
+bool     oledLockIsSoft  = false;
+
+// Clear-markers mode. Entered by holding pad 26 (modifier) and pressing pad
+// 19 (play). Continuously fade-flashes the play LED plus the four
+// loop/record LEDs at 2 Hz. Clicking either loop LED (pads 20/23) clears both
+// loop markers and stops the loop pair flashing; clicking either record LED
+// (pads 21/22) does the same for the record pair. Tapping pad 26 again exits.
+static const uint32_t FLASH_PERIOD_MS = 500;   // 2 Hz
+static const uint32_t FLASH_TICK_MS   = 20;    // 50 Hz PWM refresh
+bool     flashMode          = false;
+uint32_t flashStartMs       = 0;               // reference for phase calc
+uint32_t flashLastUpdateMs  = 0;
+
+// Called once per loop() while flashMode is active. Emits at most one PCA9685
+// write batch every FLASH_TICK_MS so the fade stays smooth without hogging I2C.
+void flashStep() {
+    if (!flashMode) return;
+    uint32_t nowMs = millis();
+    if (nowMs - flashLastUpdateMs < FLASH_TICK_MS) return;
+    flashLastUpdateMs = nowMs;
+
+    // Triangle wave: brightness ramps 0 -> 1 over the first half of each
+    // period, then 1 -> 0 over the second half.
+    uint32_t elapsed = nowMs - flashStartMs;
+    uint32_t phase = elapsed % FLASH_PERIOD_MS;
+    uint32_t halfPeriod = FLASH_PERIOD_MS / 2;
+    uint32_t brightness;  // 0..4095
+    if (phase < halfPeriod) {
+        brightness = (phase * 4095UL) / halfPeriod;
+    } else {
+        brightness = ((FLASH_PERIOD_MS - phase) * 4095UL) / halfPeriod;
+    }
+    // Our wiring: PWM=0 => fully on, PWM=4095 => off. Invert.
+    uint16_t pwm = (uint16_t)(4095 - brightness);
+
+    // Play LED: always flashes while clear-markers mode is active — it is
+    // the mode indicator.
+    pca9685SetPWM(3, pwm);
+    // Loop / record pair LEDs: solid on when their pair is ON, flashing
+    // when OFF, so the user can toggle a pair off and still see the LED
+    // (and toggle again to bring it back).
+    pca9685SetPWM(4, loopLeftLocal    ? 0 : pwm);
+    pca9685SetPWM(7, loopRightLocal   ? 0 : pwm);
+    pca9685SetPWM(5, recordLeftLocal  ? 0 : pwm);
+    pca9685SetPWM(6, recordRightLocal ? 0 : pwm);
+}
+
+// Apply a display-mode change (from either the pad 3+pad 23 combo or a
+// DAW-side SETMODE command). Idempotent: safe to call with the same value
+// we're already in — it re-writes the header, announces to the DAW, and
+// resets held-state trackers.
+void setDisplayMode(bool desc) {
+    displayMode = desc;
+    snprintf(oledLine1, sizeof(oledLine1),
+             displayMode ? "DISPLAY DESCRIPTIVE" : "DISPLAY DIAGNOSTIC");
+    snprintf(oledLine2, sizeof(oledLine2), " ");
+    oledLine1Changed = true;
+    oledLine2Changed = true;
+    oledLockUntilMs  = 0;
+    oledLockIsSoft   = false;
+    Serial.println(displayMode ? "MODE:DESC" : "MODE:DIAG");
+    modifierHeld = false;
+    pad14Held    = false;
+    pad15Held    = false;
+}
+
+void enterFlashMode() {
+    flashMode         = true;
+    flashStartMs      = millis();
+    flashLastUpdateMs = 0;
+    // Consume the modifier — a subsequent release of pad 26 shouldn't matter.
+    modifierHeld      = false;
+}
+
+void exitFlashMode() {
+    flashMode = false;
+    // Restore all flash-affected LEDs to whatever local mirrors say they
+    // should be. The DAW will re-assert via LED:N commands next tick if any
+    // of these disagree with its authoritative state.
+    ledSet(3, playLedLocal);
+    ledSet(4, loopLeftLocal);
+    ledSet(5, recordLeftLocal);
+    ledSet(6, recordRightLocal);
+    ledSet(7, loopRightLocal);
+    // Show "EXIT" for 2 s in DESCRIPTIVE mode only — diagnostic mode is a
+    // pure button/encoder-name display and shouldn't get status banners.
+    // The DAW schedules a playback-state push for after this lock expires.
+    if (displayMode) {
+        snprintf(oledLine1, sizeof(oledLine1), "EXIT");
+        snprintf(oledLine2, sizeof(oledLine2), " ");
+        oledLine1Changed = true;
+        oledLine2Changed = true;
+        oledLockUntilMs  = millis() + 2000;
+        oledLockIsSoft   = false;
+    }
 }
 
 void pca9685SetPWM(uint8_t channel, uint16_t value) {
@@ -441,11 +615,13 @@ void setup() {
         oledFound = true;
         Serial.println("SSD1362 OLED initialized!");
         oledFill(0x00);  // clear screen
-        snprintf(oledLine1, sizeof(oledLine1), "DOGMA75");
+        // Default is diagnostic mode — line 1 is the persistent mode header,
+        // line 2 shows the last button/encoder event.
+        snprintf(oledLine1, sizeof(oledLine1), "DISPLAY DIAGNOSTIC");
         snprintf(oledLine2, sizeof(oledLine2), "READY");
         oledLine1Changed = true;
         oledLine2Changed = true;
-        oledUpdateDisplay();
+        // Actual rendering happens incrementally from loop() via oledStep().
         Serial.println("OLED initialized and ready");
     } else {
         Serial.println("SSD1362 OLED NOT found");
@@ -491,6 +667,14 @@ void setup() {
             delay(30);
         }
         pca9685SetPWM(0, 4095); // off
+        // Push initial local UI LED states. LED 8 (pad-24 pan modifier) is
+        // off until the user physically holds the button.
+        ledSet(8, false);
+        ledSet(3, playLedLocal);
+        ledSet(4, loopLeftLocal);
+        ledSet(5, recordLeftLocal);
+        ledSet(6, recordRightLocal);
+        ledSet(7, loopRightLocal);
         Serial.println("LED test done");
     } else {
         Serial.println("PCA9685 NOT found");
@@ -501,6 +685,8 @@ void setup() {
     Serial.print("6 Encoders + ");
     Serial.print(mpr121Count);
     Serial.println("x MPR121 Touch + PCA9685 LEDs");
+    // Announce initial display mode so the DAW knows to ignore inputs.
+    Serial.println(displayMode ? "MODE:DESC" : "MODE:DIAG");
 }
 
 // Serial command buffer for receiving from DAW
@@ -546,6 +732,77 @@ void processSerialCommands() {
             else if (serialInputBuffer == "OLED:OFF") {
                 if (oledFound) { oledFill(0x00); Serial.println("OLED cleared"); }
             }
+            // DAW-initiated display-mode switch. Idempotent — DAW uses this
+            // on startup to force a known-good state regardless of what mode
+            // the controller was in from a previous session.
+            else if (serialInputBuffer == "SETMODE:DIAG") {
+                setDisplayMode(false);
+            }
+            else if (serialInputBuffer == "SETMODE:DESC") {
+                setDisplayMode(true);
+            }
+            // DISP:1:text / DISP:2:text — DAW-pushed OLED line text. Only
+            // takes effect in DESCRIPTIVE mode (diagnostic mode shows raw
+            // button numbers only, uniformly for every pad). Also blocked by
+            // an active mode-message lock.
+            else if (serialInputBuffer.startsWith("DISP:1:") || serialInputBuffer.startsWith("DISP:2:")) {
+                if (displayMode && millis() >= oledLockUntilMs) {
+                    int line = serialInputBuffer.charAt(5) - '0';
+                    String text = serialInputBuffer.substring(7);
+                    if (line == 1) {
+                        strncpy(oledLine1, text.c_str(), sizeof(oledLine1) - 1);
+                        oledLine1[sizeof(oledLine1) - 1] = '\0';
+                        oledLine1Changed = true;
+                    } else if (line == 2) {
+                        strncpy(oledLine2, text.c_str(), sizeof(oledLine2) - 1);
+                        oledLine2[sizeof(oledLine2) - 1] = '\0';
+                        oledLine2Changed = true;
+                    }
+                }
+            }
+            // DISPFORCE:1:text / DISPFORCE:2:text — DAW-pushed OLED text
+            // used for live status readouts (e.g. clear-markers mode). Still
+            // gated on DESCRIPTIVE mode: diagnostic mode is intentionally
+            // pure — only button/encoder names appear there, nothing from
+            // the DAW.
+            else if (serialInputBuffer.startsWith("DISPFORCE:1:") || serialInputBuffer.startsWith("DISPFORCE:2:")) {
+                if (displayMode && millis() >= oledLockUntilMs) {
+                    int line = serialInputBuffer.charAt(10) - '0';
+                    String text = serialInputBuffer.substring(12);
+                    if (line == 1) {
+                        strncpy(oledLine1, text.c_str(), sizeof(oledLine1) - 1);
+                        oledLine1[sizeof(oledLine1) - 1] = '\0';
+                        oledLine1Changed = true;
+                    } else if (line == 2) {
+                        strncpy(oledLine2, text.c_str(), sizeof(oledLine2) - 1);
+                        oledLine2[sizeof(oledLine2) - 1] = '\0';
+                        oledLine2Changed = true;
+                    }
+                }
+            }
+            // DISPHOLD:1:text / DISPHOLD:2:text — verbose text held on screen
+            // for 3 s (a "soft" lock). Only takes effect in descriptive mode;
+            // ignored in diagnostic mode so the button-event auto-updates
+            // still get through. Any subsequent touch or encoder activity on
+            // the controller clears the soft lock so the next event's
+            // feedback appears immediately.
+            else if (serialInputBuffer.startsWith("DISPHOLD:1:") || serialInputBuffer.startsWith("DISPHOLD:2:")) {
+                if (displayMode) {
+                    int line = serialInputBuffer.charAt(9) - '0';
+                    String text = serialInputBuffer.substring(11);
+                    if (line == 1) {
+                        strncpy(oledLine1, text.c_str(), sizeof(oledLine1) - 1);
+                        oledLine1[sizeof(oledLine1) - 1] = '\0';
+                        oledLine1Changed = true;
+                    } else if (line == 2) {
+                        strncpy(oledLine2, text.c_str(), sizeof(oledLine2) - 1);
+                        oledLine2[sizeof(oledLine2) - 1] = '\0';
+                        oledLine2Changed = true;
+                    }
+                    oledLockUntilMs = millis() + 3000;
+                    oledLockIsSoft  = true;
+                }
+            }
             // Parse LED commands: "LED:channel:ON" or "LED:channel:OFF"
             else if (serialInputBuffer.startsWith("LED:")) {
                 int firstColon = 3;  // position of first ':'
@@ -554,10 +811,18 @@ void processSerialCommands() {
                     int channel = serialInputBuffer.substring(firstColon + 1, secondColon).toInt();
                     String state = serialInputBuffer.substring(secondColon + 1);
                     if (pca9685Found && channel >= 0 && channel < 16) {
-                        if (state == "ON") {
-                            pca9685SetPWM(channel, 0);     // active-LOW: 0 = on
-                        } else if (state == "OFF") {
-                            pca9685SetPWM(channel, 4095);  // active-LOW: 4095 = off
+                        bool on = (state == "ON");
+                        if (on || state == "OFF") {
+                            pca9685SetPWM(channel, on ? 0 : 4095);
+                            // Keep local mirrors in sync so the next local
+                            // toggle starts from the state the DAW just set.
+                            if (channel == 3) playLedLocal     = on;
+                            if (channel == 4) loopLeftLocal    = on;
+                            if (channel == 5) recordLeftLocal  = on;
+                            if (channel == 6) recordRightLocal = on;
+                            if (channel == 7) loopRightLocal   = on;
+                            // channel 8: no state — pad 24 is a momentary modifier
+                            // and the firmware drives LED 8 directly on press/release.
                         }
                     }
                 }
@@ -586,18 +851,29 @@ void loop() {
             pendingDelta[i] += (pos - lastPosition[i]);
             lastPosition[i] = pos;
         }
-        // Send accumulated delta every 10ms (filters out ±1 oscillations)
+        // Send accumulated delta every 10ms (filters out ±1 oscillations).
         if (pendingDelta[i] != 0 && (nowMicros - lastSendTime[i]) >= 10000) {
+            // Any encoder activity releases a soft OLED lock so the next
+            // event can display its feedback immediately.
+            if (oledLockIsSoft && millis() < oledLockUntilMs) {
+                oledLockUntilMs = 0;
+                oledLockIsSoft  = false;
+            }
             Serial.print("E");
             Serial.print(i + 1);
             Serial.print(":");
             Serial.println(pendingDelta[i]);
-            // Update OLED
-            snprintf(oledLine1, sizeof(oledLine1), "ENCODER %d: %+ld", i + 1, pendingDelta[i]);
-            oledLine1Changed = true;
+            // Auto-update OLED only in diagnostic mode + no active mode-lock.
+            // Diagnostic mode's line 1 is a persistent header ("DISPLAY
+            // DIAGNOSTIC"); only line 2 gets updated with the latest
+            // button or encoder event.
+            if (!displayMode && millis() >= oledLockUntilMs) {
+                snprintf(oledLine2, sizeof(oledLine2), "ENCODER %d: %+ld", i + 1, pendingDelta[i]);
+                oledLine2Changed = true;
+            }
+            digitalWrite(LED_BUILTIN, HIGH);
             pendingDelta[i] = 0;
             lastSendTime[i] = nowMicros;
-            digitalWrite(LED_BUILTIN, HIGH);
         }
     }
     digitalWrite(LED_BUILTIN, LOW);
@@ -612,27 +888,110 @@ void loop() {
                 bool was = lastTouchState[chip] & (1 << i);
                 int touchNum = chip * 12 + i;  // 0-11, 12-23, 24-35
                 if (now && !was) {
-                    Serial.print("TOUCH:");
-                    Serial.println(touchNum);
-                    snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d ON", touchNum);
-                    oledLine2Changed = true;
+                    // Any touch press releases a soft OLED lock so the next
+                    // action's feedback appears immediately.
+                    if (oledLockIsSoft && millis() < oledLockUntilMs) {
+                        oledLockUntilMs = 0;
+                        oledLockIsSoft  = false;
+                    }
+                    bool suppressTouchSend = false;
+                    // Local UI reactions: predictive LED toggles so the user
+                    // sees the response instantly, before the DAW even sees
+                    // the touch event.
+                    if (flashMode) {
+                        // Clear/restore-markers mode: only certain pads act.
+                        // Loop and record pair clicks toggle their pair on/off.
+                        // flashStep() re-renders LEDs every tick based on the
+                        // local mirrors, so no LED writes are needed here —
+                        // the change is picked up within ~20 ms.
+                        if (touchNum == 26) {
+                            exitFlashMode();
+                        } else if (touchNum == 20 || touchNum == 23) {
+                            bool newState = !loopLeftLocal;
+                            loopLeftLocal  = newState;
+                            loopRightLocal = newState;
+                        } else if (touchNum == 21 || touchNum == 22) {
+                            bool newState = !recordLeftLocal;
+                            recordLeftLocal  = newState;
+                            recordRightLocal = newState;
+                        }
+                        // Other pads ignored while in flash mode.
+                    } else {
+                        // Normal mode.
+                        if (touchNum == 3) {
+                            pad3Held = true;
+                        } else if (touchNum == 14) {
+                            pad14Held = true;
+                        } else if (touchNum == 15) {
+                            pad15Held = true;
+                        } else if (touchNum == 23 && pad3Held) {
+                            // Display-mode toggle via helper (same code path
+                            // as the DAW's SETMODE command).
+                            setDisplayMode(!displayMode);
+                            // Don't tell the DAW about this pad 23 press:
+                            // it's consumed by the mode switch, and forwarding
+                            // it would cause a spurious loop-right jump on
+                            // the newly-active descriptive side.
+                            suppressTouchSend = true;
+                        } else if (touchNum == 26) {
+                            modifierHeld = true;
+                        } else if (touchNum == 24) {
+                            // Momentary pan-modifier: light LED 8 while held.
+                            ledSet(8, true);
+                        } else if (touchNum == 19) {
+                            if (modifierHeld) {
+                                // Modifier + play => enter clear-markers mode.
+                                enterFlashMode();
+                            } else if (pad14Held || pad15Held) {
+                                // Mode-setting combo (return-on-stop). DAW
+                                // handles it; leave LED 3 alone.
+                            } else {
+                                playLedLocal = !playLedLocal;
+                                ledSet(3, playLedLocal);
+                            }
+                        }
+                        // Pads 20-23 in normal mode: no local action. Pressing
+                        // them is now a "jump playhead to marker" trigger
+                        // handled by the DAW — LEDs 4/5/6/7 reflect marker
+                        // enabled state and only change via clear-markers mode.
+                    }
+                    if (!suppressTouchSend) {
+                        Serial.print("TOUCH:");
+                        Serial.println(touchNum);
+                    }
+                    // Diagnostic auto-write: only in diagnostic mode + no
+                    // active mode-lock. Always shows button events (including
+                    // during clear-markers mode) — diagnostic mode is a pure
+                    // event log.
+                    if (!displayMode && millis() >= oledLockUntilMs) {
+                        snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d ON", touchNum);
+                        oledLine2Changed = true;
+                    }
                 } else if (!now && was) {
+                    if (touchNum == 26) modifierHeld = false;
+                    if (touchNum == 24) ledSet(8, false);  // pan-mod released
+                    if (touchNum == 3)  pad3Held  = false;
+                    if (touchNum == 14) pad14Held = false;
+                    if (touchNum == 15) pad15Held = false;
                     Serial.print("RELEASE:");
                     Serial.println(touchNum);
-                    snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d OFF", touchNum);
-                    oledLine2Changed = true;
+                    if (!displayMode && millis() >= oledLockUntilMs) {
+                        snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d OFF", touchNum);
+                        oledLine2Changed = true;
+                    }
                 }
             }
             lastTouchState[chip] = touchState;
         }
     }
 
-    // --- OLED update (throttled to 20fps max) ---
-    static unsigned long lastOledUpdate = 0;
-    if ((oledLine1Changed || oledLine2Changed) && (millis() - lastOledUpdate) >= 50) {
-        oledUpdateDisplay();
-        lastOledUpdate = millis();
-    }
+    // --- OLED: emit at most one I2C chunk per loop iteration ---
+    // Each call is ~1.6 ms max of I2C wire time, so the loop stays responsive
+    // to serial and touch/encoder events even while a line is being redrawn.
+    oledStep();
+
+    // --- Play-LED fade flash (mod+play rejection indicator) ---
+    flashStep();
 
     // --- Heartbeat ---
     if (millis() - lastHeartbeat > 5000) {

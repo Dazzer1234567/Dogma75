@@ -137,8 +137,10 @@ bool SerialController::initialize(const std::string& portName) {
     timeouts.ReadIntervalTimeout = MAXDWORD;
     timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
     timeouts.ReadTotalTimeoutConstant = 50;
-    timeouts.WriteTotalTimeoutConstant = 50;
-    timeouts.WriteTotalTimeoutMultiplier = 10;
+    // Keep writes bounded — worst case ~15 ms so a stalled Teensy can't wedge
+    // the reader thread (which shares this handle for LED sendMessage calls).
+    timeouts.WriteTotalTimeoutConstant = 10;
+    timeouts.WriteTotalTimeoutMultiplier = 1;
 
     if (!SetCommTimeouts(hSerial, &timeouts)) {
         std::cerr << "Failed to set serial port timeouts" << std::endl;
@@ -419,6 +421,15 @@ void SerialController::processLine(const std::string& line) {
                 m_touchCallback(touchNum, true);
             }
         } catch (...) {}
+        return;
+    }
+
+    // Parse display-mode messages: firmware announces its current display
+    // mode so the DAW can ignore user events while in diagnostic mode.
+    if (line == "MODE:DIAG" || line == "MODE:DESC") {
+        if (m_modeCallback) {
+            m_modeCallback(line == "MODE:DESC");
+        }
         return;
     }
 

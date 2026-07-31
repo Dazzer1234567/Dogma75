@@ -162,6 +162,7 @@ GUIManager::GUIManager()
     , m_zoomSmoothing(false)
     , m_controllerMode(1)  // Default to Custom Mackie
     , m_waveformScrolling(false)
+    , m_waveformAutoPage(false)
     , m_waveformVerticalZoom(1.0f)
     , m_trackHeight(80.0f)
     , m_viewCenterPosition(0)
@@ -169,10 +170,10 @@ GUIManager::GUIManager()
     , m_colorScheme(0)
     , m_showColorPickers(false)
     , m_editingBgColor(true)
-    , m_bloomEnabled(false)
-    , m_bloomTextIntensity(0.5f)
-    , m_bloomLinesIntensity(0.5f)
-    , m_bloomUIIntensity(0.5f)
+    , m_bloomEnabled(true)
+    , m_bloomTextIntensity(0.2f)
+    , m_bloomLinesIntensity(0.8f)
+    , m_bloomUIIntensity(0.2f)
     , m_sceneFBO(0)
     , m_sceneTexture(0)
     , m_linesFBO(0)
@@ -1393,6 +1394,10 @@ void GUIManager::renderTrackPanel(float width, float height) {
             m_viewCenterPosition = m_audioEngine->getPlaybackPosition();
         }
     }
+    // Only relevant when Scroll Waveform is off — greys out otherwise.
+    ImGui::BeginDisabled(m_waveformScrolling);
+    ImGui::Checkbox("Auto-Page", &m_waveformAutoPage);
+    ImGui::EndDisabled();
 
     // Helper lambda to draw slider grab as stroke outline and store for UI glow
     auto storeSliderGrab = [this](float value, float minVal, float maxVal) {
@@ -1666,8 +1671,46 @@ void GUIManager::renderWaveform(float height) {
 
                 bool zoomChanged = (zoom != m_lastZoom);
                 if (zoomChanged) {
+                    // Compute where the view was BEFORE the zoom.
+                    size_t oldVisibleFrames = (size_t)(totalFrames / m_lastZoom);
+                    if (oldVisibleFrames < 100) oldVisibleFrames = 100;
+                    size_t oldViewStart = (m_viewCenterPosition > oldVisibleFrames / 2)
+                        ? m_viewCenterPosition - oldVisibleFrames / 2 : 0;
+                    if (oldViewStart + oldVisibleFrames > totalFrames) {
+                        oldViewStart = (totalFrames > oldVisibleFrames)
+                            ? totalFrames - oldVisibleFrames : 0;
+                    }
+
+                    // Determine anchor mode. Sticky within a zoom operation:
+                    // we only re-evaluate on direction reversal or first zoom
+                    // ever. Continuing zoom in the same direction keeps the
+                    // previous anchor mode — so a zoom-out that reveals the
+                    // playhead mid-operation keeps zooming around the view
+                    // centre until the user reverses direction.
+                    int currentDir = (zoom > m_lastZoom) ? +1 : -1;
+                    bool directionChanged = (m_lastZoomDirection != 0 &&
+                                             currentDir != m_lastZoomDirection);
+                    if (m_lastZoomDirection == 0 || directionChanged) {
+                        bool playheadVisible = (playbackPos >= oldViewStart) &&
+                                               (playbackPos <  oldViewStart + oldVisibleFrames);
+                        m_zoomAnchorPinPlayhead = playheadVisible;
+                    }
+
+                    if (m_zoomAnchorPinPlayhead) {
+                        // Pin the playhead: keep it at the same on-screen
+                        // position while the waveform expands/contracts.
+                        double fraction = (double)((long long)playbackPos - (long long)oldViewStart)
+                                          / (double)oldVisibleFrames;
+                        long long newViewStart = (long long)playbackPos
+                                                  - (long long)(fraction * (double)visibleFrames);
+                        if (newViewStart < 0) newViewStart = 0;
+                        m_viewCenterPosition = (size_t)newViewStart + visibleFrames / 2;
+                    }
+                    // Otherwise: leave m_viewCenterPosition alone so the zoom
+                    // happens around the middle of the current view.
+
+                    m_lastZoomDirection = currentDir;
                     m_lastZoom = zoom;
-                    m_viewCenterPosition = playbackPos;
                 }
 
                 size_t currentViewStart = m_viewCenterPosition > visibleFrames / 2 ?
@@ -1678,8 +1721,24 @@ void GUIManager::renderWaveform(float height) {
                     (playbackPos < currentViewStart) ||
                     (playbackPos >= currentViewEnd);
 
-                if (needsRecenter && scrollDelta == 0) {
+                // Only auto-page (jump view to keep playhead visible) when
+                // the user has that turned on AND playback is actually
+                // running. Skip on zoom-change ticks so we don't undo the
+                // playhead-pinning we just did above. And skip while paused
+                // — otherwise panning the view (with pad 24 + E2) so the
+                // playhead ends up off-screen would trigger a jump back
+                // to the playhead the moment you release the encoder.
+                if (needsRecenter && scrollDelta == 0 && m_waveformAutoPage
+                    && !zoomChanged && m_audioEngine->isPlaying()) {
+                    printf("[AUTOPAGE] recenter viewCenter=%zu->%zu playhead=%zu view=[%zu..%zu] vis=%zu\n",
+                           m_viewCenterPosition, playbackPos, playbackPos,
+                           currentViewStart, currentViewEnd, visibleFrames);
                     m_viewCenterPosition = playbackPos;
+                }
+                // Log any other unexpected recenter path
+                if (zoomChanged) {
+                    printf("[ZOOM] viewCenter=%zu playhead=%zu vis=%zu (pinning)\n",
+                           m_viewCenterPosition, playbackPos, visibleFrames);
                 }
 
                 size_t centerPos = (m_viewCenterPosition > 0) ? m_viewCenterPosition : playbackPos;
@@ -1695,6 +1754,10 @@ void GUIManager::renderWaveform(float height) {
                 viewEnd = viewStart + visibleFrames;
                 if (viewEnd > totalFrames) viewEnd = totalFrames;
             }
+
+            // Publish the current viewport so the reader thread can compute
+            // first-time default marker positions relative to what's on screen.
+            m_audioEngine->setViewportRange(viewStart, viewEnd - viewStart);
 
             size_t framesPerPixel = visibleFrames / (size_t)waveformSize.x;
             if (framesPerPixel < 1) framesPerPixel = 1;
@@ -2489,6 +2552,7 @@ void GUIManager::saveSettings() {
     file << "    \"simplifiedWaveform\": " << (m_simplifiedWaveform ? "true" : "false") << ",\n";
     file << "    \"zoomSmoothing\": " << (m_zoomSmoothing ? "true" : "false") << ",\n";
     file << "    \"waveformScrolling\": " << (m_waveformScrolling ? "true" : "false") << ",\n";
+    file << "    \"waveformAutoPage\": " << (m_waveformAutoPage ? "true" : "false") << ",\n";
     file << "    \"waveformVerticalZoom\": " << m_waveformVerticalZoom << ",\n";
     file << "    \"trackHeight\": " << m_trackHeight << ",\n";
     file << "    \"controllerMode\": " << m_controllerMode << "\n";
@@ -2604,13 +2668,14 @@ void GUIManager::loadSettings() {
     m_colorScheme = getInt("colorScheme", 0);
     getFloatArray("customBgColor", m_customBgColor, 3);
     getFloatArray("customTextColor", m_customTextColor, 3);
-    m_bloomEnabled = getBool("bloomEnabled", false);
-    m_bloomTextIntensity = getFloat("bloomTextIntensity", 0.5f);
-    m_bloomLinesIntensity = getFloat("bloomLinesIntensity", 0.5f);
-    m_bloomUIIntensity = getFloat("bloomUIIntensity", 0.5f);
+    m_bloomEnabled = getBool("bloomEnabled", true);
+    m_bloomTextIntensity = getFloat("bloomTextIntensity", 0.2f);
+    m_bloomLinesIntensity = getFloat("bloomLinesIntensity", 0.8f);
+    m_bloomUIIntensity = getFloat("bloomUIIntensity", 0.2f);
     m_simplifiedWaveform = getBool("simplifiedWaveform", false);
     m_zoomSmoothing = getBool("zoomSmoothing", false);
     m_waveformScrolling = getBool("waveformScrolling", false);
+    m_waveformAutoPage  = getBool("waveformAutoPage", false);
     m_waveformVerticalZoom = getFloat("waveformVerticalZoom", 1.0f);
     m_trackHeight = getFloat("trackHeight", 80.0f);
     m_controllerMode = getInt("controllerMode", 1);  // Default to Custom Mackie

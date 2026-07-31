@@ -177,6 +177,10 @@ void AudioEngine::play() {
     if (hasAudio) {
         m_scrubbing.store(false);
         m_scrubPlaybackRate.store(0.0f);
+        // Snapshot the start position so a later stop can return here if the
+        // return-on-stop flag is set. Includes stops from any source (button
+        // press, end-of-file auto-stop, mod+play rejection, etc.).
+        m_playStartPosition.store(m_playbackPosition.load());
         m_playing.store(true);
         std::cout << "Playback started" << std::endl;
     }
@@ -748,13 +752,95 @@ void AudioEngine::handleFaderZoom(int position, int range) {
 
 // ==================== ENCODER/TOUCH HANDLERS (called by SerialController) ====================
 
+void AudioEngine::handleModeChange(bool descriptive) {
+    m_diagnosticMode.store(!descriptive);
+    // Wipe any held-state trackers so descriptive mode starts from a clean
+    // slate. Anything the user was pressing during diagnostic mode wasn't
+    // seen by the DAW, so we cannot trust the previously-tracked state.
+    m_modifierHeld.store(false);
+    m_panModifierHeld.store(false);
+    m_pad3Held.store(false);
+    m_pad14Held.store(false);
+    m_pad15Held.store(false);
+    m_clearMode.store(false);
+    m_scrubResumePending.store(false);
+}
+
+void AudioEngine::oledShow(const char* line1, const char* line2) {
+    if (!m_serialController) return;
+    // Protocol: two "DISP:<line>:<text>" commands so firmware writes both
+    // lines back-to-back. Every event replaces the full screen state.
+    std::string m1 = "DISP:1:"; m1 += line1;
+    std::string m2 = "DISP:2:"; m2 += line2;
+    m_serialController->sendMessage(m1);
+    m_serialController->sendMessage(m2);
+}
+
+void AudioEngine::oledShowHold(const char* line1, const char* line2) {
+    if (!m_serialController) return;
+    // Protocol: two "DISPHOLD:<line>:<text>" commands. Firmware writes only
+    // in descriptive mode and holds both lines for ~3 s (user activity
+    // releases the hold).
+    std::string m1 = "DISPHOLD:1:"; m1 += line1;
+    std::string m2 = "DISPHOLD:2:"; m2 += line2;
+    m_serialController->sendMessage(m1);
+    m_serialController->sendMessage(m2);
+}
+
+void AudioEngine::pushPlaybackStateToOled() {
+    oledShowForce(isPlaying() ? "PLAYING" : "STOPPED", " ");
+}
+
+void AudioEngine::oledShowForce(const char* line1, const char* line2) {
+    if (!m_serialController) return;
+    // Protocol: two "DISPFORCE:<line>:<text>" commands. Firmware writes in
+    // both display modes — used for live status readouts inside interactive
+    // modes like clear-markers.
+    std::string m1 = "DISPFORCE:1:"; m1 += line1;
+    std::string m2 = "DISPFORCE:2:"; m2 += line2;
+    m_serialController->sendMessage(m1);
+    m_serialController->sendMessage(m2);
+}
+
+void AudioEngine::enableMarkerAtDefault(int markerIndex, double fractionFromLeft) {
+    if (markerIndex < 0 || markerIndex > 3) return;
+
+    if (m_markerEverSet[markerIndex]) {
+        // Restore at preserved position — clearMarker() left it intact.
+        setMarkerPosition(markerIndex, getMarkerPosition(markerIndex));
+        return;
+    }
+
+    // First-time placement: position at a fraction of the current viewport.
+    // Fall back to whole track if the GUI hasn't published a viewport yet.
+    size_t total  = getTotalFrames();
+    size_t start  = m_viewStartFrame.load();
+    size_t frames = m_viewVisibleFrames.load();
+    if (frames == 0 || start >= total) {
+        start = 0;
+        frames = total;
+    }
+    if (start + frames > total) frames = total - start;
+    size_t pos = start + (size_t)(fractionFromLeft * (double)frames);
+    if (pos > total) pos = total;
+    setMarkerPosition(markerIndex, pos);
+}
+
 void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float velocityMultiplier) {
+    // Diagnostic mode: controller is inert. Firmware still sends encoder
+    // deltas so its OLED can show them, but the DAW must not act on them.
+    if (m_diagnosticMode.load()) return;
+
     if (encoder == 1) {
-        // E1: Playhead scrub
+        // E1: Playhead scrub. If we're playing, pause and arm the resume
+        // timer so playback picks up 100 ms after the user stops moving.
+        double nowSec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_lastScrubMoveTime.store(nowSec);
+
         if (isPlaying()) {
             stop();
-            if (m_serialController) m_serialController->sendMessage("LED:0:OFF");
-            std::cout << "E1 scrub: stopped playback" << std::endl;
+            m_scrubResumePending.store(true);
         }
 
         size_t totalFrames = getTotalFrames();
@@ -773,14 +859,27 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             if (newPlayPos > (long)totalFrames) newPlayPos = totalFrames;
 
             setPlaybackPosition((size_t)newPlayPos);
-            printf("ENC: delta=%ld pos=%ld\n", delta, newPlayPos);
         }
     }
     else if (encoder == 2) {
-        // E2: Zoom
-        float currentZoom = getWaveformZoom();
-        float newZoom = currentZoom * std::pow(1.0005f, (float)delta);
-        setWaveformZoom(newZoom);
+        // E2: pan the timeline while pad 24 is held, otherwise zoom.
+        if (m_panModifierHeld.load()) {
+            size_t totalFrames = getTotalFrames();
+            if (totalFrames > 0) {
+                float zoom = getWaveformZoom();
+                size_t visibleFrames = (size_t)(totalFrames / zoom);
+                if (visibleFrames < 100) visibleFrames = 100;
+                VelocityCurve& curve = m_serialController->getVelocityCurve();
+                long scrollAmount = (long)(-delta * (double)visibleFrames / 2400.0 * curve.baseMultiplier);
+                m_viewScrollDelta.fetch_add(scrollAmount);
+                printf("[PAN] delta=%ld scroll=%+ld visibleFrames=%zu playhead=%zu playing=%d\n",
+                       delta, scrollAmount, visibleFrames, getPlaybackPosition(), (int)isPlaying());
+            }
+        } else {
+            float currentZoom = getWaveformZoom();
+            float newZoom = currentZoom * std::pow(1.0005f, (float)delta);
+            setWaveformZoom(newZoom);
+        }
     }
     else if (encoder == 3 && m_modifierHeld.load()) {
         // Modifier + E3: Scroll timeline view
@@ -796,38 +895,53 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         }
     }
     else if (encoder >= 3 && encoder <= 6) {
-        // E3-E6: Markers 0-3
+        // E3-E6: adjust markers 0-3. A disabled/hidden marker is inert here —
+        // markers can only be created via clear-mode restore (which places
+        // them at the pair's default viewport fraction on first use).
         int markerIdx = encoder - 3;
-        size_t totalFrames = getTotalFrames();
-        if (totalFrames > 0) {
-            float zoom = getWaveformZoom();
-            size_t visibleFrames = (size_t)(totalFrames / zoom);
-            if (visibleFrames < 100) visibleFrames = 100;
-            size_t stepSize = (size_t)((double)visibleFrames / 2400.0 * std::abs(delta));
-            if (stepSize < 1) stepSize = 1;
+        if (!isMarkerEnabled(markerIdx)) return;
 
-            if (!isMarkerEnabled(markerIdx)) {
-                size_t pos = getPlaybackPosition();
-                // Constrain against neighbors
-                if (markerIdx > 0 && isMarkerEnabled(markerIdx - 1) && pos <= getMarkerPosition(markerIdx - 1))
-                    pos = getMarkerPosition(markerIdx - 1) + stepSize;
-                if (markerIdx < 3 && isMarkerEnabled(markerIdx + 1) && pos >= getMarkerPosition(markerIdx + 1))
-                    pos = (getMarkerPosition(markerIdx + 1) > stepSize) ? getMarkerPosition(markerIdx + 1) - stepSize : pos;
-                setMarkerPosition(markerIdx, pos);
-            } else {
-                size_t pos = getMarkerPosition(markerIdx);
-                if (delta > 0) {
-                    pos = (pos + stepSize < totalFrames) ? pos + stepSize : totalFrames;
-                    if (markerIdx < 3 && isMarkerEnabled(markerIdx + 1) && pos >= getMarkerPosition(markerIdx + 1))
-                        pos = (getMarkerPosition(markerIdx + 1) > stepSize) ? getMarkerPosition(markerIdx + 1) - stepSize : getMarkerPosition(markerIdx);
-                } else {
-                    pos = (pos > stepSize) ? pos - stepSize : 0;
-                    if (markerIdx > 0 && isMarkerEnabled(markerIdx - 1) && pos <= getMarkerPosition(markerIdx - 1))
-                        pos = getMarkerPosition(markerIdx - 1) + stepSize;
-                }
-                setMarkerPosition(markerIdx, pos);
-            }
+        size_t totalFrames = getTotalFrames();
+        if (totalFrames == 0) return;
+
+        float zoom = getWaveformZoom();
+        size_t visibleFrames = (size_t)(totalFrames / zoom);
+        if (visibleFrames < 100) visibleFrames = 100;
+        // Halve the marker step relative to the scrub / scroll rate so
+        // markers feel fine-grained enough to place precisely.
+        size_t stepSize = (size_t)((double)visibleFrames / 4800.0 * std::abs(delta));
+        if (stepSize < 1) stepSize = 1;
+
+        // Pair-only clamping (loop-left <-> loop-right, record-left <-> record-right).
+        size_t lowerBound = 0;
+        bool   hasLower   = false;
+        size_t upperBound = totalFrames;
+        bool   hasUpper   = false;
+        int partnerAbove = -1, partnerBelow = -1;
+        if      (markerIdx == 0) partnerAbove = 3;
+        else if (markerIdx == 3) partnerBelow = 0;
+        else if (markerIdx == 1) partnerAbove = 2;
+        else if (markerIdx == 2) partnerBelow = 1;
+        if (partnerAbove >= 0 && isMarkerEnabled(partnerAbove)) {
+            upperBound = getMarkerPosition(partnerAbove);
+            hasUpper = true;
         }
+        if (partnerBelow >= 0 && isMarkerEnabled(partnerBelow)) {
+            lowerBound = getMarkerPosition(partnerBelow);
+            hasLower = true;
+        }
+
+        size_t pos = getMarkerPosition(markerIdx);
+        if (delta > 0) {
+            pos = (pos + stepSize < totalFrames) ? pos + stepSize : totalFrames;
+        } else {
+            pos = (pos > stepSize) ? pos - stepSize : 0;
+        }
+        if (hasLower && pos <= lowerBound + stepSize)
+            pos = lowerBound + stepSize;
+        if (hasUpper && pos + stepSize >= upperBound)
+            pos = (upperBound > stepSize) ? upperBound - stepSize : lowerBound + stepSize;
+        setMarkerPosition(markerIdx, pos);
     }
 }
 
@@ -860,22 +974,252 @@ static int ledChannelForPad(int pad) {
 }
 
 void AudioEngine::handleTouch(int pad, bool pressed) {
-    // Modifier button (pad 26)
+    // Diagnostic mode: controller is inert. Firmware keeps sending events so
+    // its OLED can show button numbers, but the DAW must not react — no
+    // play/stop, no marker jumps, no state changes at all.
+    if (m_diagnosticMode.load()) return;
+
+    // Runs on the SerialController reader thread. Firmware toggles LEDs 3-8
+    // predictively for instant response; the DAW only reasserts state via
+    // updateController when its own state diverges from what firmware assumed
+    // (e.g. play() no-op with no audio loaded, or audio-callback auto-stop).
+
+    // Pad 26 (modifier). A press while already in clear-markers mode exits
+    // the mode instead of setting the modifier bit (matches firmware exit).
     if (pad == 26) {
-        m_modifierHeld.store(pressed);
+        if (pressed && m_clearMode.load()) {
+            m_clearMode.store(false);
+            // Firmware locally writes "EXIT" and hard-locks the screen for
+            // 2 s on its side. Schedule the playback-state push for right
+            // after that lock expires.
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs + 2000);
+        } else {
+            m_modifierHeld.store(pressed);
+            // Don't scribble "MODIFIER OFF" over the live clear-mode status
+            // when the user simply releases pad 26 after entering the mode.
+            if (!m_clearMode.load()) {
+                oledShow("MODIFIER", pressed ? "HOLD" : "OFF");
+            }
+        }
         return;
     }
 
-    // Play/stop: pad 19 is the physical play pad; pad 0 kept as legacy trigger.
-    if ((pad == 0 || pad == 19) && pressed) {
+    // Pad 24 (pan modifier). Held while turning E2 = pan instead of zoom.
+    if (pad == 24) {
+        m_panModifierHeld.store(pressed);
+        oledShow("PAN MOD", pressed ? "HOLD" : "OFF");
+        return;
+    }
+
+    // Pad 3 (display-mode modifier). Tracked here so we can consume the
+    // pad 23 press that follows and not flip the loop-right toggle.
+    if (pad == 3) {
+        m_pad3Held.store(pressed);
+        return;
+    }
+
+    // Pad 14 / pad 15 — held while pressing pad 19 to set the on-stop
+    // return-to-start flag. Absolute set commands, not toggles.
+    if (pad == 14) { m_pad14Held.store(pressed); return; }
+    if (pad == 15) { m_pad15Held.store(pressed); return; }
+
+    if (pressed && pad == 23 && m_pad3Held.load()) {
+        // Display-mode toggle — firmware writes the new mode's header to
+        // line 1 with no lock. Diagnostic keeps it forever; descriptive
+        // gets it replaced by the DAW's next push on the user's next real
+        // interaction. Nothing to schedule DAW-side.
+        return;
+    }
+
+    if (!pressed) return;  // rest is press-only
+
+    // Combo: pad 14 + play => turn on "return playhead to start on stop".
+    // Combo: pad 15 + play => turn it off. Both are absolute set commands.
+    if ((pad == 0 || pad == 19) && (m_pad14Held.load() || m_pad15Held.load())) {
+        bool on = m_pad14Held.load();  // 14 => on, 15 => off (14 wins ties)
+        m_returnToStartOnStop.store(on);
+        // Short two-line status (both display modes).
+        oledShow("ON STOP", on ? "RETURN" : "STAY");
+        // Verbose 3-second explanation for descriptive mode. Firmware
+        // silently ignores DISPHOLD in diagnostic mode.
+        oledShowHold("ON STOP:", on ? "RETURN TO START" : "STAY IN PLACE");
+        return;
+    }
+
+    // ---- Clear/restore-markers mode: pad presses toggle the pair. ----
+    // If a pair is currently enabled, clear it (disable markers + toggles →
+    // hidden from waveform). If a pair is currently disabled, restore it
+    // (re-enable markers at their preserved positions + toggles on).
+    if (m_clearMode.load()) {
+        if (pad == 20 || pad == 23) {
+            bool wasOn = m_loopLeftEnabled.load();
+            if (wasOn) {
+                clearMarker(0);
+                clearMarker(3);
+                m_loopLeftEnabled.store(false);
+                m_loopRightEnabled.store(false);
+                m_lastLoopLeftLedState  = 0;
+                m_lastLoopRightLedState = 0;
+            } else {
+                enableMarkerAtDefault(0, 0.15);
+                enableMarkerAtDefault(3, 0.85);
+                m_loopLeftEnabled.store(true);
+                m_loopRightEnabled.store(true);
+                m_lastLoopLeftLedState  = 1;
+                m_lastLoopRightLedState = 1;
+            }
+        } else if (pad == 21 || pad == 22) {
+            bool wasOn = m_recordLeftEnabled.load();
+            if (wasOn) {
+                clearMarker(1);
+                clearMarker(2);
+                m_recordLeftEnabled.store(false);
+                m_recordRightEnabled.store(false);
+                m_lastRecordLeftLedState  = 0;
+                m_lastRecordRightLedState = 0;
+            } else {
+                enableMarkerAtDefault(1, 0.25);
+                enableMarkerAtDefault(2, 0.75);
+                m_recordLeftEnabled.store(true);
+                m_recordRightEnabled.store(true);
+                m_lastRecordLeftLedState  = 1;
+                m_lastRecordRightLedState = 1;
+            }
+        }
+        // Refresh the live clear-mode status display after any toggle.
+        oledShowForce(m_loopLeftEnabled.load()   ? "LOOP: ON" : "LOOP: OFF",
+                      m_recordLeftEnabled.load() ? "REC: ON"  : "REC: OFF");
+        return;
+    }
+
+    // ---- Modifier + play => enter clear-markers mode. ----
+    if ((pad == 0 || pad == 19) && m_modifierHeld.load()) {
+        m_clearMode.store(true);
+        m_modifierHeld.store(false);
+        // Live status readout — updated in place as the user toggles pairs.
+        oledShowForce(m_loopLeftEnabled.load()   ? "LOOP: ON" : "LOOP: OFF",
+                      m_recordLeftEnabled.load() ? "REC: ON"  : "REC: OFF");
+        return;
+    }
+
+    // ---- Pads 20-23: jump-to-marker triggers ----
+    // When a marker is enabled, pressing its pad moves the playhead to that
+    // marker. Playback continues seamlessly if it was already playing (the
+    // audio callback just reads from the new position). If the marker isn't
+    // enabled, the press does nothing — use clear-markers mode to turn a
+    // marker on. LEDs 4/5/6/7 are driven only by marker enabled state, so
+    // they don't flicker on jump presses.
+    auto jumpToMarker = [&](int markerIdx, const char* label) {
+        if (!isMarkerEnabled(markerIdx)) {
+            oledShow("NO MARKER", "SET");
+            return;
+        }
+        setPlaybackPosition(getMarkerPosition(markerIdx));
+        oledShow("JUMP TO", label);
+    };
+    if (pad == 20) { jumpToMarker(0, "LOOP LEFT");  return; }
+    if (pad == 21) { jumpToMarker(1, "REC LEFT");   return; }
+    if (pad == 22) { jumpToMarker(2, "REC RIGHT");  return; }
+    if (pad == 23) { jumpToMarker(3, "LOOP RIGHT"); return; }
+
+    // ---- Normal play/stop. ----
+    if (pad == 0 || pad == 19) {
+        m_scrubResumePending.store(false);
+        m_lastPlayLedState = 1 - m_lastPlayLedState;
         if (isPlaying()) {
             stop();
-            if (m_serialController) m_serialController->sendMessage("LED:3:OFF");
+            oledShow("STOPPED", " ");
         } else {
             play();
-            if (m_serialController) m_serialController->sendMessage("LED:3:ON");
+            oledShow(isPlaying() ? "PLAYING" : "NO AUDIO", " ");
         }
     }
+}
+
+void AudioEngine::updateController() {
+    if (!m_serialController) return;
+
+    // One-shot: on the first tick after DAW startup, force the controller
+    // into descriptive mode (regardless of what it was doing before) and
+    // seed the OLED with the current playback state ("STOPPED"). The DAW
+    // is always the authority on session start.
+    if (!m_startupOledPushed) {
+        m_startupOledPushed = true;
+        // Firmware handles SETMODE:DESC by switching mode, updating the
+        // OLED header, and echoing "MODE:DESC" back — which triggers our
+        // handleModeChange() and resets held-state trackers.
+        m_serialController->sendMessage("SETMODE:DESC");
+        // The DISPFORCE writes are queued after SETMODE, so firmware
+        // processes them once it's in descriptive mode.
+        pushPlaybackStateToOled();
+    }
+
+    // Timed OLED revert — currently used to auto-clear the mode-switch
+    // banner after ~3 s so the screen doesn't get stuck on "DISPLAY MODE".
+    int64_t revertAt = m_oledRevertAtMs.load();
+    if (revertAt != 0) {
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowMs >= revertAt) {
+            m_oledRevertAtMs.store(0);
+            pushPlaybackStateToOled();
+        }
+    }
+
+    // Scrub-then-resume: 100 ms after the last E1 movement, resume playback
+    // from wherever the user parked the playhead.
+    if (m_scrubResumePending.load()) {
+        double nowSec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowSec - m_lastScrubMoveTime.load() >= SCRUB_RESUME_DELAY_S) {
+            m_scrubResumePending.store(false);
+            play();
+        }
+    }
+
+    // Return-on-stop: detect a play->stop transition and, if the flag is set,
+    // yank the playhead back to where playback last started. Catches stops
+    // from every path (button, end-of-file, etc.) because we sample the
+    // authoritative isPlaying() state.
+    bool nowPlaying = isPlaying();
+    if (m_wasPlayingLastTick && !nowPlaying && m_returnToStartOnStop.load()) {
+        setPlaybackPosition(m_playStartPosition.load());
+    }
+    m_wasPlayingLastTick = nowPlaying;
+
+    // Play LED (channel 3): on only during active playback. Firmware toggles
+    // predictively on pad 19 press; this catches auto-stops (end of file) and
+    // corrects any mismatch from play()-no-op cases.
+    int wantPlay = isPlaying() ? 1 : 0;
+    if (wantPlay != m_lastPlayLedState) {
+        m_serialController->sendMessage(wantPlay ? "LED:3:ON" : "LED:3:OFF");
+        m_lastPlayLedState = wantPlay;
+    }
+
+    // Mode LEDs (channels 4/5/6/7 — loop-left, record-left, record-right,
+    // loop-right). Normally the firmware toggle keeps the cache in sync via
+    // handleTouch, so this only fires on startup (cache is -1) to force-sync
+    // the physical LEDs to the DAW's boot state (all disabled).
+    struct ModeLed { int ch; std::atomic<bool>* state; int* cache; };
+    ModeLed modeLeds[] = {
+        { 4, &m_loopLeftEnabled,    &m_lastLoopLeftLedState },
+        { 5, &m_recordLeftEnabled,  &m_lastRecordLeftLedState },
+        { 6, &m_recordRightEnabled, &m_lastRecordRightLedState },
+        { 7, &m_loopRightEnabled,   &m_lastLoopRightLedState },
+    };
+    for (auto& m : modeLeds) {
+        int want = m.state->load() ? 1 : 0;
+        if (want != *m.cache) {
+            char msg[16];
+            snprintf(msg, sizeof(msg), "LED:%d:%s", m.ch, want ? "ON" : "OFF");
+            m_serialController->sendMessage(msg);
+            *m.cache = want;
+        }
+    }
+
+    // Pan-modifier LED (channel 8) is fully firmware-owned — no host sync.
 }
 
 // ==================== AUDIO CALLBACK ====================
@@ -1084,6 +1428,16 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                 if (track.solo) { anySolo = true; break; }
             }
 
+            // If the loop pair (markers 0 and 3) is armed, wrap the playhead
+            // from loop-right back to loop-left every time it crosses the
+            // end. Hoisted outside the inner loop so it's a single check
+            // per buffer, not per sample.
+            bool loopActive = m_loopLeftEnabled.load() && m_loopRightEnabled.load()
+                              && isMarkerEnabled(0) && isMarkerEnabled(3);
+            size_t loopStart = loopActive ? getMarkerPosition(0) : 0;
+            size_t loopEnd   = loopActive ? getMarkerPosition(3) : 0;
+            if (loopActive && loopStart >= loopEnd) loopActive = false;  // safety
+
             for (unsigned long i = 0; i < framesPerBuffer; i++) {
                 if (playPos >= maxTotalFrames) {
                     m_playing.store(false);
@@ -1117,6 +1471,9 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                 }
 
                 playPos++;
+                if (loopActive && playPos >= loopEnd) {
+                    playPos = loopStart;
+                }
             }
 
             m_playbackPosition.store(playPos);
