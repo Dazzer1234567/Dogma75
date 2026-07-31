@@ -1,0 +1,71 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Compiled Object files
+*.o
+*.obj
+*.lo
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# macOS
+.DS_Store
+
+# Prerequisites
+*.d
+
+# Debug files
+*.dSYM/
+*.pdb
+*.ilk
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+*~
+*.swp
+*.swo
+
+# Vendored third-party sources (fetched by setup_dependencies.sh)
+external/
+
+# PlatformIO firmware build outputs
+**/.pio/
+
+# Runtime state files
+imgui.ini
+
+# Stray shell-redirect artifact on Windows
+/nul
+
+# Claude Code local settings
+.claude/

@@ -1,0 +1,34 @@
+{
+  "_comment": "Dogma75 User Settings - Give this file to Claude to update defaults",
+  "_saved_at": "Jan  8 2026 13:19:42",
+
+  "gui": {
+    "colorScheme": 1,
+    "customBgColor": [0.0001, 9.999e-05, 9.999e-05],
+    "customTextColor": [0.271329, 0.598176, 0.747319],
+    "bloomEnabled": true,
+    "bloomTextIntensity": 0.81,
+    "bloomLinesIntensity": 0.51,
+    "bloomUIIntensity": 0.32,
+    "simplifiedWaveform": false,
+    "zoomSmoothing": false,
+    "waveformScrolling": false,
+    "waveformVerticalZoom": 3.5,
+    "trackHeight": 300
+  },
+
+  "audio": {
+    "scrubSpeed": 0.05,
+    "rpmThreshold": 30,
+    "fastSpeedMultiplier": 5,
+    "rpmAveraging": 0.5
+  },
+
+  "parkButtons": {
+    "park1": "Park 1",
+    "park2": "Park 2",
+    "park3": "Park 3",
+    "park4": "Park 4",
+    "selectedPark": 0
+  }
+}

@@ -1,0 +1,2 @@
+cd C:\0_CODE\Dogma75\build\Release
+MinimalDAW.exe
