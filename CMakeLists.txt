@@ -61,6 +61,7 @@ if(WIN32)
     set(PLATFORM_LIBS
         winmm
         dsound
+        comdlg32   # GetOpenFileName (WAV browse dialog)
         ${OPENGL_LIBRARIES}
     )
     target_compile_definitions(MinimalDAW PRIVATE PLATFORM_WINDOWS)

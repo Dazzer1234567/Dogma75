@@ -49,7 +49,8 @@ AudioEngine::AudioEngine()
     , m_waveformZoom(1.0f)
     , m_selectedPark(0)
     , m_controllerMode(1)
-    , m_scrubSpeed(0.05f)
+    , m_scrubSpeed(1.0f)
+    , m_silentScrubSpeed(0.7f)
     , m_scrubRpmThreshold(30.0f)
     , m_fastSpeedMultiplier(5.0f)
     , m_currentEncoderRpm(0.0f)
@@ -668,21 +669,8 @@ void AudioEngine::processMidiMessages() {
                     }
                 }
             }
-            else if (m_selectedPark == 2) {
-                size_t totalFrames = getTotalFrames();
-                if (totalFrames > 0) {
-                    if (ccNumber == 16 && direction != 0) {
-                        float currentRate = m_scrubPlaybackRate.load();
-                        float newRate = currentRate + (direction * 0.05f);
-                        if (newRate > 6.0f) newRate = 6.0f;
-                        if (newRate < -6.0f) newRate = -6.0f;
-                        m_currentEncoderRpm = std::abs(newRate) * 100.0f;
-                        m_scrubPlaybackRate.store(newRate);
-                        m_scrubbing.store(true);
-                        m_scrubPlaybackPosition = (double)getPlaybackPosition();
-                    }
-                }
-            }
+            // (MIDI park-2 audio-scrub removed — audio scrubbing is now
+            //  driven by pad 24 held + encoder E6 on the physical controller.)
         }
     }
 
@@ -751,6 +739,55 @@ void AudioEngine::handleFaderZoom(int position, int range) {
 }
 
 // ==================== ENCODER/TOUCH HANDLERS (called by SerialController) ====================
+
+void AudioEngine::handleRenameBuffer(const std::string& buffer, int cursorPos, bool active) {
+    std::lock_guard<std::mutex> lock(m_renameMutex);
+    m_renameBuffer = buffer;
+    m_renameCursorPos.store(cursorPos);
+    m_renameActive.store(active);
+}
+
+void AudioEngine::handleRenameSync(int phaseMs) {
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_renameSyncLocalMs.store(nowMs);
+    m_renameSyncFwPhaseMs.store(phaseMs);
+}
+
+float AudioEngine::getLedFlashBrightness() const {
+    int64_t syncLocal = m_renameSyncLocalMs.load();
+    if (syncLocal == 0) return 0.0f;
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int elapsed = (int)((nowMs - syncLocal) + m_renameSyncFwPhaseMs.load());
+    int phase = ((elapsed % FLASH_PERIOD_MS) + FLASH_PERIOD_MS) % FLASH_PERIOD_MS;
+    int half = FLASH_PERIOD_MS / 2;
+    // Same triangle-wave formula as the firmware LED flash: linear ramp
+    // 0->1 for the first half of the period, 1->0 for the second half.
+    float b = (phase < half)
+        ? (float)phase / (float)half
+        : (float)(FLASH_PERIOD_MS - phase) / (float)half;
+    return b;
+}
+
+bool AudioEngine::getRenameBuffer(std::string& out, int& cursorPosOut) const {
+    if (!m_renameActive.load()) return false;
+    std::lock_guard<std::mutex> lock(m_renameMutex);
+    out = m_renameBuffer;
+    cursorPosOut = m_renameCursorPos.load();
+    return true;
+}
+
+void AudioEngine::handleTrackNameFromController(const std::string& name) {
+    int idx = m_pendingNameTrackIndex.exchange(-1);
+    if (idx < 0) return;
+    Track* t = getTrack(idx);
+    if (!t) return;
+    if (!name.empty()) t->name = name;
+    char line2[32];
+    snprintf(line2, sizeof(line2), "TR%d - %s", idx + 1, t->name.c_str());
+    oledShow("NAME SET", line2);
+}
 
 void AudioEngine::handleModeChange(bool descriptive) {
     m_diagnosticMode.store(!descriptive);
@@ -831,6 +868,16 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
     // deltas so its OLED can show them, but the DAW must not act on them.
     if (m_diagnosticMode.load()) return;
 
+    // Nudging any marker encoder (E3-E6) while clear-markers mode is on
+    // is an implicit exit — the user has moved from pair-management to
+    // marker-positioning. Firmware exits its own flashMode symmetrically.
+    if (m_clearMode.load() && encoder >= 3 && encoder <= 6) {
+        m_clearMode.store(false);
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_oledRevertAtMs.store(nowMs + 2000);
+    }
+
     if (encoder == 1) {
         // E1: Playhead scrub. If we're playing, pause and arm the resume
         // timer so playback picks up 100 ms after the user stops moving.
@@ -851,7 +898,9 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             if (visibleFrames < 100) visibleFrames = 100;
 
             VelocityCurve& curve = m_serialController->getVelocityCurve();
-            double framesPerPulse = (double)visibleFrames / 2400.0 * curve.baseMultiplier * velocityMultiplier;
+            // Silent-scrub (E1) sensitivity from the SILENT SCRUB slider.
+            double framesPerPulse = (double)visibleFrames / 2400.0 * curve.baseMultiplier
+                                     * velocityMultiplier * (double)m_silentScrubSpeed;
             long frameDelta = (long)(delta * framesPerPulse);
 
             long newPlayPos = (long)currentPos + frameDelta;
@@ -894,6 +943,32 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             m_viewScrollDelta.fetch_add(scrollAmount);
         }
     }
+    else if (encoder == 6 && m_panModifierHeld.load()) {
+        // Pad 24 + E6: audio scrub. Rate is set DIRECTLY from the encoder
+        // delta on every tick — no accumulator, no coast. When the user
+        // stops turning, updateController() zeros the rate within the
+        // short SCRUB_TIMEOUT_S window and audio stops immediately.
+        //
+        // Sensitivity: m_scrubSpeed (Audio Scrub Speed slider). At 1.0 a
+        // delta of 1 gives a rate of ~0.5x (half speed). Fast mode kicks
+        // in when |delta| >= (m_scrubRpmThreshold / 10) and multiplies by
+        // m_fastSpeedMultiplier.
+        float rate = m_scrubSpeed * 0.5f * (float)delta;
+        if ((float)std::abs(delta) * 10.0f >= m_scrubRpmThreshold) {
+            rate *= m_fastSpeedMultiplier;
+        }
+        if (rate >  8.0f) rate =  8.0f;
+        if (rate < -8.0f) rate = -8.0f;
+        m_scrubPlaybackRate.store(rate);
+        if (!m_scrubbing.load()) {
+            m_scrubbing.store(true);
+            m_scrubPlaybackPosition = (double)getPlaybackPosition();
+        }
+        double nowSec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_lastAudioScrubMs.store(nowSec);
+        return;
+    }
     else if (encoder >= 3 && encoder <= 6) {
         // E3-E6: adjust markers 0-3. A disabled/hidden marker is inert here —
         // markers can only be created via clear-mode restore (which places
@@ -907,9 +982,9 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         float zoom = getWaveformZoom();
         size_t visibleFrames = (size_t)(totalFrames / zoom);
         if (visibleFrames < 100) visibleFrames = 100;
-        // Halve the marker step relative to the scrub / scroll rate so
-        // markers feel fine-grained enough to place precisely.
-        size_t stepSize = (size_t)((double)visibleFrames / 4800.0 * std::abs(delta));
+        // Marker step is 1/9600 of the visible range per encoder tick —
+        // half the previous 1/4800 rate — so marker placement is finer.
+        size_t stepSize = (size_t)((double)visibleFrames / 9600.0 * std::abs(delta));
         if (stepSize < 1) stepSize = 1;
 
         // Pair-only clamping (loop-left <-> loop-right, record-left <-> record-right).
@@ -974,6 +1049,24 @@ static int ledChannelForPad(int pad) {
 }
 
 void AudioEngine::handleTouch(int pad, bool pressed) {
+    // Sentinel pads from SerialController for DELETEPAIR combos —
+    // 200 = wipe loop pair (markers 0, 3), 201 = wipe record pair (1, 2).
+    // Runs even in diagnostic mode: the gesture arrived via its own serial
+    // message and is a deliberate user action.
+    if (pressed && (pad == 200 || pad == 201)) {
+        if (pad == 200) {
+            resetMarker(0); resetMarker(3);
+            m_loopLeftEnabled.store(false);
+            m_loopRightEnabled.store(false);
+            oledShow("LOOP", "DELETED");
+        } else {
+            resetMarker(1); resetMarker(2);
+            m_recordLeftEnabled.store(false);
+            m_recordRightEnabled.store(false);
+            oledShow("REC LOOP", "DELETED");
+        }
+        return;
+    }
     // Diagnostic mode: controller is inert. Firmware keeps sending events so
     // its OLED can show button numbers, but the DAW must not react — no
     // play/stop, no marker jumps, no state changes at all.
@@ -997,11 +1090,10 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
             m_oledRevertAtMs.store(nowMs + 2000);
         } else {
             m_modifierHeld.store(pressed);
-            // Don't scribble "MODIFIER OFF" over the live clear-mode status
-            // when the user simply releases pad 26 after entering the mode.
-            if (!m_clearMode.load()) {
-                oledShow("MODIFIER", pressed ? "HOLD" : "OFF");
-            }
+            // Pad 26 is silent when tapped alone — it only ever acts as a
+            // modifier for other keys, so it should never overwrite the
+            // OLED with its own status. Combos (26 + 19 = clear-markers,
+            // etc.) push their own display when they fire.
         }
         return;
     }
@@ -1020,10 +1112,30 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         return;
     }
 
-    // Pad 14 / pad 15 — held while pressing pad 19 to set the on-stop
-    // return-to-start flag. Absolute set commands, not toggles.
+    // Pad 14 — held while pressing pad 19 to set the on-stop return-to-
+    // start flag ON. Absolute set command, not a toggle.
     if (pad == 14) { m_pad14Held.store(pressed); return; }
-    if (pad == 15) { m_pad15Held.store(pressed); return; }
+    // Pad 15 — single tap toggles loop-edit / clear-markers mode. Firmware
+    // mirrors the same toggle locally on press so LEDs update instantly.
+    if (pad == 15) {
+        if (pressed) {
+            bool nowOn = !m_clearMode.load();
+            m_clearMode.store(nowOn);
+            if (!nowOn) {
+                // Exiting: schedule the OLED playback-state revert so the
+                // firmware's local "EXIT" banner is replaced cleanly.
+                int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                m_oledRevertAtMs.store(nowMs + 2000);
+            } else {
+                // Entering: push the live status readout the firmware
+                // shows in clear mode (LOOP: ON/OFF, REC: ON/OFF).
+                oledShowForce(m_loopLeftEnabled.load()   ? "LOOP: ON" : "LOOP: OFF",
+                              m_recordLeftEnabled.load() ? "REC: ON"  : "REC: OFF");
+            }
+        }
+        return;
+    }
 
     if (pressed && pad == 23 && m_pad3Held.load()) {
         // Display-mode toggle — firmware writes the new mode's header to
@@ -1033,12 +1145,50 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         return;
     }
 
+    // Pad 12 (add track): fire on RELEASE, not press. Reader-thread request;
+    // the actual m_tracks mutation happens on the main thread in
+    // updateController() to avoid racing with the audio callback.
+    // Also rate-limited to one add per ADD_TRACK_MIN_INTERVAL_MS so light
+    // grazes that ripple through the MPR121 as many touch/release cycles
+    // don't spawn a burst of tracks.
+    if (pad == 12) {
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (pressed) {
+            // Modifier (pad 26) + pad 12 = delete the selected track.
+            // Queue the delete for the main thread; mark long-press as
+            // already-fired so the release doesn't also create a new track.
+            if (m_modifierHeld.load()) {
+                m_pendingDeleteTrackRequest.store(true);
+                m_pad12LongPressFired.store(true);
+                m_pad12PressTimeMs.store(0);
+                m_modifierHeld.store(false);   // consume the modifier
+                return;
+            }
+            m_pad12PressTimeMs.store(nowMs);
+            m_pad12LongPressFired.store(false);
+        } else {
+            m_pad12PressTimeMs.store(0);
+            // Release after a long-press: rename was already fired; do NOT
+            // also create a new track.
+            if (m_pad12LongPressFired.exchange(false)) return;
+            // Short press: queue an add-track (with the usual debounce).
+            int64_t lastMs = m_lastAddTrackMs.load();
+            if (nowMs - lastMs >= ADD_TRACK_MIN_INTERVAL_MS) {
+                m_lastAddTrackMs.store(nowMs);
+                m_pendingAddTrackRequest.store(true);
+            }
+        }
+        return;
+    }
+
     if (!pressed) return;  // rest is press-only
 
     // Combo: pad 14 + play => turn on "return playhead to start on stop".
-    // Combo: pad 15 + play => turn it off. Both are absolute set commands.
-    if ((pad == 0 || pad == 19) && (m_pad14Held.load() || m_pad15Held.load())) {
-        bool on = m_pad14Held.load();  // 14 => on, 15 => off (14 wins ties)
+    // The old 15+19 (turn OFF) is retired since pad 15 alone now toggles
+    // loop-edit mode; use 14+19 or the settings panel to switch off.
+    if ((pad == 19) && m_pad14Held.load()) {
+        bool on = true;
         m_returnToStartOnStop.store(on);
         // Short two-line status (both display modes).
         oledShow("ON STOP", on ? "RETURN" : "STAY");
@@ -1080,8 +1230,32 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
                 m_lastRecordLeftLedState  = 0;
                 m_lastRecordRightLedState = 0;
             } else {
-                enableMarkerAtDefault(1, 0.25);
-                enableMarkerAtDefault(2, 0.75);
+                // First-time record-pair placement: anchor to the loop
+                // pair if it's already enabled — 33% and 66% between the
+                // loop-left and loop-right markers. Fall back to a
+                // viewport-fraction placement otherwise. Re-enable
+                // (previously cleared) restores preserved positions via
+                // enableMarkerAtDefault's normal branch.
+                bool loopSet = isMarkerEnabled(0) && isMarkerEnabled(3);
+                bool rec1First = !markerEverSet(1);
+                bool rec2First = !markerEverSet(2);
+                if (loopSet && (rec1First || rec2First)) {
+                    size_t a = getMarkerPosition(0);
+                    size_t b = getMarkerPosition(3);
+                    if (b > a) {
+                        size_t range = b - a;
+                        if (rec1First) setMarker(1, a + (size_t)(range * 0.33), true);
+                        else           enableMarkerAtDefault(1, 0.25);
+                        if (rec2First) setMarker(2, a + (size_t)(range * 0.66), true);
+                        else           enableMarkerAtDefault(2, 0.75);
+                    } else {
+                        enableMarkerAtDefault(1, 0.25);
+                        enableMarkerAtDefault(2, 0.75);
+                    }
+                } else {
+                    enableMarkerAtDefault(1, 0.25);
+                    enableMarkerAtDefault(2, 0.75);
+                }
                 m_recordLeftEnabled.store(true);
                 m_recordRightEnabled.store(true);
                 m_lastRecordLeftLedState  = 1;
@@ -1094,15 +1268,8 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         return;
     }
 
-    // ---- Modifier + play => enter clear-markers mode. ----
-    if ((pad == 0 || pad == 19) && m_modifierHeld.load()) {
-        m_clearMode.store(true);
-        m_modifierHeld.store(false);
-        // Live status readout — updated in place as the user toggles pairs.
-        oledShowForce(m_loopLeftEnabled.load()   ? "LOOP: ON" : "LOOP: OFF",
-                      m_recordLeftEnabled.load() ? "REC: ON"  : "REC: OFF");
-        return;
-    }
+    // (26+19 clear-markers combo retired — pad 15 alone toggles the mode.)
+    // (pad 12 add-track handled earlier, on RELEASE)
 
     // ---- Pads 20-23: jump-to-marker triggers ----
     // When a marker is enabled, pressing its pad moves the playhead to that
@@ -1124,8 +1291,29 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     if (pad == 22) { jumpToMarker(2, "REC RIGHT");  return; }
     if (pad == 23) { jumpToMarker(3, "LOOP RIGHT"); return; }
 
-    // ---- Normal play/stop. ----
-    if (pad == 0 || pad == 19) {
+    // ---- Track selection: pad 0 = previous, pad 4 = next. Clamped at
+    // both ends — no wrap-around, so pad 4 on the last track and pad 0 on
+    // the first are silent no-ops. OLED still updates so the user sees
+    // the current selection when they press the button.
+    if (pad == 0 || pad == 4) {
+        int n = getTrackCount();
+        if (n <= 0) return;
+        int cur = getSelectedTrack();
+        if (cur < 0) cur = 0;
+        int next = cur;
+        if (pad == 0 && cur > 0)     next = cur - 1;
+        if (pad == 4 && cur < n - 1) next = cur + 1;
+        setSelectedTrack(next);
+        Track* t = getTrack(next);
+        char line2[32];
+        if (t) snprintf(line2, sizeof(line2), "TR%d - %s", next + 1, t->name.c_str());
+        else   snprintf(line2, sizeof(line2), " ");
+        oledShow(pad == 0 ? "TRACK UP" : "TRACK DN", line2);
+        return;
+    }
+
+    // ---- Normal play/stop (pad 19). ----
+    if (pad == 19) {
         m_scrubResumePending.store(false);
         m_lastPlayLedState = 1 - m_lastPlayLedState;
         if (isPlaying()) {
@@ -1147,13 +1335,93 @@ void AudioEngine::updateController() {
     // is always the authority on session start.
     if (!m_startupOledPushed) {
         m_startupOledPushed = true;
-        // Firmware handles SETMODE:DESC by switching mode, updating the
-        // OLED header, and echoing "MODE:DESC" back — which triggers our
-        // handleModeChange() and resets held-state trackers.
         m_serialController->sendMessage("SETMODE:DESC");
-        // The DISPFORCE writes are queued after SETMODE, so firmware
-        // processes them once it's in descriptive mode.
         pushPlaybackStateToOled();
+    }
+
+    // Heartbeat every ~1 s so the firmware can detect DAW disconnection and
+    // block a switch to descriptive mode when nothing's listening.
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowMs - m_lastHeartbeatSendMs >= 1000) {
+        m_serialController->sendMessage("HB");
+        m_lastHeartbeatSendMs = nowMs;
+    }
+
+    // Process any pad-triggered track-add requests here on the main thread
+    // so we never mutate m_tracks from the serial reader thread while the
+    // audio callback is iterating it. Show "TRACK N ADDED - NAME:" on line
+    // 1 and enter text-input mode (flashing cursor) on line 2 for the user
+    // to type a name.
+    if (m_pendingAddTrackRequest.exchange(false)) {
+        int newIndex = addTrack("");
+        int trackNum = getTrackCount();
+        char line1[32];
+        snprintf(line1, sizeof(line1), "TRACK %d ADDED,NAME:", trackNum);
+        // Line 1 announce (line 2 will be replaced by the cursor immediately).
+        oledShowForce(line1, " ");
+        // Enter text-input mode on line 2 with an empty starting buffer.
+        m_serialController->sendMessage("TEXTIN:");
+        // Remember which track the incoming NAME:... belongs to.
+        m_pendingNameTrackIndex.store(newIndex);
+    }
+
+    // --- Pad 12 long-press: detect & fire rename entry ---
+    // Runs on main thread so we don't touch the controller from the reader.
+    {
+        int64_t pressedAt = m_pad12PressTimeMs.load();
+        if (pressedAt != 0 && !m_pad12LongPressFired.load()) {
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - pressedAt >= RENAME_HOLD_MS) {
+                m_pad12LongPressFired.store(true);
+                m_pendingRenameRequest.store(true);
+            }
+        }
+    }
+    if (m_pendingDeleteTrackRequest.exchange(false)) {
+        int idx = getSelectedTrack();
+        int n = getTrackCount();
+        if (idx >= 0 && idx < n) {
+            Track* t = getTrack(idx);
+            char line2[32];
+            snprintf(line2, sizeof(line2), "TR%d - %s", idx + 1,
+                     t ? t->name.c_str() : " ");
+            deleteTrack(idx);
+            // deleteTrack may have shifted the selection; clamp for OLED.
+            int newSel = getSelectedTrack();
+            if (newSel >= getTrackCount()) setSelectedTrack(getTrackCount() - 1);
+            oledShow("DELETED", line2);
+        } else {
+            oledShow("DELETE", "NO TRACK");
+        }
+    }
+    if (m_pendingRenameRequest.exchange(false)) {
+        int idx = getSelectedTrack();
+        int n = getTrackCount();
+        if (idx >= 0 && idx < n) {
+            char line1[32];
+            snprintf(line1, sizeof(line1), "TR%d RENAME,NAME:", idx + 1);
+            oledShowForce(line1, " ");
+            // Start with an empty buffer for now — cursor navigation of the
+            // existing name will come later.
+            m_serialController->sendMessage("TEXTIN:");
+            m_pendingNameTrackIndex.store(idx);
+        } else {
+            oledShow("RENAME", "NO TRACK");
+        }
+    }
+
+    // Audio-scrub timeout: if E6 (pad 24 held) hasn't fired in a while, stop
+    // scrubbing and snap the visual playhead to wherever the audio ended up.
+    if (m_scrubbing.load()) {
+        double nowSec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowSec - m_lastAudioScrubMs.load() > SCRUB_TIMEOUT_S) {
+            m_playbackPosition.store((size_t)m_scrubPlaybackPosition);
+            m_scrubbing.store(false);
+            m_scrubPlaybackRate.store(0.0f);
+        }
     }
 
     // Timed OLED revert — currently used to auto-clear the mode-switch
@@ -1220,6 +1488,20 @@ void AudioEngine::updateController() {
     }
 
     // Pan-modifier LED (channel 8) is fully firmware-owned — no host sync.
+
+    // Push PAIRDEF whenever a pair's "defined" state changes. Defined ==
+    // both markers have ever been placed (markerEverSet); goes back to
+    // false via the pad 19 + marker-pad delete gesture (resetMarker).
+    int loopDef = (markerEverSet(0) && markerEverSet(3)) ? 1 : 0;
+    if (loopDef != m_lastLoopPairDefinedSent) {
+        m_serialController->sendMessage(loopDef ? "PAIRDEF:LOOP:1" : "PAIRDEF:LOOP:0");
+        m_lastLoopPairDefinedSent = loopDef;
+    }
+    int recDef = (markerEverSet(1) && markerEverSet(2)) ? 1 : 0;
+    if (recDef != m_lastRecordPairDefinedSent) {
+        m_serialController->sendMessage(recDef ? "PAIRDEF:REC:1" : "PAIRDEF:REC:0");
+        m_lastRecordPairDefinedSent = recDef;
+    }
 }
 
 // ==================== AUDIO CALLBACK ====================
@@ -1408,6 +1690,8 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             }
 
             m_scrubPlaybackPosition = pos;
+            // Keep the visible playhead in step with the audio scrub position.
+            m_playbackPosition.store((size_t)pos);
             m_playbackPosition.store((size_t)pos);
         }
     }

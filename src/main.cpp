@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <chrono>
 #include "audio/audio_engine.h"
 #include "controller/serial_controller.h"
 #include "gui/gui_manager.h"
@@ -79,6 +80,15 @@ int main(int argc, char** argv) {
     serialController.setModeCallback([&audioEngine](bool descriptive) {
         audioEngine.handleModeChange(descriptive);
     });
+    serialController.setNameCallback([&audioEngine](const std::string& name) {
+        audioEngine.handleTrackNameFromController(name);
+    });
+    serialController.setRenameBufferCallback([&audioEngine](const std::string& buf, int cursor, bool active) {
+        audioEngine.handleRenameBuffer(buf, cursor, active);
+    });
+    serialController.setRenameSyncCallback([&audioEngine](int phaseMs) {
+        audioEngine.handleRenameSync(phaseMs);
+    });
 
     std::cout << std::endl;
 
@@ -101,16 +111,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Main loop
+    // Main loop with per-stage timing so the FPS overlay can point at the
+    // stage responsible for a hitch. Each label is a static string; the
+    // overlay tracks worst-seen values per label.
     while (guiManager.isRunning()) {
-        audioEngine.processMidiMessages();   // Poll for MIDI input
-
-        // Serial is drained by SerialController's own reader thread now;
-        // processMessages() is a no-op stub kept for source compatibility.
-        serialController.processMessages();
-
-        audioEngine.updateController();      // LEDs, scrub-then-resume timer
+        auto t0 = std::chrono::steady_clock::now();
+        audioEngine.processMidiMessages();
+        auto t1 = std::chrono::steady_clock::now();
+        serialController.processMessages();   // no-op stub
+        auto t2 = std::chrono::steady_clock::now();
+        audioEngine.updateController();
+        auto t3 = std::chrono::steady_clock::now();
         guiManager.processFrame();
+        auto t4 = std::chrono::steady_clock::now();
+
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<float, std::milli>(b - a).count();
+        };
+        guiManager.reportFrameStats(ms(t0, t4), ms(t0, t1), ms(t2, t3), ms(t3, t4));
     }
 
     // Cleanup

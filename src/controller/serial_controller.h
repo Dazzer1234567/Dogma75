@@ -5,6 +5,8 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 
 // Velocity curve (moved from audio_engine.h)
 struct VelocityCurvePoint {
@@ -42,6 +44,19 @@ using TouchCallback = std::function<void(int pad, bool pressed)>;
 // means the DAW should respond to user inputs; false = diagnostic mode
 // where the DAW must ignore all touch/encoder events.
 using ModeCallback = std::function<void(bool descriptive)>;
+// Fires when the firmware sends "NAME:<text>" — the user has finalised
+// a track name via the on-controller text-entry flow (pad 21).
+using NameCallback = std::function<void(const std::string& name)>;
+// Fires on live text-input state changes. `buffer` is the on-screen text
+// (committed + any pending letter substituted at cursorPos); `cursorPos`
+// is where the DAW should overlay a blinking cursor; `active` is false
+// when the firmware left text-input mode (RENAMEEND) so the GUI can drop
+// the preview.
+using RenameBufferCallback = std::function<void(const std::string& buffer, int cursorPos, bool active)>;
+// Fires once at the start of a rename with the firmware's current LED-
+// flash phase (0 .. 499 ms). The DAW uses this to pulse its own preview
+// in sync with the physical LEDs.
+using RenameSyncCallback = std::function<void(int phaseMs)>;
 
 class SerialController {
 public:
@@ -64,6 +79,9 @@ public:
     void setEncoderCallback(EncoderCallback cb) { m_encoderCallback = cb; }
     void setTouchCallback(TouchCallback cb) { m_touchCallback = cb; }
     void setModeCallback(ModeCallback cb) { m_modeCallback = cb; }
+    void setNameCallback(NameCallback cb) { m_nameCallback = cb; }
+    void setRenameBufferCallback(RenameBufferCallback cb) { m_renameBufferCallback = cb; }
+    void setRenameSyncCallback(RenameSyncCallback cb) { m_renameSyncCallback = cb; }
 
     // Test page state (read by GUI)
     bool isTouched(int pad) const { return (pad >= 0 && pad < 36) ? m_touchState[pad] : false; }
@@ -89,13 +107,29 @@ private:
     // hitting the OS buffer and handleTouch/handleEncoderDelta running).
     std::thread m_readerThread;
     std::atomic<bool> m_readerStop{false};
-    std::mutex m_sendMutex;  // Serializes WriteFile against concurrent reads
     void readerLoop();
+
+    // Writer thread: WriteFile on the Teensy's USB-CDC port routinely blocks
+    // for hundreds of ms — sometimes seconds — despite COMMTIMEOUTS, when
+    // the Teensy stops draining its endpoint (busy with I2C / OLED). Any
+    // blocking write on the main thread stalls rendering and freezes the
+    // playhead. So sendMessage() enqueues here; the writer thread does the
+    // WriteFile calls off the main loop.
+    std::thread m_writerThread;
+    std::atomic<bool> m_writerStop{false};
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCv;
+    std::deque<std::string> m_sendQueue;
+    static constexpr size_t MAX_QUEUE_SIZE = 256;
+    void writerLoop();
 
     // Callbacks
     EncoderCallback m_encoderCallback;
     TouchCallback m_touchCallback;
     ModeCallback m_modeCallback;
+    NameCallback m_nameCallback;
+    RenameBufferCallback m_renameBufferCallback;
+    RenameSyncCallback   m_renameSyncCallback;
 
     // Touch state (for test page display)
     bool m_touchState[36] = {};

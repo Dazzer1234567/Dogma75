@@ -171,9 +171,9 @@ GUIManager::GUIManager()
     , m_showColorPickers(false)
     , m_editingBgColor(true)
     , m_bloomEnabled(true)
-    , m_bloomTextIntensity(0.2f)
-    , m_bloomLinesIntensity(0.8f)
-    , m_bloomUIIntensity(0.2f)
+    , m_bloomTextIntensity(0.0f)
+    , m_bloomLinesIntensity(1.0f)
+    , m_bloomUIIntensity(0.0f)
     , m_sceneFBO(0)
     , m_sceneTexture(0)
     , m_linesFBO(0)
@@ -278,6 +278,11 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
 
     // Load saved settings
     loadSettings();
+
+    // Auto-load default session on startup. If the file is missing (renamed
+    // or on a different machine), loadSessionFromFile logs and returns
+    // cleanly — the DAW just starts empty.
+    loadSessionFromFile("c:\\0_CODE\\Dogma75\\Workspace\\can delete\\beegee.json");
 
     m_running = true;
     std::cout << "GUI initialized successfully with OpenGL " << glGetString(GL_VERSION) << std::endl;
@@ -803,28 +808,32 @@ void GUIManager::renderBloom() {
     blurTexture(m_sceneTexture, m_textBlurTexture);
 
     // ===== LAYER 2: LINES (markers and playhead) =====
-    // Render lines layer to its own FBO using raw OpenGL, then blur
-    if (m_bloomLinesIntensity > 0.001f && !m_lineDrawCmds.empty()) {
+    // Always run the clear + blur; skip only the actual draw when there are
+    // no line commands. Otherwise the blur target keeps the previous frame's
+    // markers and they ghost through the composite pass forever.
+    if (m_bloomLinesIntensity > 0.001f) {
         glBindFramebuffer(GL_FRAMEBUFFER, m_linesFBO);
         glViewport(0, 0, m_windowWidth, m_windowHeight);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        drawLinesRaw();
+        if (!m_lineDrawCmds.empty()) drawLinesRaw();
 
         glClearColor(bgR, bgG, bgB, 1.0f);
         blurTexture(m_linesTexture, m_linesBlurTexture);
     }
 
     // ===== LAYER 3: WAVEFORM =====
-    // Render waveform layer to its own FBO using raw OpenGL, then blur
-    if (m_bloomUIIntensity > 0.001f && !m_waveformDrawCmds.empty()) {
+    // Same story — deleting the last track cleared the draw commands but
+    // left the last blurred waveform in m_uiBlurTexture, so it kept
+    // showing through as a ghost. Blur an empty FBO to zero it out.
+    if (m_bloomUIIntensity > 0.001f) {
         glBindFramebuffer(GL_FRAMEBUFFER, m_waveformFBO);
         glViewport(0, 0, m_windowWidth, m_windowHeight);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        drawWaveformRaw();
+        if (!m_waveformDrawCmds.empty()) drawWaveformRaw();
 
         glClearColor(bgR, bgG, bgB, 1.0f);
         blurTexture(m_waveformTexture, m_uiBlurTexture);
@@ -968,6 +977,31 @@ void GUIManager::processFrame() {
     }
     spaceWasPressed = spaceIsPressed;
 
+    // 'A' key: open a WAV file dialog and load into the selected track.
+    // Uses ImGui's event-based IsKeyPressed (not the poll-based SDL keystate)
+    // so a quick tap is caught even when the frame rate is low.
+    if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput) {
+#ifdef _WIN32
+        char filename[MAX_PATH] = "";
+        OPENFILENAMEA ofn = {};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner   = nullptr;
+        ofn.lpstrFilter = "WAV files\0*.wav\0All files\0*.*\0";
+        ofn.lpstrFile   = filename;
+        ofn.nMaxFile    = sizeof(filename);
+        ofn.lpstrTitle  = "Load WAV into selected track";
+        ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetOpenFileNameA(&ofn)) {
+            int idx = m_audioEngine->getSelectedTrack();
+            if (idx < 0 || idx >= m_audioEngine->getTrackCount()) {
+                idx = m_audioEngine->addTrack("");
+                m_audioEngine->setSelectedTrack(idx);
+            }
+            m_audioEngine->loadTrackAudio(idx, filename);
+        }
+#endif
+    }
+
     // Zoom interpolation
     float targetZoom = m_audioEngine->getWaveformZoom();
     if (m_zoomSmoothing) {
@@ -1057,12 +1091,84 @@ void GUIManager::processFrame() {
 
 // ==================== EXTRACTED RENDER METHODS ====================
 
+void GUIManager::reportFrameStats(float total_ms, float midi_ms, float update_ms, float frame_ms) {
+    // Also feed the overlay's stage panel so nothing else needs to change.
+    reportStageTime("midi",   midi_ms);
+    reportStageTime("update", update_ms);
+    reportStageTime("frame",  frame_ms);
+
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (m_perfStartMs == 0) m_perfStartMs = nowMs;
+
+    FrameSample& s = m_frameHistory[m_frameHistoryIdx];
+    s.tMs    = nowMs - m_perfStartMs;
+    s.total  = total_ms;
+    s.midi   = midi_ms;
+    s.update = update_ms;
+    s.frame  = frame_ms;
+    m_frameHistoryIdx = (m_frameHistoryIdx + 1) % kFrameHistoryLen;
+    if (m_frameHistoryCount < kFrameHistoryLen) m_frameHistoryCount++;
+
+    if (total_ms < SPIKE_LOG_THRESHOLD_MS) return;
+    if (nowMs - m_lastSpikeDumpMs < SPIKE_LOG_MIN_GAP_MS) return;
+    m_lastSpikeDumpMs = nowMs;
+
+    // Dump the whole ring buffer to perf.log with a SPIKE marker on the
+    // triggering frame. Append mode so successive spikes accumulate.
+    std::ofstream f("c:\\0_CODE\\Dogma75\\perf.log", std::ios::app);
+    if (!f.is_open()) return;
+    f << "===== SPIKE " << total_ms << " ms at t=" << (nowMs - m_perfStartMs)
+      << " ms (playing=" << (m_audioEngine && m_audioEngine->isPlaying() ? 1 : 0)
+      << ", tracks="   << (m_audioEngine ? m_audioEngine->getTrackCount() : 0) << ")\n";
+    f << "  t_ms     total    midi    update    frame\n";
+    // Walk the ring buffer oldest -> newest.
+    int start = (m_frameHistoryCount == kFrameHistoryLen) ? m_frameHistoryIdx : 0;
+    for (int k = 0; k < m_frameHistoryCount; k++) {
+        const FrameSample& r = m_frameHistory[(start + k) % kFrameHistoryLen];
+        bool spike = (r.total >= SPIKE_LOG_THRESHOLD_MS);
+        f << (spike ? " * " : "   ")
+          << r.tMs << "  "
+          << r.total << "  " << r.midi << "  " << r.update << "  " << r.frame << "\n";
+    }
+    f << "\n";
+    f.close();
+}
+
+void GUIManager::reportStageTime(const char* stage, float ms) {
+    // Find or create a slot. Only kStageStatCount labels supported; extras
+    // silently drop, but the caller only ever passes four fixed names.
+    for (int i = 0; i < kStageStatCount; i++) {
+        if (m_stageStats[i].label == nullptr) {
+            m_stageStats[i].label   = stage;
+            m_stageStats[i].worstMs = ms;
+            m_stageStats[i].lastMs  = ms;
+            return;
+        }
+        if (m_stageStats[i].label == stage) {
+            m_stageStats[i].lastMs = ms;
+            if (ms > m_stageStats[i].worstMs) m_stageStats[i].worstMs = ms;
+            return;
+        }
+    }
+}
+
 void GUIManager::renderToolbar() {
 #ifdef IMGUI_FOUND
     ImGuiIO& io = ImGui::GetIO();
 
     if (ImGui::Button("+ Add Track")) {
         m_audioEngine->addTrack();
+    }
+    ImGui::SameLine();
+
+    if (ImGui::Button("Save Session")) {
+        saveSession();
+    }
+    ImGui::SameLine();
+
+    if (ImGui::Button("Open Session")) {
+        openSession();
     }
     ImGui::SameLine();
 
@@ -1288,9 +1394,186 @@ void GUIManager::renderTrackPanel(float width, float height) {
 #ifdef IMGUI_FOUND
     ImGui::BeginChild("TrackPanel", ImVec2(width, height), true);
 
-    ImGui::Text("TRACKS");
+    // Panel-view dropdown at the top of the panel.
+    static const char* modeNames[] = { "TRACKS", "SCRUBBING", "WAVEFORM" };
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##LeftPanelMode", modeNames[m_leftPanelMode])) {
+        for (int i = 0; i < IM_ARRAYSIZE(modeNames); i++) {
+            bool sel = (m_leftPanelMode == i);
+            if (ImGui::Selectable(modeNames[i], sel)) m_leftPanelMode = i;
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
     ImGui::Separator();
 
+    // -------- SCRUBBING view --------
+    if (m_leftPanelMode == 1) {
+        ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
+
+        // Inline lambda copied from the track view — needed for slider glow.
+        auto storeSliderGrab = [this](float value, float minVal, float maxVal) {
+            ImVec2 sliderMin = ImGui::GetItemRectMin();
+            ImVec2 sliderMax = ImGui::GetItemRectMax();
+            float t = (value - minVal) / (maxVal - minVal);
+            float grabWidth = 8.0f;
+            float grabX = sliderMin.x + t * (sliderMax.x - sliderMin.x - grabWidth);
+            WaveformDrawCmd cmd;
+            cmd.x1 = grabX; cmd.y1 = sliderMin.y;
+            cmd.isRect = true;
+            cmd.rectX2 = grabX + grabWidth; cmd.rectY2 = sliderMax.y;
+            ImU32 col;
+            if (m_colorScheme == 1) {
+                col = IM_COL32((int)(m_customTextColor[0] * 255),
+                               (int)(m_customTextColor[1] * 255),
+                               (int)(m_customTextColor[2] * 255), 255);
+            } else {
+                col = IM_COL32(51, 102, 204, 255);
+            }
+            cmd.color = col;
+            m_waveformDrawCmds.push_back(cmd);
+        };
+
+        ImGui::Text("SILENT SCRUB (E1)");
+        ImGui::Separator();
+        float silentScrubSpeed = m_audioEngine->getSilentScrubSpeed();
+        ImGui::Text("Scrub Speed");
+        if (ImGui::SliderFloat("##SilentScrubSpeed", &silentScrubSpeed, 0.1f, 4.0f, "%.2f")) {
+            m_audioEngine->setSilentScrubSpeed(silentScrubSpeed);
+        }
+        storeSliderGrab(silentScrubSpeed, 0.1f, 4.0f);
+
+        ImGui::Spacing();
+        ImGui::Text("AUDIO SCRUB (Pad 24 + E6)");
+        ImGui::Separator();
+
+        float scrubSpeed = m_audioEngine->getScrubSpeed();
+        ImGui::Text("Scrub Speed");
+        if (ImGui::SliderFloat("##ScrubSpeed", &scrubSpeed, 0.1f, 4.0f, "%.2f")) {
+            m_audioEngine->setScrubSpeed(scrubSpeed);
+        }
+        storeSliderGrab(scrubSpeed, 0.1f, 4.0f);
+
+        float rpmThreshold = m_audioEngine->getScrubRpmThreshold();
+        ImGui::Text("RPM Threshold");
+        if (ImGui::SliderFloat("##RpmThreshold", &rpmThreshold, 5.0f, 100.0f, "%.0f RPM")) {
+            m_audioEngine->setScrubRpmThreshold(rpmThreshold);
+        }
+        storeSliderGrab(rpmThreshold, 5.0f, 100.0f);
+
+        float fastMult = m_audioEngine->getFastSpeedMultiplier();
+        ImGui::Text("Fast Speed");
+        if (ImGui::SliderFloat("##FastSpeed", &fastMult, 1.0f, 20.0f, "%.1fx")) {
+            m_audioEngine->setFastSpeedMultiplier(fastMult);
+        }
+        storeSliderGrab(fastMult, 1.0f, 20.0f);
+
+        float rpmAveraging = m_audioEngine->getRpmAveraging();
+        ImGui::Text("RPM Smoothing");
+        if (ImGui::SliderFloat("##RpmAveraging", &rpmAveraging, 0.0f, 0.99f, "%.2f")) {
+            m_audioEngine->setRpmAveraging(rpmAveraging);
+        }
+        storeSliderGrab(rpmAveraging, 0.0f, 0.99f);
+
+        ImGui::PopStyleColor(2);
+
+        float currentRpm = m_audioEngine->getCurrentEncoderRpm();
+        int displayRpm = (int)currentRpm;
+        if (displayRpm > 999) displayRpm = 999;
+        ImVec4 rpmColor;
+        if (m_colorScheme == 1) {
+            rpmColor = ImVec4(m_customTextColor[0], m_customTextColor[1], m_customTextColor[2], 1.0f);
+        } else {
+            rpmColor = (currentRpm >= rpmThreshold)
+                ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
+                : ImVec4(0.6f, 0.6f, 1.0f, 1.0f);
+        }
+        const char* zoneText = (currentRpm >= rpmThreshold) ? "FAST" : "SLOW";
+        ImGui::TextColored(rpmColor, "Knob 1: %03d RPM (%s)", displayRpm, zoneText);
+
+        ImGui::EndChild();
+        return;
+    }
+
+    // -------- WAVEFORM view --------
+    if (m_leftPanelMode == 2) {
+        ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
+
+        auto storeSliderGrab = [this](float value, float minVal, float maxVal) {
+            ImVec2 sliderMin = ImGui::GetItemRectMin();
+            ImVec2 sliderMax = ImGui::GetItemRectMax();
+            float t = (value - minVal) / (maxVal - minVal);
+            float grabWidth = 8.0f;
+            float grabX = sliderMin.x + t * (sliderMax.x - sliderMin.x - grabWidth);
+            WaveformDrawCmd cmd;
+            cmd.x1 = grabX; cmd.y1 = sliderMin.y;
+            cmd.isRect = true;
+            cmd.rectX2 = grabX + grabWidth; cmd.rectY2 = sliderMax.y;
+            ImU32 col;
+            if (m_colorScheme == 1) {
+                col = IM_COL32((int)(m_customTextColor[0] * 255),
+                               (int)(m_customTextColor[1] * 255),
+                               (int)(m_customTextColor[2] * 255), 255);
+            } else {
+                col = IM_COL32(51, 102, 204, 255);
+            }
+            cmd.color = col;
+            m_waveformDrawCmds.push_back(cmd);
+        };
+
+        ImGui::Text("Vertical Zoom");
+        ImGui::SliderFloat("##VertZoom", &m_waveformVerticalZoom, 0.5f, 4.0f, "%.1fx");
+        storeSliderGrab(m_waveformVerticalZoom, 0.5f, 4.0f);
+
+        ImGui::Text("Track Height");
+        ImGui::SliderFloat("##TrackHeight", &m_trackHeight, 40.0f, 300.0f, "%.0f");
+        storeSliderGrab(m_trackHeight, 40.0f, 300.0f);
+
+        ImGui::Spacing();
+        ImGui::Text("View");
+        ImGui::Separator();
+        if (ImGui::Button(m_simplifiedWaveform ? "Detailed" : "Simplified", ImVec2(-1, 0))) {
+            m_simplifiedWaveform = !m_simplifiedWaveform;
+        }
+        ImGui::Checkbox("Smooth Zoom", &m_zoomSmoothing);
+        if (ImGui::Checkbox("Scroll Waveform", &m_waveformScrolling)) {
+            if (!m_waveformScrolling) {
+                m_viewCenterPosition = m_audioEngine->getPlaybackPosition();
+            }
+        }
+        ImGui::BeginDisabled(m_waveformScrolling);
+        ImGui::Checkbox("Auto-Page", &m_waveformAutoPage);
+        ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        ImGui::Text("Glow");
+        ImGui::Separator();
+        ImGui::Checkbox("Enable Glow", &m_bloomEnabled);
+        if (m_bloomEnabled) {
+            ImGui::Text("Glow Text");
+            ImGui::SliderFloat("##bloomText", &m_bloomTextIntensity, 0.0f, 1.0f, "%.2f");
+            storeSliderGrab(m_bloomTextIntensity, 0.0f, 1.0f);
+            ImGui::Text("Glow Lines");
+            ImGui::SliderFloat("##bloomLines", &m_bloomLinesIntensity, 0.0f, 1.0f, "%.2f");
+            storeSliderGrab(m_bloomLinesIntensity, 0.0f, 1.0f);
+            ImGui::Text("Glow UI");
+            ImGui::SliderFloat("##bloomUI", &m_bloomUIIntensity, 0.0f, 1.0f, "%.2f");
+            storeSliderGrab(m_bloomUIIntensity, 0.0f, 1.0f);
+        }
+
+        ImGui::PopStyleColor(2);
+
+        ImGui::EndChild();
+        return;
+    }
+
+    // -------- TRACKS view (default) --------
+    // Cubase/Ableton-style track headers: each track is its own inline block
+    // with name + volume/pan sliders + M/S/R buttons + output dropdown,
+    // separated by a horizontal rule. Click the name to select the track;
+    // double-click to rename inline.
     int selectedTrack = m_audioEngine->getSelectedTrack();
     int trackCount = m_audioEngine->getTrackCount();
     if (trackCount == 0) {
@@ -1300,104 +1583,206 @@ void GUIManager::renderTrackPanel(float width, float height) {
         ImGui::TextColored(hintColor, "No tracks");
         ImGui::TextColored(hintColor, "Click '+ Add Track'");
     } else {
+        static int editingTrackName = -1;
+        static char nameBuffer[128] = "";
+        int numPairs = m_audioEngine->getNumStereoPairs();
+
+        // Match the arrangement view's per-track vertical slot so each
+        // header block aligns with its waveform strip. Controls stack from
+        // the top with fixed heights; empty space at the bottom when there
+        // are few tracks. When there are enough tracks that controls no
+        // longer fit, they clip inside their fixed slot (no scroll).
+        float availableHeight = ImGui::GetContentRegionAvail().y;
+        float perTrackHeight = availableHeight / (float)trackCount;
+        // Reserve pixels for the between-track separator so blocks + rules
+        // still add up to availableHeight.
+        float separatorH = ImGui::GetTextLineHeightWithSpacing() * 0.5f;
+        float perTrackBlockH = perTrackHeight - separatorH;
+        if (perTrackBlockH < 30.0f) perTrackBlockH = 30.0f;
+
         for (int i = 0; i < trackCount; i++) {
-            const Track* track = m_audioEngine->getTrack(i);
-            if (track) {
-                bool isSelected = (selectedTrack == i);
-                if (ImGui::Selectable(track->name.c_str(), isSelected)) {
-                    m_audioEngine->setSelectedTrack(i);
-                }
-            }
-        }
+            Track* track = m_audioEngine->getTrack(i);
+            if (!track) continue;
+            bool isSelected = (selectedTrack == i);
 
-        ImGui::Separator();
+            ImGui::PushID(i);
 
-        if (selectedTrack >= 0) {
-            Track* track = m_audioEngine->getTrack(selectedTrack);
-            if (track) {
-                ImGui::Text("PROPERTIES");
-                ImGui::Separator();
+            // Blue for the currently-selected track, white/gray otherwise.
+            // Applies to text, slider grabs, slider/combo frames, buttons,
+            // AND the horizontal Separator drawn after the block so the
+            // whole row (including its bottom divider) reads as one colour.
+            ImVec4 tint = isSelected
+                ? ImVec4(0.95f, 0.95f, 0.95f, 1.0f)   // selected = white
+                : ImVec4(0.30f, 0.55f, 0.80f, 1.0f);  // unselected = blue
+            ImVec4 tintDim = ImVec4(tint.x * 0.35f, tint.y * 0.35f, tint.z * 0.35f, 1.0f);
+            ImVec4 tintHi  = ImVec4(tint.x * 1.15f, tint.y * 1.15f, tint.z * 1.15f, 1.0f);
+            if (tintHi.x > 1.0f) tintHi.x = 1.0f;
+            if (tintHi.y > 1.0f) tintHi.y = 1.0f;
+            if (tintHi.z > 1.0f) tintHi.z = 1.0f;
+            ImGui::PushStyleColor(ImGuiCol_Text,            tint);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg,         tintDim);
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,  ImVec4(tintDim.x * 1.3f, tintDim.y * 1.3f, tintDim.z * 1.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive,   ImVec4(tintDim.x * 1.6f, tintDim.y * 1.6f, tintDim.z * 1.6f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_SliderGrab,      tint);
+            ImGui::PushStyleColor(ImGuiCol_SliderGrabActive,tintHi);
+            ImGui::PushStyleColor(ImGuiCol_Button,          tintDim);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,   ImVec4(tintDim.x * 1.3f, tintDim.y * 1.3f, tintDim.z * 1.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,    ImVec4(tintDim.x * 1.6f, tintDim.y * 1.6f, tintDim.z * 1.6f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Separator,       tint);
+            ImGui::PushStyleColor(ImGuiCol_Header,          tintDim);
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered,   ImVec4(tintDim.x * 1.3f, tintDim.y * 1.3f, tintDim.z * 1.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive,    ImVec4(tintDim.x * 1.6f, tintDim.y * 1.6f, tintDim.z * 1.6f, 1.0f));
+            const int kTrackStyleCount = 13;
 
-                static char nameBuffer[128];
-                strncpy(nameBuffer, track->name.c_str(), sizeof(nameBuffer) - 1);
-                nameBuffer[sizeof(nameBuffer) - 1] = '\0';
+            ImGui::BeginChild("trackBlock", ImVec2(-1, perTrackBlockH),
+                              false, ImGuiWindowFlags_NoScrollbar);
+
+            // --- Track name row ---
+            if (editingTrackName == i) {
                 ImGui::SetNextItemWidth(-1);
-                if (ImGui::InputText("##TrackName", nameBuffer, sizeof(nameBuffer))) {
+                if (ImGui::InputText("##name", nameBuffer, sizeof(nameBuffer),
+                                     ImGuiInputTextFlags_EnterReturnsTrue |
+                                     ImGuiInputTextFlags_AutoSelectAll)) {
                     track->name = nameBuffer;
+                    editingTrackName = -1;
                 }
-
-                ImGui::Spacing();
-
-                ImGui::Text("Volume");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::SliderFloat("##Volume", &track->volume, 0.0f, 1.0f);
-
-                ImGui::Text("Pan");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::SliderFloat("##Pan", &track->pan, -1.0f, 1.0f);
-
-                ImGui::Spacing();
-
-                ImGui::Checkbox("Mute", &track->muted);
-                ImGui::SameLine();
-                ImGui::Checkbox("Solo", &track->solo);
-
-                ImGui::Spacing();
-
-                int numPairs = m_audioEngine->getNumStereoPairs();
-                if (numPairs > 0) {
-                    ImGui::Text("Output");
-                    static char pairLabel[32];
-                    sprintf(pairLabel, "Ch %d & %d", (track->outputPair * 2) + 1, (track->outputPair * 2) + 2);
-                    ImGui::SetNextItemWidth(-1);
-                    if (ImGui::BeginCombo("##Output", pairLabel)) {
-                        for (int p = 0; p < numPairs; p++) {
-                            bool isSelectedPair = (track->outputPair == p);
-                            char label[32];
-                            sprintf(label, "Ch %d & %d", (p * 2) + 1, (p * 2) + 2);
-                            if (ImGui::Selectable(label, isSelectedPair)) {
-                                track->outputPair = p;
-                            }
-                            if (isSelectedPair) {
-                                ImGui::SetItemDefaultFocus();
-                            }
-                        }
-                        ImGui::EndCombo();
+                if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
+                    editingTrackName = -1;
+                }
+                if (ImGui::IsItemVisible() && !ImGui::IsItemActive()) {
+                    ImGui::SetKeyboardFocusHere(-1);
+                }
+            } else {
+                // If this track is the one currently being renamed via the
+                // hardware controller, show a live-typing preview: red
+                // background fill, live text from the firmware buffer, and
+                // a blinking cursor. Falls through to the normal name
+                // display otherwise.
+                std::string liveBuf;
+                int liveCursor = 0;
+                bool renaming = (m_audioEngine->getRenameTrackIndex() == i) &&
+                                m_audioEngine->getRenameBuffer(liveBuf, liveCursor);
+                if (renaming) {
+                    // Fill pulses on the same triangle-wave phase as the
+                    // physical pad-20 / pad-21 LEDs — we reconstruct that
+                    // phase on the DAW side from the RENAMESYNC message.
+                    float b = m_audioEngine->getLedFlashBrightness();  // 0..1
+                    // Cursor character follows the same phase: shown while
+                    // the LEDs are on the brighter half of the cycle.
+                    bool cursorOn = (b > 0.5f);
+                    // Build display: overlay a '_' at cursor pos when
+                    // cursorOn; when off, show the underlying letter (or a
+                    // space if cursor is past the end).
+                    std::string disp = liveBuf;
+                    int cp = liveCursor;
+                    if (cp < 0) cp = 0;
+                    if (cp > (int)disp.size()) disp.resize((size_t)cp, ' ');
+                    if (cursorOn) {
+                        char cursorChar = '_';
+                        if (cp < (int)disp.size()) disp[(size_t)cp] = cursorChar;
+                        else                       disp.push_back(cursorChar);
+                    } else if (cp >= (int)disp.size()) {
+                        disp.push_back(' ');
                     }
-                }
-
-                ImGui::Spacing();
-
-                static char filePathBuffer[512] = "";
-                ImGui::Text("Audio File");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::InputText("##FilePath", filePathBuffer, sizeof(filePathBuffer));
-                if (ImGui::Button("Load Audio", ImVec2(-1, 0))) {
-                    if (strlen(filePathBuffer) > 0) {
-                        m_audioEngine->loadTrackAudio(selectedTrack, filePathBuffer);
+                    char selLbl[128];
+                    snprintf(selLbl, sizeof(selLbl), "TR%d - %s",
+                             i + 1, disp.c_str());
+                    // Interpolate between dim and bright red by brightness.
+                    ImVec4 redDim    = ImVec4(0.30f, 0.04f, 0.04f, 1.0f);
+                    ImVec4 redBright = ImVec4(1.00f, 0.10f, 0.10f, 1.0f);
+                    ImVec4 fill(
+                        redDim.x + (redBright.x - redDim.x) * b,
+                        redDim.y + (redBright.y - redDim.y) * b,
+                        redDim.z + (redBright.z - redDim.z) * b,
+                        1.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Header,        fill);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, fill);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  fill);
+                    ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1,1,1,1));
+                    // Always-selected flag paints the row background using
+                    // ImGuiCol_Header, which we've just made red.
+                    ImGui::Selectable(selLbl, true, ImGuiSelectableFlags_Disabled);
+                    ImGui::PopStyleColor(4);
+                } else {
+                    char selLbl[128];
+                    snprintf(selLbl, sizeof(selLbl), "TR%d - %s", i + 1, track->name.c_str());
+                    if (ImGui::Selectable(selLbl, isSelected)) {
+                        m_audioEngine->setSelectedTrack(i);
+                    }
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                        editingTrackName = i;
+                        strncpy(nameBuffer, track->name.c_str(), sizeof(nameBuffer) - 1);
+                        nameBuffer[sizeof(nameBuffer) - 1] = '\0';
                     }
                 }
             }
+
+            // --- Volume slider ---
+            ImGui::Text("Vol");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##vol", &track->volume, 0.0f, 1.0f, "%.2f");
+
+            // --- Pan slider ---
+            ImGui::Text("Pan");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##pan", &track->pan, -1.0f, 1.0f, "%.2f");
+
+            // --- Mute / Solo / Record-arm buttons ---
+            // Push all three button-state colours (Button + Hovered + Active)
+            // so an active state (mute/solo/arm) reads the same colour no
+            // matter whether the mouse is still hovering. Without this, the
+            // ButtonHovered override from the row's tint would show through
+            // until the pointer left the button.
+            ImVec2 msrBtnSize(30, 22);
+            auto pushBtnColor = [](ImVec4 c) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        c);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, c);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  c);
+            };
+            // Mute
+            if (track->muted) pushBtnColor(ImVec4(0.85f, 0.60f, 0.00f, 1.0f));
+            if (ImGui::Button("M", msrBtnSize)) track->muted = !track->muted;
+            if (track->muted) ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            // Solo
+            if (track->solo) pushBtnColor(ImVec4(0.00f, 0.70f, 0.30f, 1.0f));
+            if (ImGui::Button("S", msrBtnSize)) track->solo = !track->solo;
+            if (track->solo) ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            // Record arm
+            if (track->armed) pushBtnColor(ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
+            if (ImGui::Button("R", msrBtnSize)) track->armed = !track->armed;
+            if (track->armed) ImGui::PopStyleColor(3);
+
+            // --- Output pair dropdown ---
+            if (numPairs > 0) {
+                char pairLabel[32];
+                sprintf(pairLabel, "Ch %d-%d", (track->outputPair * 2) + 1, (track->outputPair * 2) + 2);
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##out", pairLabel)) {
+                    for (int p = 0; p < numPairs; p++) {
+                        bool sel = (track->outputPair == p);
+                        char label[32];
+                        sprintf(label, "Ch %d-%d", (p * 2) + 1, (p * 2) + 2);
+                        if (ImGui::Selectable(label, sel)) track->outputPair = p;
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::EndChild();
+
+            // Horizontal separator between tracks — visually carries into the
+            // arrangement view (which also uses Separator at matching heights).
+            ImGui::Separator();
+
+            ImGui::PopStyleColor(kTrackStyleCount);
+            ImGui::PopID();
         }
     }
-
-    ImGui::Separator();
-    ImGui::Text("Waveform View");
-    if (ImGui::Button(m_simplifiedWaveform ? "Detailed" : "Simplified", ImVec2(-1, 0))) {
-        m_simplifiedWaveform = !m_simplifiedWaveform;
-    }
-
-    ImGui::Checkbox("Smooth Zoom", &m_zoomSmoothing);
-
-    if (ImGui::Checkbox("Scroll Waveform", &m_waveformScrolling)) {
-        if (!m_waveformScrolling) {
-            m_viewCenterPosition = m_audioEngine->getPlaybackPosition();
-        }
-    }
-    // Only relevant when Scroll Waveform is off — greys out otherwise.
-    ImGui::BeginDisabled(m_waveformScrolling);
-    ImGui::Checkbox("Auto-Page", &m_waveformAutoPage);
-    ImGui::EndDisabled();
 
     // Helper lambda to draw slider grab as stroke outline and store for UI glow
     auto storeSliderGrab = [this](float value, float minVal, float maxVal) {
@@ -1440,138 +1825,6 @@ void GUIManager::renderTrackPanel(float width, float height) {
         m_waveformDrawCmds.push_back(cmdRight);
     };
 
-    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
-
-    ImGui::Text("Vertical Zoom");
-    ImGui::SliderFloat("##VertZoom", &m_waveformVerticalZoom, 0.5f, 4.0f, "%.1fx");
-    storeSliderGrab(m_waveformVerticalZoom, 0.5f, 4.0f);
-
-    ImGui::Text("Track Height");
-    ImGui::SliderFloat("##TrackHeight", &m_trackHeight, 40.0f, 300.0f, "%.0f");
-    storeSliderGrab(m_trackHeight, 40.0f, 300.0f);
-
-    ImGui::Separator();
-    ImGui::Text("SCRUB");
-    ImGui::Separator();
-
-    float scrubSpeed = m_audioEngine->getScrubSpeed();
-    ImGui::Text("Scrub Speed");
-    if (ImGui::SliderFloat("##ScrubSpeed", &scrubSpeed, 0.05f, 2.0f, "%.2f")) {
-        m_audioEngine->setScrubSpeed(scrubSpeed);
-    }
-    storeSliderGrab(scrubSpeed, 0.05f, 2.0f);
-
-    float rpmThreshold = m_audioEngine->getScrubRpmThreshold();
-    ImGui::Text("RPM Threshold");
-    if (ImGui::SliderFloat("##RpmThreshold", &rpmThreshold, 5.0f, 100.0f, "%.0f RPM")) {
-        m_audioEngine->setScrubRpmThreshold(rpmThreshold);
-    }
-    storeSliderGrab(rpmThreshold, 5.0f, 100.0f);
-
-    float fastMult = m_audioEngine->getFastSpeedMultiplier();
-    ImGui::Text("Fast Speed");
-    if (ImGui::SliderFloat("##FastSpeed", &fastMult, 1.0f, 20.0f, "%.1fx")) {
-        m_audioEngine->setFastSpeedMultiplier(fastMult);
-    }
-    storeSliderGrab(fastMult, 1.0f, 20.0f);
-
-    float rpmAveraging = m_audioEngine->getRpmAveraging();
-    ImGui::Text("RPM Smoothing");
-    if (ImGui::SliderFloat("##RpmAveraging", &rpmAveraging, 0.0f, 0.99f, "%.2f")) {
-        m_audioEngine->setRpmAveraging(rpmAveraging);
-    }
-    storeSliderGrab(rpmAveraging, 0.0f, 0.99f);
-
-    ImGui::PopStyleColor(2);
-
-    float currentRpm = m_audioEngine->getCurrentEncoderRpm();
-    int displayRpm = (int)currentRpm;
-    if (displayRpm > 999) displayRpm = 999;
-    const char* zoneText = "SLOW";
-    ImVec4 rpmColor;
-    if (m_colorScheme == 1) {
-        rpmColor = ImVec4(m_customTextColor[0], m_customTextColor[1], m_customTextColor[2], 1.0f);
-    } else {
-        rpmColor = ImVec4(0.6f, 0.6f, 1.0f, 1.0f);
-        if (currentRpm >= rpmThreshold) {
-            rpmColor = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-        }
-    }
-    if (currentRpm >= rpmThreshold) {
-        zoneText = "FAST";
-    }
-    ImGui::TextColored(rpmColor, "Knob 1: %03d RPM (%s)", displayRpm, zoneText);
-
-    ImGui::Separator();
-    ImGui::Text("PARK");
-    ImGui::Separator();
-
-    for (int i = 0; i < 4; i++) {
-        ImGui::PushID(i);
-
-        if (m_editingParkButton == i) {
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##ParkEdit", m_parkNames[i], sizeof(m_parkNames[i]),
-                                 ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) {
-                m_editingParkButton = -1;
-            }
-            if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
-                m_editingParkButton = -1;
-            }
-            if (ImGui::IsItemVisible() && !ImGui::IsItemActive()) {
-                ImGui::SetKeyboardFocusHere(-1);
-            }
-        } else {
-            bool isSelected = (m_selectedParkButton == i);
-            if (isSelected) {
-                if (m_colorScheme == 1) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(m_customTextColor[0], m_customTextColor[1], m_customTextColor[2], 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(m_customTextColor[0], m_customTextColor[1], m_customTextColor[2], 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(m_customBgColor[0], m_customBgColor[1], m_customBgColor[2], 1.0f));
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.4f, 0.8f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.5f, 0.9f, 1.0f));
-                }
-            }
-            if (ImGui::Button(m_parkNames[i], ImVec2(-1, 0))) {
-                m_selectedParkButton = i;
-                m_audioEngine->setSelectedPark(i);
-            }
-            if (isSelected) {
-                ImVec2 btnMin = ImGui::GetItemRectMin();
-                ImVec2 btnMax = ImGui::GetItemRectMax();
-                ImU32 btnColor;
-                if (m_colorScheme == 1) {
-                    btnColor = IM_COL32(
-                        (int)(m_customTextColor[0] * 255),
-                        (int)(m_customTextColor[1] * 255),
-                        (int)(m_customTextColor[2] * 255), 255);
-                } else {
-                    btnColor = IM_COL32(51, 102, 204, 255);
-                }
-                WaveformDrawCmd cmd;
-                cmd.x1 = btnMin.x; cmd.y1 = btnMin.y;
-                cmd.isRect = true;
-                cmd.rectX2 = btnMax.x; cmd.rectY2 = btnMax.y;
-                cmd.color = btnColor;
-                m_waveformDrawCmds.push_back(cmd);
-            }
-            if (isSelected) {
-                if (m_colorScheme == 1) {
-                    ImGui::PopStyleColor(3);
-                } else {
-                    ImGui::PopStyleColor(2);
-                }
-            }
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-                m_editingParkButton = i;
-            }
-        }
-
-        ImGui::PopID();
-    }
-
     ImGui::EndChild();
 #endif
 }
@@ -1580,24 +1833,34 @@ void GUIManager::renderWaveform(float height) {
 #ifdef IMGUI_FOUND
     ImGui::BeginChild("MainArea", ImVec2(0, height), true);
 
+    // Match the left panel's combo-widget frame height so the separator
+    // below TIMELINE aligns with the separator below the TRACKS dropdown.
+    ImGui::AlignTextToFramePadding();
     ImGui::Text("TIMELINE");
     ImGui::Separator();
 
     int selectedTrack = m_audioEngine->getSelectedTrack();
     int trackCount = m_audioEngine->getTrackCount();
 
+    // Dynamic per-track waveform height: split the remaining vertical space
+    // in the arrangement window evenly between all tracks. 1 track fills the
+    // whole area, 2 tracks split 50/50, 3 tracks each get a third, etc.
+    // The slider-set m_trackHeight is only used as a fallback when the count
+    // is zero (which never actually enters the loop below).
+    float availableHeight = ImGui::GetContentRegionAvail().y;
+    float perTrackOverhead = 50.0f;  // label text + label padding + Spacing()
+    float perTrackWaveformHeight = (trackCount > 0)
+        ? (availableHeight / trackCount) - perTrackOverhead
+        : m_trackHeight;
+    if (perTrackWaveformHeight < 20.0f) perTrackWaveformHeight = 20.0f;
+
     for (int i = 0; i < trackCount; i++) {
         const Track* track = m_audioEngine->getTrack(i);
         if (track && !track->audioData.empty()) {
             bool isSelected = (selectedTrack == i);
 
-            ImVec4 headerColor;
-            if (m_colorScheme == 1) {
-                headerColor = ImVec4(m_customTextColor[0], m_customTextColor[1], m_customTextColor[2], 1.0f);
-            } else {
-                headerColor = isSelected ? ImVec4(0.3f, 0.5f, 0.7f, 1.0f) : ImVec4(0.2f, 0.2f, 0.2f, 1.0f);
-            }
-            ImGui::TextColored(headerColor, "%s", track->name.c_str());
+            // (Track name intentionally not drawn here — the left panel's
+            // TR# label is the single source of truth for name/state.)
 
             const std::vector<float>& audioData = track->audioData;
             int channels = track->channels;
@@ -1606,7 +1869,7 @@ void GUIManager::renderWaveform(float height) {
 
             float availableWidth = ImGui::GetContentRegionAvail().x;
             float labelPadding = 20.0f;
-            ImVec2 waveformSize(availableWidth, m_trackHeight);
+            ImVec2 waveformSize(availableWidth, perTrackWaveformHeight);
             ImVec2 cursorPos = ImGui::GetCursorScreenPos();
             cursorPos.y += labelPadding;
 
@@ -1762,19 +2025,9 @@ void GUIManager::renderWaveform(float height) {
             size_t framesPerPixel = visibleFrames / (size_t)waveformSize.x;
             if (framesPerPixel < 1) framesPerPixel = 1;
 
-            ImU32 waveColor;
-            if (m_colorScheme == 1) {
-                waveColor = IM_COL32(
-                    (int)(m_customTextColor[0] * 255),
-                    (int)(m_customTextColor[1] * 255),
-                    (int)(m_customTextColor[2] * 255), 255);
-            } else if (track->solo) {
-                waveColor = IM_COL32(255, 165, 0, 255);
-            } else if (track->muted) {
-                waveColor = IM_COL32(100, 100, 100, 255);
-            } else {
-                waveColor = IM_COL32(100, 200, 100, 255);
-            }
+            ImU32 waveColor = isSelected
+                ? IM_COL32(240, 240, 240, 255)   // selected = white
+                : IM_COL32(77, 140, 204, 255);   // unselected = blue
 
             if (m_simplifiedWaveform) {
                 int numBars = 50;
@@ -1824,40 +2077,105 @@ void GUIManager::renderWaveform(float height) {
                     m_waveformDrawCmds.push_back(cmd);
                 }
             } else {
-                for (int x = 0; x < (int)waveformSize.x; x++) {
-                    size_t frameStart = viewStart + x * framesPerPixel;
-                    size_t frameEnd = frameStart + framesPerPixel;
-                    if (frameEnd > totalFrames) frameEnd = totalFrames;
-                    if (frameStart >= totalFrames) break;
+                // Pre-rendered GPU texture path — sub-pixel smooth under
+                // zoom / pan because the GPU linear-filters the texture.
+                // Two levels of detail:
+                //   overview  : whole track, built once at load time
+                //   detail    : covers only the current view window (+25%
+                //               margin), rebuilt when the view exits the
+                //               window. Chosen automatically when the
+                //               overview's per-texel sample count would
+                //               exceed one screen pixel.
+                Track* tMut = m_audioEngine->getTrack(i);
+                if (tMut && (tMut->waveformTex == 0 ||
+                             tMut->waveformTexVersion != tMut->audioVersion)) {
+                    uploadWaveformTexture(tMut);
+                }
+                if (tMut && tMut->waveformTex && totalFrames > 0) {
+                    // Framing / vertical zoom (same for both LODs).
+                    float halfH  = waveformSize.y * 0.5f * m_waveformVerticalZoom;
+                    float top    = centerY - halfH;
+                    float bottom = centerY + halfH;
+                    if (top    < cursorPos.y)                  top    = cursorPos.y;
+                    if (bottom > cursorPos.y + waveformSize.y) bottom = cursorPos.y + waveformSize.y;
 
-                    float minVal = 0.0f, maxVal = 0.0f;
-                    for (size_t frame = frameStart; frame < frameEnd; frame++) {
-                        float sample = 0.0f;
-                        for (int ch = 0; ch < channels; ch++) {
-                            sample += audioData[frame * channels + ch];
+                    // Decide overview vs detail. Overview texel covers
+                    // totalFrames / W samples; if that's more than one
+                    // screen pixel, the overview is undersampling — kick in
+                    // the detail texture instead.
+                    size_t overviewFPT = totalFrames / (size_t)tMut->waveformTexW;
+                    if (overviewFPT < 1) overviewFPT = 1;
+                    size_t viewRange = viewEnd - viewStart;
+                    size_t viewFPP   = viewRange / (size_t)waveformSize.x;
+                    if (viewFPP < 1) viewFPP = 1;
+                    bool useDetail = (viewFPP < overviewFPT);
+
+                    unsigned int texId = tMut->waveformTex;
+                    float u1 = 0.0f, u2 = 1.0f;
+                    if (useDetail) {
+                        // Pick a STABLE framesPerBucket: largest power of 2
+                        // <= viewFPP. Because bucket size and bucket
+                        // boundaries are aligned to sample 0, panning by
+                        // fewer than one bucket doesn't shift any texel
+                        // content, and panning past the covered edge just
+                        // re-uploads the same texels for a different aligned
+                        // window — no per-rebuild content jitter.
+                        size_t fpbTarget = 1;
+                        while (fpbTarget * 2 <= viewFPP) fpbTarget *= 2;
+
+                        // Hysteresis: only change fpb if it drifts by 2x or
+                        // more. Prevents rapid ping-pong at the boundary.
+                        size_t fpbUse = tMut->waveformDetailFPB;
+                        if (fpbUse == 0 ||
+                            fpbTarget >= fpbUse * 2 ||
+                            fpbTarget * 2 <= fpbUse) {
+                            fpbUse = fpbTarget;
                         }
-                        sample /= channels;
-                        if (sample < minVal) minVal = sample;
-                        if (sample > maxVal) maxVal = sample;
+
+                        size_t detailW = 8192;
+                        size_t coveredRange = detailW * fpbUse;
+                        bool inRange = (tMut->waveformDetailTex != 0) &&
+                                       (viewStart >= tMut->waveformDetailStart) &&
+                                       (viewEnd   <= tMut->waveformDetailEnd)   &&
+                                       (tMut->waveformDetailFPB == fpbUse) &&
+                                       (tMut->waveformDetailVersion == tMut->audioVersion);
+                        if (!inRange) {
+                            // Centre the window on the view so pan margin
+                            // is available in both directions.
+                            size_t centreFrame = (viewStart + viewEnd) / 2;
+                            size_t half        = coveredRange / 2;
+                            size_t dStart      = (centreFrame > half) ? centreFrame - half : 0;
+                            if (dStart + coveredRange > totalFrames)
+                                dStart = (totalFrames > coveredRange) ? totalFrames - coveredRange : 0;
+                            uploadWaveformDetailTexture(tMut, dStart, fpbUse);
+                        }
+                        if (tMut->waveformDetailTex) {
+                            texId = tMut->waveformDetailTex;
+                            uint64_t dRange = (uint64_t)(tMut->waveformDetailEnd - tMut->waveformDetailStart);
+                            if (dRange > 0) {
+                                u1 = (float)((double)((int64_t)viewStart - (int64_t)tMut->waveformDetailStart) / (double)dRange);
+                                u2 = (float)((double)((int64_t)viewEnd   - (int64_t)tMut->waveformDetailStart) / (double)dRange);
+                            }
+                        }
+                    } else {
+                        u1 = (float)((double)viewStart / (double)totalFrames);
+                        u2 = (float)((double)viewEnd   / (double)totalFrames);
                     }
 
-                    float y1 = centerY - (maxVal * waveformSize.y * 0.45f * m_waveformVerticalZoom);
-                    float y2 = centerY - (minVal * waveformSize.y * 0.45f * m_waveformVerticalZoom);
-
-                    float trackTop = cursorPos.y;
-                    float trackBottom = cursorPos.y + waveformSize.y;
-                    if (y1 < trackTop) y1 = trackTop;
-                    if (y2 > trackBottom) y2 = trackBottom;
-
-                    drawList->AddLine(ImVec2(cursorPos.x + x, y1),
-                                     ImVec2(cursorPos.x + x, y2),
-                                     waveColor);
-
+                    drawList->AddImage(
+                        (ImTextureID)(uintptr_t)texId,
+                        ImVec2(cursorPos.x,                  top),
+                        ImVec2(cursorPos.x + waveformSize.x, bottom),
+                        ImVec2(u1, 0.0f), ImVec2(u2, 1.0f),
+                        waveColor);
+                    // Bloom layer 3 bounding rect.
                     WaveformDrawCmd cmd;
-                    cmd.x1 = cursorPos.x + x; cmd.y1 = y1;
-                    cmd.x2 = cursorPos.x + x; cmd.y2 = y2;
-                    cmd.isRect = false;
-                    cmd.color = waveColor;
+                    cmd.x1     = cursorPos.x;
+                    cmd.y1     = top;
+                    cmd.isRect = true;
+                    cmd.rectX2 = cursorPos.x + waveformSize.x;
+                    cmd.rectY2 = bottom;
+                    cmd.color  = waveColor;
                     m_waveformDrawCmds.push_back(cmd);
                 }
             }
@@ -1976,7 +2294,53 @@ void GUIManager::renderWaveform(float height) {
                 storeLineCmd(playbackX, cursorPos.y, playbackX, cursorPos.y + waveformSize.y, playheadColor, 2.0f);
             }
 
-            ImGui::Spacing();
+            // Horizontal separator between tracks — visually pairs with the
+            // matching Separator in the left panel's TRACKS view, and picks
+            // up the track's blue/gray colour like the rest of the row.
+            ImGui::PushStyleColor(ImGuiCol_Separator,
+                isSelected ? ImVec4(0.95f, 0.95f, 0.95f, 1.0f)
+                           : ImVec4(0.30f, 0.55f, 0.80f, 1.0f));
+            ImGui::Separator();
+            ImGui::PopStyleColor();
+        }
+        else if (track) {
+            // Empty track (no audio loaded yet) — show a placeholder slot so
+            // the user can see the track exists in the arrangement. Name
+            // is intentionally not drawn here; only in the left panel.
+            bool isSelected = (selectedTrack == i);
+
+            float availableWidth = ImGui::GetContentRegionAvail().x;
+            float labelPadding = 20.0f;
+            ImVec2 waveformSize(availableWidth, perTrackWaveformHeight);
+            ImVec2 cursorPos = ImGui::GetCursorScreenPos();
+            cursorPos.y += labelPadding;
+
+            ImGui::InvisibleButton(("track_" + std::to_string(i)).c_str(),
+                                   ImVec2(waveformSize.x, waveformSize.y + labelPadding));
+            if (ImGui::IsItemClicked()) {
+                m_audioEngine->setSelectedTrack(i);
+            }
+
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            ImU32 bgColor = (m_colorScheme == 1)
+                ? IM_COL32((int)(m_customBgColor[0] * 255),
+                           (int)(m_customBgColor[1] * 255),
+                           (int)(m_customBgColor[2] * 255), 255)
+                : (isSelected ? IM_COL32(40, 50, 60, 255) : IM_COL32(30, 30, 30, 255));
+            drawList->AddRectFilled(cursorPos,
+                                    ImVec2(cursorPos.x + waveformSize.x, cursorPos.y + waveformSize.y),
+                                    bgColor);
+            // Center-line and empty-state label so it doesn't look broken.
+            float centerY = cursorPos.y + waveformSize.y * 0.5f;
+            drawList->AddLine(ImVec2(cursorPos.x, centerY),
+                              ImVec2(cursorPos.x + waveformSize.x, centerY),
+                              IM_COL32(80, 80, 80, 255));
+            const char* emptyText = "(no audio loaded)";
+            ImVec2 textSize = ImGui::CalcTextSize(emptyText);
+            drawList->AddText(ImVec2(cursorPos.x + (waveformSize.x - textSize.x) * 0.5f,
+                                     centerY - textSize.y * 0.5f - 12),
+                              IM_COL32(120, 120, 120, 255), emptyText);
+            ImGui::Separator();
         }
     }
 
@@ -2133,37 +2497,7 @@ void GUIManager::renderTransportBar() {
         ImGui::PopStyleColor(3);
     }
 
-    // Bloom controls
-    ImGui::SameLine();
-    ImGui::Checkbox("Glow", &m_bloomEnabled);
-
-    if (m_bloomEnabled) {
-        float availableWidth = ImGui::GetContentRegionAvail().x;
-        float sliderWidth = 120.0f;
-        float labelWidth = 70.0f;
-        float spacing = (availableWidth - 3 * (labelWidth + sliderWidth)) / 4.0f;
-        if (spacing < 20.0f) spacing = 20.0f;
-
-        ImGui::SetCursorPosX(spacing);
-        ImGui::Text("Glow Text");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(sliderWidth);
-        ImGui::SliderFloat("##bloomText", &m_bloomTextIntensity, 0.0f, 1.0f, "%.2f");
-
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(spacing + labelWidth + sliderWidth + spacing);
-        ImGui::Text("Glow Lines");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(sliderWidth);
-        ImGui::SliderFloat("##bloomLines", &m_bloomLinesIntensity, 0.0f, 1.0f, "%.2f");
-
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(spacing + 2 * (labelWidth + sliderWidth + spacing));
-        ImGui::Text("Glow UI");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(sliderWidth);
-        ImGui::SliderFloat("##bloomUI", &m_bloomUIIntensity, 0.0f, 1.0f, "%.2f");
-    }
+    // (Glow controls moved to left panel → WAVEFORM view.)
 
     // Color picker popup
     if (m_colorScheme == 1 && m_showColorPickers) {
@@ -2532,7 +2866,8 @@ void GUIManager::saveSettings() {
     }
 
     // Get audio engine settings
-    float scrubSpeed = m_audioEngine ? m_audioEngine->getScrubSpeed() : 0.25f;
+    float scrubSpeed = m_audioEngine ? m_audioEngine->getScrubSpeed() : 1.0f;
+    float silentScrubSpeed = m_audioEngine ? m_audioEngine->getSilentScrubSpeed() : 0.7f;
     float rpmThreshold = m_audioEngine ? m_audioEngine->getScrubRpmThreshold() : 30.0f;
     float fastSpeedMult = m_audioEngine ? m_audioEngine->getFastSpeedMultiplier() : 4.0f;
     float rpmAveraging = m_audioEngine ? m_audioEngine->getRpmAveraging() : 0.7f;
@@ -2560,6 +2895,7 @@ void GUIManager::saveSettings() {
     file << "\n";
     file << "  \"audio\": {\n";
     file << "    \"scrubSpeed\": " << scrubSpeed << ",\n";
+    file << "    \"silentScrubSpeed\": " << silentScrubSpeed << ",\n";
     file << "    \"rpmThreshold\": " << rpmThreshold << ",\n";
     file << "    \"fastSpeedMultiplier\": " << fastSpeedMult << ",\n";
     file << "    \"rpmAveraging\": " << rpmAveraging << "\n";
@@ -2599,6 +2935,396 @@ void GUIManager::saveSettings() {
 
     file.close();
     std::cout << "Settings saved to c:\\0_CODE\\Dogma75\\settings\\user_settings.json" << std::endl;
+}
+
+void GUIManager::saveSession() {
+#ifdef _WIN32
+    char filename[MAX_PATH] = "session.json";
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = nullptr;
+    ofn.lpstrFilter = "DAW session (*.json)\0*.json\0All files\0*.*\0";
+    ofn.lpstrFile   = filename;
+    ofn.nMaxFile    = sizeof(filename);
+    ofn.lpstrTitle  = "Save DAW Session";
+    ofn.lpstrDefExt = "json";
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameA(&ofn)) return;
+
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Session save failed: " << filename << std::endl;
+        return;
+    }
+
+    int trackCount = m_audioEngine->getTrackCount();
+    file << "{\n";
+    file << "  \"selectedTrack\":       " << m_audioEngine->getSelectedTrack()   << ",\n";
+    file << "  \"playbackPosition\":    " << m_audioEngine->getPlaybackPosition()<< ",\n";
+    file << "  \"waveformZoom\":        " << m_audioEngine->getWaveformZoom()    << ",\n";
+    file << "  \"viewCenter\":          " << m_viewCenterPosition                << ",\n";
+    file << "  \"waveformVerticalZoom\":" << m_waveformVerticalZoom              << ",\n";
+    file << "  \"trackHeight\":         " << m_trackHeight                       << ",\n";
+    file << "  \"simplifiedWaveform\":  " << (m_simplifiedWaveform ? "true" : "false") << ",\n";
+    file << "  \"zoomSmoothing\":       " << (m_zoomSmoothing      ? "true" : "false") << ",\n";
+    file << "  \"waveformScrolling\":   " << (m_waveformScrolling  ? "true" : "false") << ",\n";
+    file << "  \"waveformAutoPage\":    " << (m_waveformAutoPage   ? "true" : "false") << ",\n";
+    file << "  \"leftPanelMode\":       " << m_leftPanelMode                     << ",\n";
+    file << "  \"silentScrubSpeed\":    " << m_audioEngine->getSilentScrubSpeed()<< ",\n";
+    file << "  \"scrubSpeed\":          " << m_audioEngine->getScrubSpeed()      << ",\n";
+    file << "  \"loopEnabled\":         " << (m_audioEngine->getLoopEnabled()          ? "true" : "false") << ",\n";
+    file << "  \"recordEnabled\":       " << (m_audioEngine->getRecordEnabled()        ? "true" : "false") << ",\n";
+    file << "  \"returnToStartOnStop\": " << (m_audioEngine->getReturnToStartOnStop()  ? "true" : "false") << ",\n";
+    file << "  \"markers\": [\n";
+    for (int mi = 0; mi < 4; mi++) {
+        // "everSet" round-trips whether the marker has EVER been placed,
+        // so a session with no record loop restores to no record loop
+        // (and the loop-edit LED stays dark instead of flashing).
+        file << "    { \"position\": " << m_audioEngine->getMarkerPosition(mi)
+             << ", \"enabled\": " << (m_audioEngine->isMarkerEnabled(mi) ? "true" : "false")
+             << ", \"everSet\": " << (m_audioEngine->markerEverSet(mi)   ? "true" : "false")
+             << " }" << (mi < 3 ? "," : "") << "\n";
+    }
+    file << "  ],\n";
+    file << "  \"tracks\": [\n";
+    for (int i = 0; i < trackCount; i++) {
+        const Track* t = m_audioEngine->getTrack(i);
+        if (!t) continue;
+        auto escape = [](const std::string& s) {
+            std::string out;
+            for (char c : s) {
+                if (c == '"' || c == '\\') { out += '\\'; out += c; }
+                else if (c == '\n') out += "\\n";
+                else out += c;
+            }
+            return out;
+        };
+        file << "    {\n";
+        file << "      \"name\":       \"" << escape(t->name)     << "\",\n";
+        file << "      \"filePath\":   \"" << escape(t->filePath) << "\",\n";
+        file << "      \"volume\":     " << t->volume      << ",\n";
+        file << "      \"pan\":        " << t->pan         << ",\n";
+        file << "      \"muted\":      " << (t->muted ? "true" : "false") << ",\n";
+        file << "      \"solo\":       " << (t->solo  ? "true" : "false") << ",\n";
+        file << "      \"armed\":      " << (t->armed ? "true" : "false") << ",\n";
+        file << "      \"outputPair\": " << t->outputPair  << "\n";
+        file << "    }" << (i + 1 < trackCount ? "," : "") << "\n";
+    }
+    file << "  ]\n";
+    file << "}\n";
+    file.close();
+    std::cout << "Session saved to " << filename << std::endl;
+#endif
+}
+
+void GUIManager::openSession() {
+#ifdef _WIN32
+    char filename[MAX_PATH] = "";
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "DAW session (*.json)\0*.json\0All files\0*.*\0";
+    ofn.lpstrFile   = filename;
+    ofn.nMaxFile    = sizeof(filename);
+    ofn.lpstrTitle  = "Open DAW Session";
+    ofn.lpstrDefExt = "json";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&ofn)) return;
+    loadSessionFromFile(filename);
+#endif
+}
+
+void GUIManager::loadSessionFromFile(const std::string& path) {
+#ifdef _WIN32
+    const char* filename = path.c_str();
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Session open failed: " << filename << std::endl;
+        return;
+    }
+    std::stringstream buf; buf << file.rdbuf();
+    std::string json = buf.str();
+
+    // Minimal JSON walker — we only read strings, numbers, and booleans from
+    // fixed keys the saver wrote. Each track object starts at a "{" nested
+    // inside the "tracks" array; we scan sequentially.
+    auto findKeyAfter = [&](const std::string& key, size_t from) -> size_t {
+        return json.find("\"" + key + "\"", from);
+    };
+    auto readString = [&](size_t keyPos) -> std::string {
+        size_t colon = json.find(':', keyPos);
+        if (colon == std::string::npos) return "";
+        size_t q1 = json.find('"', colon + 1);
+        if (q1 == std::string::npos) return "";
+        std::string out;
+        for (size_t i = q1 + 1; i < json.size(); i++) {
+            char c = json[i];
+            if (c == '\\' && i + 1 < json.size()) { out += json[i + 1]; i++; continue; }
+            if (c == '"') break;
+            out += c;
+        }
+        return out;
+    };
+    auto readNumber = [&](size_t keyPos) -> double {
+        size_t colon = json.find(':', keyPos);
+        if (colon == std::string::npos) return 0.0;
+        return atof(json.c_str() + colon + 1);
+    };
+    auto readBool = [&](size_t keyPos) -> bool {
+        size_t colon = json.find(':', keyPos);
+        if (colon == std::string::npos) return false;
+        size_t t = json.find_first_not_of(" \t\r\n", colon + 1);
+        return t != std::string::npos && json[t] == 't';
+    };
+
+    // Clear existing tracks (delete from the back so indices stay valid).
+    for (int i = m_audioEngine->getTrackCount() - 1; i >= 0; i--) {
+        m_audioEngine->deleteTrack(i);
+    }
+
+    size_t tracksKey = json.find("\"tracks\"");
+    size_t cursor    = (tracksKey == std::string::npos) ? std::string::npos : tracksKey;
+    while (cursor != std::string::npos) {
+        size_t objStart = json.find('{', cursor);
+        if (objStart == std::string::npos) break;
+        size_t objEnd = json.find('}', objStart);
+        if (objEnd == std::string::npos) break;
+
+        // Read each field only within [objStart, objEnd].
+        auto keyIn = [&](const std::string& key) -> size_t {
+            size_t p = findKeyAfter(key, objStart);
+            return (p != std::string::npos && p < objEnd) ? p : std::string::npos;
+        };
+
+        std::string name     = keyIn("name")     != std::string::npos ? readString(keyIn("name"))     : "";
+        std::string filePath = keyIn("filePath") != std::string::npos ? readString(keyIn("filePath")) : "";
+        double vol           = keyIn("volume")     != std::string::npos ? readNumber(keyIn("volume"))     : 1.0;
+        double pan           = keyIn("pan")        != std::string::npos ? readNumber(keyIn("pan"))        : 0.0;
+        bool muted           = keyIn("muted")      != std::string::npos ? readBool(keyIn("muted"))        : false;
+        bool solo            = keyIn("solo")       != std::string::npos ? readBool(keyIn("solo"))         : false;
+        bool armed           = keyIn("armed")      != std::string::npos ? readBool(keyIn("armed"))        : false;
+        int outputPair       = keyIn("outputPair") != std::string::npos ? (int)readNumber(keyIn("outputPair")) : 0;
+
+        int newIdx = m_audioEngine->addTrack(name);
+        Track* t = m_audioEngine->getTrack(newIdx);
+        if (t) {
+            t->name       = name;   // preserve exactly (addTrack may have munged)
+            t->volume     = (float)vol;
+            t->pan        = (float)pan;
+            t->muted      = muted;
+            t->solo       = solo;
+            t->armed      = armed;
+            t->outputPair = outputPair;
+        }
+        if (!filePath.empty()) {
+            m_audioEngine->loadTrackAudio(newIdx, filePath);
+            if (t) t->name = name;   // load must not change the stored name
+        }
+
+        cursor = objEnd + 1;
+        // Stop if the next non-space char is ']' (end of tracks array).
+        size_t nxt = json.find_first_not_of(" \t\r\n,", cursor);
+        if (nxt == std::string::npos || json[nxt] == ']') break;
+    }
+
+    // Top-level scalar restore. Each is optional — missing keys leave the
+    // current value in place, which is the right behaviour for older
+    // session files that pre-date some of these fields.
+    auto readTop = [&](const std::string& key) -> size_t {
+        return findKeyAfter(key, 0);
+    };
+    size_t k;
+    if ((k = readTop("playbackPosition"))     != std::string::npos) m_audioEngine->setPlaybackPosition((size_t)readNumber(k));
+    if ((k = readTop("waveformZoom"))         != std::string::npos) m_audioEngine->setWaveformZoom((float)readNumber(k));
+    if ((k = readTop("viewCenter"))           != std::string::npos) m_viewCenterPosition = (size_t)readNumber(k);
+    if ((k = readTop("waveformVerticalZoom")) != std::string::npos) m_waveformVerticalZoom = (float)readNumber(k);
+    if ((k = readTop("trackHeight"))          != std::string::npos) m_trackHeight          = (float)readNumber(k);
+    if ((k = readTop("simplifiedWaveform"))   != std::string::npos) m_simplifiedWaveform   = readBool(k);
+    if ((k = readTop("zoomSmoothing"))        != std::string::npos) m_zoomSmoothing        = readBool(k);
+    if ((k = readTop("waveformScrolling"))    != std::string::npos) m_waveformScrolling    = readBool(k);
+    if ((k = readTop("waveformAutoPage"))     != std::string::npos) m_waveformAutoPage     = readBool(k);
+    if ((k = readTop("leftPanelMode"))        != std::string::npos) m_leftPanelMode        = (int)readNumber(k);
+    if ((k = readTop("silentScrubSpeed"))     != std::string::npos) m_audioEngine->setSilentScrubSpeed((float)readNumber(k));
+    if ((k = readTop("scrubSpeed"))           != std::string::npos) m_audioEngine->setScrubSpeed((float)readNumber(k));
+    if ((k = readTop("loopEnabled"))          != std::string::npos) m_audioEngine->setLoopEnabled(readBool(k));
+    if ((k = readTop("recordEnabled"))        != std::string::npos) m_audioEngine->setRecordEnabled(readBool(k));
+    if ((k = readTop("returnToStartOnStop"))  != std::string::npos) m_audioEngine->setReturnToStartOnStop(readBool(k));
+
+    // Markers array — walk it the same way as the tracks array.
+    size_t markersKey = json.find("\"markers\"");
+    if (markersKey != std::string::npos) {
+        size_t mcur = markersKey;
+        for (int mi = 0; mi < 4; mi++) {
+            size_t objStart = json.find('{', mcur);
+            if (objStart == std::string::npos) break;
+            size_t objEnd = json.find('}', objStart);
+            if (objEnd == std::string::npos) break;
+            auto mKeyIn = [&](const std::string& key) -> size_t {
+                size_t p = findKeyAfter(key, objStart);
+                return (p != std::string::npos && p < objEnd) ? p : std::string::npos;
+            };
+            size_t pos = mKeyIn("position") != std::string::npos ? (size_t)readNumber(mKeyIn("position")) : 0;
+            bool   en  = mKeyIn("enabled")  != std::string::npos ? readBool(mKeyIn("enabled"))            : false;
+            // Prefer the explicit "everSet" field written by newer saves.
+            // For older sessions without it, infer: a marker at position 0
+            // with enabled=false was almost certainly never placed.
+            bool ever;
+            if (mKeyIn("everSet") != std::string::npos) {
+                ever = readBool(mKeyIn("everSet"));
+            } else {
+                ever = (pos != 0) || en;
+            }
+            if (ever) m_audioEngine->setMarker(mi, pos, en);
+            else      m_audioEngine->resetMarker(mi);
+            mcur = objEnd + 1;
+        }
+    }
+
+    // Selected track last so it wins over anything the loader did.
+    size_t selKey = json.find("\"selectedTrack\"");
+    if (selKey != std::string::npos) {
+        int sel = (int)readNumber(selKey);
+        if (sel >= 0 && sel < m_audioEngine->getTrackCount()) {
+            m_audioEngine->setSelectedTrack(sel);
+        }
+    }
+
+    std::cout << "Session loaded from " << filename << std::endl;
+#endif
+}
+
+void GUIManager::uploadWaveformTexture(Track* t) {
+    if (!t) return;
+    size_t total = t->getTotalFrames();
+    if (total == 0) return;
+    // Delete previous texture if it exists (audio was reloaded).
+    if (t->waveformTex) {
+        GLuint old = (GLuint)t->waveformTex;
+        glDeleteTextures(1, &old);
+        t->waveformTex = 0;
+    }
+    // Wide, short texture: enough horizontal resolution that GPU linear
+    // filtering never shows individual texels even at deep zoom, and just
+    // tall enough that vertical scaling looks smooth. 16384 × 256 × 4 =
+    // 16 MB per track — comfortable on any GPU from the last decade.
+    const int W = 16384;
+    const int H = 256;
+    std::vector<uint32_t> pixels(W * H, 0);
+    for (int x = 0; x < W; x++) {
+        size_t fStart = (size_t)((uint64_t)x       * (uint64_t)total / (uint64_t)W);
+        size_t fEnd   = (size_t)((uint64_t)(x + 1) * (uint64_t)total / (uint64_t)W);
+        if (fStart >= total) continue;
+        if (fEnd > total) fEnd = total;
+        if (fEnd <= fStart) fEnd = fStart + 1;
+        // Reuse the peak pyramid: much faster than raw-sample scan on load.
+        Track::PeakBucket peak;
+        t->getPeaks(fStart, fEnd, &peak, 1);
+        float centerY = H * 0.5f;
+        int yTop = (int)(centerY - peak.maxVal * (H * 0.45f));
+        int yBot = (int)(centerY - peak.minVal * (H * 0.45f));
+        if (yTop < 0)  yTop = 0;
+        if (yBot >= H) yBot = H - 1;
+        if (yTop > yBot) std::swap(yTop, yBot);
+        // Ensure at least one visible pixel so silent regions still show
+        // a hairline through the middle.
+        if (yBot == yTop) {
+            int mid = (int)centerY;
+            yTop = mid; yBot = mid;
+        }
+        for (int y = yTop; y <= yBot; y++) {
+            pixels[y * W + x] = 0xFFFFFFFF;   // opaque white; ImGui tints via vertex colour
+        }
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    t->waveformTex        = tex;
+    t->waveformTexW       = W;
+    t->waveformTexH       = H;
+    t->waveformTexVersion = t->audioVersion;
+}
+
+void GUIManager::uploadWaveformDetailTexture(Track* t, size_t startFrame, size_t framesPerBucket) {
+    if (!t) return;
+    size_t total = t->getTotalFrames();
+    if (total == 0 || framesPerBucket == 0) return;
+    const int W = 8192;
+    const int H = 256;
+    // Snap startFrame down to a framesPerBucket boundary — key invariant
+    // that keeps texel content identical across rebuilds.
+    startFrame = (startFrame / framesPerBucket) * framesPerBucket;
+    size_t endFrame = startFrame + (size_t)W * framesPerBucket;
+    if (endFrame > total) endFrame = total;
+    if (startFrame >= endFrame) return;
+
+    bool needAlloc = (t->waveformDetailTex == 0 ||
+                      t->waveformDetailW != W ||
+                      t->waveformDetailH != H ||
+                      t->waveformDetailVersion != t->audioVersion);
+    static thread_local std::vector<uint32_t> pixels;
+    if ((int)pixels.size() < W * H) pixels.assign(W * H, 0);
+    else std::fill(pixels.begin(), pixels.begin() + W * H, 0);
+
+    // At extreme zoom, framesPerBucket can drop below the peak pyramid's
+    // base bucket size (64 samples) — the pyramid would then return the
+    // coarser 64-sample level, blurring what should be sample-accurate.
+    // Read raw samples directly in that regime so the render stays crisp
+    // all the way down to one sample per texel.
+    bool rawMode = (framesPerBucket < Track::PEAK_BASE_BUCKET);
+    for (int x = 0; x < W; x++) {
+        size_t fs = startFrame + (size_t)x       * framesPerBucket;
+        size_t fe = fs + framesPerBucket;
+        if (fs >= total) break;
+        if (fe > total) fe = total;
+        float mn = 0.0f, mx = 0.0f;
+        if (rawMode) {
+            for (size_t f = fs; f < fe; f++) {
+                float v = t->getMixedSample(f);
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+        } else {
+            Track::PeakBucket peak;
+            t->getPeaks(fs, fe, &peak, 1);
+            mn = peak.minVal; mx = peak.maxVal;
+        }
+        float centerY = H * 0.5f;
+        int yTop = (int)(centerY - mx * (H * 0.45f));
+        int yBot = (int)(centerY - mn * (H * 0.45f));
+        if (yTop < 0) yTop = 0;
+        if (yBot >= H) yBot = H - 1;
+        if (yTop > yBot) std::swap(yTop, yBot);
+        if (yBot == yTop) { int m = (int)centerY; yTop = m; yBot = m; }
+        for (int y = yTop; y <= yBot; y++) pixels[y * W + x] = 0xFFFFFFFF;
+    }
+    if (needAlloc) {
+        if (t->waveformDetailTex) {
+            GLuint old = (GLuint)t->waveformDetailTex;
+            glDeleteTextures(1, &old);
+        }
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        t->waveformDetailTex     = tex;
+        t->waveformDetailW       = W;
+        t->waveformDetailH       = H;
+        t->waveformDetailVersion = t->audioVersion;
+    } else {
+        glBindTexture(GL_TEXTURE_2D, (GLuint)t->waveformDetailTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    }
+    t->waveformDetailStart = startFrame;
+    t->waveformDetailEnd   = endFrame;
+    t->waveformDetailFPB   = framesPerBucket;
 }
 
 void GUIManager::loadSettings() {
@@ -2683,7 +3409,8 @@ void GUIManager::loadSettings() {
     // Load audio settings (will be applied after audio engine is ready)
     if (m_audioEngine) {
         m_audioEngine->setControllerMode(m_controllerMode);  // Sync controller mode
-        m_audioEngine->setScrubSpeed(getFloat("scrubSpeed", 0.25f));
+        m_audioEngine->setScrubSpeed(getFloat("scrubSpeed", 1.0f));
+        m_audioEngine->setSilentScrubSpeed(getFloat("silentScrubSpeed", 0.7f));
         m_audioEngine->setScrubRpmThreshold(getFloat("rpmThreshold", 30.0f));
         m_audioEngine->setFastSpeedMultiplier(getFloat("fastSpeedMultiplier", 4.0f));
         m_audioEngine->setRpmAveraging(getFloat("rpmAveraging", 0.7f));

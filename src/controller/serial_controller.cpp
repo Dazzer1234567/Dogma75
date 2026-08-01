@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -158,6 +159,11 @@ bool SerialController::initialize(const std::string& portName) {
     // Spawn the reader thread now that the handle is valid.
     m_readerStop.store(false);
     m_readerThread = std::thread(&SerialController::readerLoop, this);
+    // Spawn the writer thread — sendMessage() now only enqueues, this
+    // thread owns every WriteFile call so main-loop timing is decoupled
+    // from Teensy USB-CDC stalls.
+    m_writerStop.store(false);
+    m_writerThread = std::thread(&SerialController::writerLoop, this);
 
     return true;
 #else
@@ -234,11 +240,16 @@ bool SerialController::autoDetect() {
 
 void SerialController::shutdown() {
 #ifdef _WIN32
-    // Signal the reader thread and wait for it to exit before closing the
-    // handle it's reading from.
+    // Signal both worker threads and wait for them before closing the
+    // handle they share.
     m_readerStop.store(true);
     if (m_readerThread.joinable()) {
         m_readerThread.join();
+    }
+    m_writerStop.store(true);
+    m_queueCv.notify_all();
+    if (m_writerThread.joinable()) {
+        m_writerThread.join();
     }
     if (m_serialHandle) {
         CloseHandle(static_cast<HANDLE>(m_serialHandle));
@@ -251,13 +262,56 @@ void SerialController::shutdown() {
 void SerialController::sendMessage(const std::string& message) {
 #ifdef _WIN32
     if (!m_serialHandle) return;
-    HANDLE hSerial = static_cast<HANDLE>(m_serialHandle);
-    DWORD bytesWritten;
-    std::string msg = message + "\n";
-    std::lock_guard<std::mutex> lock(m_sendMutex);
-    WriteFile(hSerial, msg.c_str(), (DWORD)msg.size(), &bytesWritten, NULL);
+    // Non-blocking enqueue. The writer thread owns the actual WriteFile.
+    // Drop the OLDEST heartbeat when the queue overflows — heartbeats are
+    // safe to lose (firmware just uses their arrival time). Any other
+    // message is kept.
+    std::unique_lock<std::mutex> lock(m_queueMutex);
+    if (m_sendQueue.size() >= MAX_QUEUE_SIZE) {
+        for (auto it = m_sendQueue.begin(); it != m_sendQueue.end(); ++it) {
+            if (*it == "HB") { m_sendQueue.erase(it); break; }
+        }
+        if (m_sendQueue.size() >= MAX_QUEUE_SIZE) {
+            m_sendQueue.pop_front();   // last resort: drop oldest of any kind
+        }
+    }
+    m_sendQueue.push_back(message);
+    lock.unlock();
+    m_queueCv.notify_one();
 #else
     (void)message;
+#endif
+}
+
+void SerialController::writerLoop() {
+#ifdef _WIN32
+    if (!m_serialHandle) return;
+    HANDLE hSerial = static_cast<HANDLE>(m_serialHandle);
+    while (!m_writerStop.load()) {
+        std::unique_lock<std::mutex> lock(m_queueMutex);
+        m_queueCv.wait(lock, [this]{ return m_writerStop.load() || !m_sendQueue.empty(); });
+        if (m_writerStop.load() && m_sendQueue.empty()) return;
+        std::string msg = std::move(m_sendQueue.front());
+        m_sendQueue.pop_front();
+        lock.unlock();
+
+        msg += '\n';
+        DWORD bytesWritten;
+        auto t0 = std::chrono::steady_clock::now();
+        // This can block for hundreds of ms — that's fine now, we're off
+        // the main thread. Log slow ones so we can still see when the
+        // Teensy is not draining its USB endpoint.
+        WriteFile(hSerial, msg.c_str(), (DWORD)msg.size(), &bytesWritten, NULL);
+        auto t1 = std::chrono::steady_clock::now();
+        auto writeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        if (writeMs > 100.0f) {
+            std::ofstream f("c:\\0_CODE\\Dogma75\\perf.log", std::ios::app);
+            if (f.is_open()) {
+                if (!msg.empty() && msg.back() == '\n') msg.pop_back();
+                f << "SLOW WRITE (bg)  " << writeMs << " ms  msg=\"" << msg << "\"\n";
+            }
+        }
+    }
 #endif
 }
 
@@ -430,6 +484,54 @@ void SerialController::processLine(const std::string& line) {
         if (m_modeCallback) {
             m_modeCallback(line == "MODE:DESC");
         }
+        return;
+    }
+
+    // NAME:<text> — user finalised the on-controller name entry (pad 21).
+    if (line.find("NAME:") == 0) {
+        std::string name = line.substr(5);
+        if (m_nameCallback) {
+            m_nameCallback(name);
+        }
+        return;
+    }
+    // RENAMEBUF:<cursorPos>:<text> — live rename buffer update.
+    if (line.find("RENAMEBUF:") == 0) {
+        std::string rest = line.substr(10);
+        size_t colon = rest.find(':');
+        int cursor = 0;
+        std::string buf;
+        if (colon != std::string::npos) {
+            try { cursor = std::stoi(rest.substr(0, colon)); } catch (...) { cursor = 0; }
+            buf = rest.substr(colon + 1);
+        } else {
+            buf = rest;
+        }
+        if (m_renameBufferCallback) m_renameBufferCallback(buf, cursor, true);
+        return;
+    }
+    // RENAMEEND — firmware left text-input mode without a finalise.
+    if (line == "RENAMEEND") {
+        if (m_renameBufferCallback) m_renameBufferCallback("", 0, false);
+        return;
+    }
+    // DELETEPAIR:LOOP / :REC — user held pad 19 and tapped a marker pad
+    // to wipe the pair. Handled via a sentinel pad number so we don't
+    // need another dedicated wiring path. 200 = loop, 201 = record.
+    if (line == "DELETEPAIR:LOOP" || line == "DELETEPAIR:REC") {
+        if (m_touchCallback) {
+            int sentinel = (line == "DELETEPAIR:LOOP") ? 200 : 201;
+            m_touchCallback(sentinel, true);
+        }
+        return;
+    }
+    // RENAMESYNC:<phaseMs> — firmware LED-flash phase snapshot at the
+    // start of a rename, so the DAW can pulse in sync.
+    if (line.find("RENAMESYNC:") == 0) {
+        try {
+            int phase = std::stoi(line.substr(11));
+            if (m_renameSyncCallback) m_renameSyncCallback(phase);
+        } catch (...) {}
         return;
     }
 

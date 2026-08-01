@@ -1,10 +1,12 @@
 #pragma once
 
 #include <vector>
+#include <string>
 
 // Forward declarations
 class AudioEngine;
 class SerialController;
+struct Track;
 struct SDL_Window;
 typedef void* SDL_GLContext;
 
@@ -39,9 +41,42 @@ public:
     void processFrame();
     void render();
 
+    // Per-stage timing samples fed in by main.cpp so the FPS overlay can
+    // report which stage of the loop stalled. Values are milliseconds.
+    void reportStageTime(const char* stage, float ms);
+    // One-call-per-frame stats. Feeds the FPS overlay's stage panels AND
+    // keeps a rolling ring buffer of the last N frames. When total_ms
+    // crosses SPIKE_LOG_THRESHOLD_MS the ring buffer is dumped to
+    // perf.log with a "SPIKE" marker, giving Claude a self-serve
+    // snapshot of exactly what happened around the hitch.
+    void reportFrameStats(float total_ms, float midi_ms, float update_ms, float frame_ms);
+
 private:
     bool m_running;
     SDL_Window* m_window;
+    // Rolling worst-frame-time-per-stage bookkeeping, for the FPS overlay.
+    // Keyed by a short static-string label so we don't allocate at report time.
+    struct StageStat {
+        const char* label;
+        float worstMs;
+        float lastMs;
+    };
+    static constexpr int kStageStatCount = 6;
+    StageStat m_stageStats[kStageStatCount] = {};
+
+    // Rolling frame-time history for the perf.log dumper.
+    struct FrameSample {
+        int64_t tMs;         // wall-clock ms since app start (Perf lightweight)
+        float total, midi, update, frame;
+    };
+    static constexpr int kFrameHistoryLen = 240;   // ~4 s at 60 fps
+    FrameSample m_frameHistory[kFrameHistoryLen] = {};
+    int  m_frameHistoryIdx   = 0;
+    int  m_frameHistoryCount = 0;
+    int64_t m_perfStartMs    = 0;
+    int64_t m_lastSpikeDumpMs = 0;
+    static constexpr float   SPIKE_LOG_THRESHOLD_MS = 100.0f;
+    static constexpr int64_t SPIKE_LOG_MIN_GAP_MS  = 2000;  // rate-limit dumps
     SDL_GLContext m_glContext;
     AudioEngine* m_audioEngine;
     SerialController* m_serialController;
@@ -56,6 +91,9 @@ private:
     char m_parkNames[4][64];
     int m_editingParkButton;
     int m_selectedParkButton;
+    // Left panel view: 0 = Tracks, 1 = Scrubbing. Selected via a dropdown
+    // combo at the top of the panel.
+    int m_leftPanelMode = 0;
 
     // Zoom smoothing toggle
     bool m_zoomSmoothing;
@@ -74,6 +112,7 @@ private:
     // user reverses direction.
     int  m_lastZoomDirection = 0;      // +1 zoom-in, -1 zoom-out, 0 = fresh
     bool m_zoomAnchorPinPlayhead = true;
+
 
     // Waveform vertical zoom (amplitude scaling) and track height
     float m_waveformVerticalZoom;  // 1.0 = normal, 2.0 = 2x amplitude
@@ -152,4 +191,21 @@ private:
     unsigned int compileShader(const char* vertexSrc, const char* fragmentSrc);
     void saveSettings();
     void loadSettings();
+    // Build (or rebuild) a wide RGBA texture containing the full waveform
+    // envelope of `t`. Called lazily from renderWaveform when the track
+    // has been (re)loaded since the last upload.
+    void uploadWaveformTexture(Track* t);
+    // Build the on-demand high-detail texture. Texel size is fixed at
+    // `framesPerBucket` samples and boundaries are aligned to sample 0 so
+    // that panning across the texture edge only shifts which aligned
+    // window we show — texel contents themselves are always identical.
+    // This is what keeps the render flicker-free during pan.
+    void uploadWaveformDetailTexture(Track* t, size_t startFrame, size_t framesPerBucket);
+    // Serialize the current DAW session (tracks + their metadata) to a JSON
+    // file. Uses the Win32 save-file dialog on Windows.
+    void saveSession();
+    // Load a session file written by saveSession(). Replaces the current
+    // set of tracks and re-loads each track's audio from its stored path.
+    void openSession();                                        // shows file dialog
+    void loadSessionFromFile(const std::string& path);         // no dialog
 };
