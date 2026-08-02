@@ -92,6 +92,9 @@ public:
     int getSelectedTrack() const { return m_selectedTrack; }
     void setSelectedTrack(int trackIndex) { m_selectedTrack = trackIndex; }
     bool loadTrackAudio(int trackIndex, const std::string& filepath);
+    // Wipe audio from a track but keep the strip (name, mixer state, etc.).
+    // Used by the Ctrl+A "clear audio" hotkey.
+    void clearTrackAudio(int trackIndex);
 
     // Waveform zoom
     float getWaveformZoom() const { return m_waveformZoom; }
@@ -136,6 +139,7 @@ public:
             m_markerPositions[markerIndex] = position;
             m_markerEnabled[markerIndex] = true;
             m_markerEverSet[markerIndex] = true;
+            markSessionDirty();
         }
     }
     size_t getMarkerPosition(int markerIndex) const {
@@ -148,7 +152,10 @@ public:
         return (markerIndex >= 0 && markerIndex < 4) ? m_markerEverSet[markerIndex] : false;
     }
     void clearMarker(int markerIndex) {
-        if (markerIndex >= 0 && markerIndex < 4) m_markerEnabled[markerIndex] = false;
+        if (markerIndex >= 0 && markerIndex < 4) {
+            m_markerEnabled[markerIndex] = false;
+            markSessionDirty();
+        }
     }
     // Full reset: forget the marker so a later enable places it at the
     // fresh first-time default (33/66 of loop range, etc.) rather than
@@ -158,6 +165,7 @@ public:
         m_markerEnabled[markerIndex]  = false;
         m_markerEverSet[markerIndex]  = false;
         m_markerPositions[markerIndex] = 0;
+        markSessionDirty();
     }
     // Enable a marker: if it's never been placed, position it at the given
     // fraction of the current viewport; otherwise restore the preserved
@@ -166,11 +174,11 @@ public:
 
     // Toggle-state accessors for session save/load.
     bool getLoopEnabled() const   { return m_loopLeftEnabled.load(); }
-    void setLoopEnabled(bool on)  { m_loopLeftEnabled.store(on); m_loopRightEnabled.store(on); }
+    void setLoopEnabled(bool on)  { m_loopLeftEnabled.store(on); m_loopRightEnabled.store(on); markSessionDirty(); }
     bool getRecordEnabled() const { return m_recordLeftEnabled.load(); }
-    void setRecordEnabled(bool on){ m_recordLeftEnabled.store(on); m_recordRightEnabled.store(on); }
+    void setRecordEnabled(bool on){ m_recordLeftEnabled.store(on); m_recordRightEnabled.store(on); markSessionDirty(); }
     bool getReturnToStartOnStop() const  { return m_returnToStartOnStop.load(); }
-    void setReturnToStartOnStop(bool on) { m_returnToStartOnStop.store(on); }
+    void setReturnToStartOnStop(bool on) { m_returnToStartOnStop.store(on); markSessionDirty(); }
     // Session save/load use this to set a marker's position AND enable state
     // atomically without disturbing the "everSet" tracker's default logic.
     void setMarker(int idx, size_t position, bool enabled) {
@@ -178,6 +186,7 @@ public:
         m_markerPositions[idx] = position;
         m_markerEnabled[idx]   = enabled;
         m_markerEverSet[idx]   = true;
+        markSessionDirty();
     }
 
     // GUI pushes the current viewport range each frame so the reader thread
@@ -235,6 +244,10 @@ public:
     void syncPlayLedNow();
     void syncLoopPairLedsNow();
     void syncRecordPairLedsNow();
+    // Pushes the selected track's solo/mute state to LEDs 1 (solo) and 0
+    // (mute). Called on toggle and on track-change so the physical LEDs
+    // always mirror the DAW's per-track flags.
+    void syncSoloMuteLedsNow();
 
 private:
     // MIDI helper methods (extracted from processMidiMessages)
@@ -256,6 +269,34 @@ private:
     std::atomic<bool> m_playing;
     std::atomic<int> m_outputStereoPair;
     std::atomic<size_t> m_playbackPosition;
+    // Peak meter — audio callback writes the max |sample| of each block
+    // into m_lastPeak. GUI reads via getLastPeak() to display a level +
+    // clip indicator. Reset via clearPeak() after a display flush.
+public:
+    float getLastPeak() const     { return m_lastPeak.load(); }
+    void  clearPeak()             { m_lastPeak.store(0.0f); }
+    // Session-dirty flag. Set from every mutation point that would
+    // otherwise be lost on a "New Session" without save. Cleared by
+    // saveSession/loadSessionFromFile after a successful round-trip.
+    bool  isSessionDirty() const  { return m_sessionDirty.load(); }
+    void  markSessionDirty()      { m_sessionDirty.store(true); }
+    void  clearSessionDirty()     { m_sessionDirty.store(false); }
+private:
+    std::atomic<float> m_lastPeak{0.0f};
+    std::atomic<bool>  m_sessionDirty{false};
+
+    // Master output gain applied to the mixed L/R sums right before they
+    // hit the PortAudio buffer. Default 0.5 (-6 dB) — safe headroom for
+    // ~4-8 stems summed at unity without slamming the output.
+public:
+    float getMasterGain() const           { return m_masterGain.load(); }
+    void  setMasterGain(float g) {
+        if (g < 0.0f)  g = 0.0f;
+        if (g > 2.0f)  g = 2.0f;   // +6 dB ceiling; user rarely wants more
+        m_masterGain.store(g);
+    }
+private:
+    std::atomic<float>  m_masterGain{0.5f};
 
     // Play/stop click-avoidance envelope. Ramps 0<->1 at PLAY_FADE_MS
     // (5 ms) whenever m_playing changes. Owned entirely by the audio
@@ -374,6 +415,12 @@ private:
     int m_lastRecordLeftLedState  = -1;
     int m_lastRecordRightLedState = -1;
     int m_lastLoopRightLedState   = -1;
+
+    // Solo (pad 17 / LED 1) and mute (pad 18 / LED 0) mirror the selected
+    // track's per-track flags. Cached so we only send LED updates when the
+    // effective state actually changes (track switch or toggle).
+    int m_lastSoloLedState = -1;
+    int m_lastMuteLedState = -1;
 
     // Clear-markers mode. Firmware runs a continuous fade-flash on LEDs
     // 3/4/5/6/7 while this is true; pad presses re-route to marker clearing

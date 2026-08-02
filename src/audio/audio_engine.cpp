@@ -777,6 +777,21 @@ void AudioEngine::syncRecordPairLedsNow() {
     }
 }
 
+void AudioEngine::syncSoloMuteLedsNow() {
+    if (!m_serialController) return;
+    const Track* t = getTrack(getSelectedTrack());
+    int wantSolo = (t && t->solo)  ? 1 : 0;
+    int wantMute = (t && t->muted) ? 1 : 0;
+    if (wantSolo != m_lastSoloLedState) {
+        m_serialController->sendMessage(wantSolo ? "LED:1:ON" : "LED:1:OFF");
+        m_lastSoloLedState = wantSolo;
+    }
+    if (wantMute != m_lastMuteLedState) {
+        m_serialController->sendMessage(wantMute ? "LED:0:ON" : "LED:0:OFF");
+        m_lastMuteLedState = wantMute;
+    }
+}
+
 void AudioEngine::handleResync() {
     // Invalidate all "last sent" caches so the next updateController tick
     // re-sends every piece of controller-facing state. The firmware just
@@ -788,6 +803,8 @@ void AudioEngine::handleResync() {
     m_lastLoopRightLedState     = -1;
     m_lastLoopPairDefinedSent   = -1;
     m_lastRecordPairDefinedSent = -1;
+    m_lastSoloLedState          = -1;
+    m_lastMuteLedState          = -1;
     m_lastHeartbeatSendMs       = 0;   // force an immediate HB
     m_startupOledPushed         = false; // force SETMODE:DESC + playback push
     // Held-state flags that live on the DAW side but mirror physical pads
@@ -845,7 +862,7 @@ void AudioEngine::handleTrackNameFromController(const std::string& name) {
     if (idx < 0) return;
     Track* t = getTrack(idx);
     if (!t) return;
-    if (!name.empty()) t->name = name;
+    if (!name.empty()) { t->name = name; markSessionDirty(); }
     // Silent — repaint the persistent OLED playback state so the "TRACK N
     // ADDED,NAME:" prompt line is replaced immediately.
     pushPlaybackStateToOled();
@@ -1363,6 +1380,20 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     // Pad 12 handles both press and release (add-track, rename, delete).
     if (pad == 12) { touchHandlePad12(pressed); return; }
 
+    // Solo (17) / Mute (18) toggle on tap release. Firmware suppresses
+    // RELEASE:18 when its 3-second reset fired, so a long-press-to-reset
+    // doesn't also toggle mute.
+    if (!pressed && (pad == 17 || pad == 18)) {
+        int sel = getSelectedTrack();
+        Track* t = getTrack(sel);
+        if (!t) return;
+        if (pad == 17) t->solo  = !t->solo;
+        else           t->muted = !t->muted;
+        markSessionDirty();
+        syncSoloMuteLedsNow();
+        return;
+    }
+
     if (!pressed) return;  // remainder is press-only
 
     // (14+19 / 15+19 return-on-stop combos are retired — firmware now
@@ -1389,6 +1420,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         if (pad == 0 && cur > 0)     next = cur - 1;
         if (pad == 4 && cur < n - 1) next = cur + 1;
         setSelectedTrack(next);
+        syncSoloMuteLedsNow();   // reflect the newly-selected track's flags
         return;
     }
 
@@ -1417,7 +1449,13 @@ void AudioEngine::updateController() {
         m_startupOledPushed = true;
         m_serialController->sendMessage("SETMODE:DESC");
         pushPlaybackStateToOled();
+        syncSoloMuteLedsNow();   // paint the selected track's flags on 0/1
     }
+
+    // Cheap tick: the DAW's own S/M buttons (or session load) can flip
+    // solo/mute without going through pad 17/18, so poll for divergence
+    // once per updateController tick and sync when it happens.
+    syncSoloMuteLedsNow();
 
     // Heartbeat every ~1 s so the firmware can detect DAW disconnection and
     // block a switch to descriptive mode when nothing's listening.
@@ -1632,12 +1670,16 @@ bool AudioEngine::startAudio(int deviceId) {
         streamSampleRate = deviceInfo->defaultSampleRate;
     }
 
+    // Drop paClipOff so PortAudio clamps out-of-range floats itself
+    // (previously we handed the driver raw samples and let it decide —
+    // some drivers wrap-around into nasty distortion instead of clipping
+    // cleanly, which could sound harsher than the actual over-level).
     PaError err = Pa_OpenStream(
         reinterpret_cast<PaStream**>(&m_stream),
         nullptr, &outputParameters,
         streamSampleRate,
         paFramesPerBufferUnspecified,
-        paClipOff, portAudioCallback, this
+        paNoFlag, portAudioCallback, this
     );
 
     if (err != paNoError) {
@@ -1902,6 +1944,19 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
         }
     }
 
+    // Peak-hold: scan the buffer for the max |sample| and update the
+    // atomic peak meter so the GUI can display a level / clip indicator.
+    // Cheap even for large buffers — one pass over the interleaved output.
+    {
+        float peak = 0.0f;
+        for (int i = 0; i < totalSamples; i++) {
+            float a = std::fabs(out[i]);
+            if (a > peak) peak = a;
+        }
+        // Overwrite (peak-hold decay handled on the GUI side).
+        m_lastPeak.store(peak);
+    }
+
     return 0;
 }
 
@@ -2056,6 +2111,7 @@ int AudioEngine::addTrack(const std::string& name) {
     m_selectedTrack = newIndex;
 
     std::cout << "Added track: " << track.name << " (index " << newIndex << ")" << std::endl;
+    markSessionDirty();
     return newIndex;
 }
 
@@ -2070,6 +2126,7 @@ void AudioEngine::deleteTrack(int trackIndex) {
     } else if (m_selectedTrack >= static_cast<int>(m_tracks.size())) {
         m_selectedTrack = static_cast<int>(m_tracks.size()) - 1;
     }
+    markSessionDirty();
 }
 
 Track* AudioEngine::getTrack(int trackIndex) {
@@ -2090,8 +2147,18 @@ bool AudioEngine::loadTrackAudio(int trackIndex, const std::string& filepath) {
     if (result) {
         std::cout << "Loaded audio to track " << trackIndex << ": " << track->name
                   << " (" << track->getTotalFrames() << " frames, " << track->channels << " channels)" << std::endl;
+        markSessionDirty();
     } else {
         std::cerr << "Failed to load audio: " << filepath << std::endl;
     }
     return result;
+}
+
+void AudioEngine::clearTrackAudio(int trackIndex) {
+    Track* track = getTrack(trackIndex);
+    if (!track) return;
+    if (!track->hasAudio()) return;
+    std::cout << "Cleared audio from track " << trackIndex << ": " << track->name << std::endl;
+    track->clearAudio();
+    markSessionDirty();
 }

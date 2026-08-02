@@ -101,6 +101,15 @@ private:
     // user_settings.json so they survive DAW restarts.
     std::string m_lastAudioDir;
     std::string m_lastSessionDir;
+    // Path of the currently-open session file (populated on successful
+    // load or save-as). Empty when nothing has been opened this session,
+    // in which case Revert is disabled.
+    std::string m_currentSessionPath;
+    // Shared vertical scroll offset for the track list — the left panel
+    // (track headers/controls) and the arrangement view (waveforms) both
+    // apply and read this so they stay in lock-step when the user has
+    // more tracks than fit on screen.
+    float m_trackScrollY = 0.0f;
 
     // Zoom smoothing toggle
     bool m_zoomSmoothing;
@@ -209,10 +218,18 @@ private:
     // This is what keeps the render flicker-free during pan.
     void uploadWaveformDetailTexture(Track* t, size_t startFrame, size_t framesPerBucket);
     // Serialize the current DAW session (tracks + their metadata) to a JSON
-    // file. Uses the Win32 save-file dialog on Windows.
+    // file. Save writes to m_currentSessionPath directly (no dialog); if no
+    // session has been saved yet this run it falls through to Save As.
+    // Save As always prompts for a filename. saveSessionToPath does the
+    // actual write.
     void saveSession();
+    void saveSessionAs();
+    void saveSessionToPath(const std::string& filename);
     // Load a session file written by saveSession(). Replaces the current
     // set of tracks and re-loads each track's audio from its stored path.
     void openSession();                                        // shows file dialog
     void loadSessionFromFile(const std::string& path);         // no dialog
+    // File menu helpers.
+    void revertSession();  // reload m_currentSessionPath from disk
+    void closeSession();   // wipe tracks + markers, keep app running
 };

@@ -1,24 +1,27 @@
 {
   "_comment": "Dogma75 User Settings - Give this file to Claude to update defaults",
-  "_saved_at": "Jan  8 2026 13:19:42",
+  "_saved_at": "Aug  2 2026 09:11:36",
 
   "gui": {
     "colorScheme": 1,
     "customBgColor": [0.0001, 9.999e-05, 9.999e-05],
     "customTextColor": [0.271329, 0.598176, 0.747319],
     "bloomEnabled": true,
-    "bloomTextIntensity": 0.0,
-    "bloomLinesIntensity": 1.0,
-    "bloomUIIntensity": 0.0,
+    "bloomTextIntensity": 0,
+    "bloomLinesIntensity": 1,
+    "bloomUIIntensity": 0,
     "simplifiedWaveform": false,
     "zoomSmoothing": false,
     "waveformScrolling": false,
+    "waveformAutoPage": false,
     "waveformVerticalZoom": 3.5,
-    "trackHeight": 300
+    "trackHeight": 300,
+    "controllerMode": 1
   },
 
   "audio": {
     "scrubSpeed": 0.05,
+    "silentScrubSpeed": 0.7,
     "rpmThreshold": 30,
     "fastSpeedMultiplier": 5,
     "rpmAveraging": 0.5
@@ -30,5 +33,26 @@
     "park3": "Park 3",
     "park4": "Park 4",
     "selectedPark": 0
+  },
+
+  "dialogs": {
+    "lastAudioDir":   "C:\\Workspace\\stems",
+    "lastSessionDir": "C:\\0_CODE\\Dogma75\\Workspace\\can delete"
+  },
+
+  "velocityCurve": {
+    "enabled": true,
+    "smoothed": false,
+    "maxInputRpm": 120,
+    "rpmWindowMs": 50,
+    "maxMultiplier": 2,
+    "baseMultiplier": 1,
+    "numPoints": 4,
+    "points": [
+      {"x": 0, "y": 0},
+      {"x": 0.33, "y": 0.33},
+      {"x": 0.66, "y": 0.66},
+      {"x": 1, "y": 1}
+    ]
   }
 }

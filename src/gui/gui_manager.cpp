@@ -9,8 +9,16 @@
 #include <algorithm>
 #include <chrono>
 
+// windows.h has to be included BEFORE SDL_syswm.h — the SDL header
+// references HWND / HGLRC without pulling windows.h in itself.
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #ifdef SDL2_FOUND
 #include <SDL.h>
+#include <SDL_syswm.h>
 #endif
 
 #ifdef IMGUI_FOUND
@@ -19,11 +27,6 @@
 #include <imgui_impl_opengl3.h>
 #endif
 
-// OpenGL headers
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#endif
 #include <GL/gl.h>
 
 // OpenGL 3.3 function pointers (loaded dynamically)
@@ -930,6 +933,46 @@ void GUIManager::drawLinesLayer() {
 #endif
 }
 
+// Native HWND for the SDL window — used as the owner for Win32
+// file-dialogs so they stay in front of the DAW and don't cause it to
+// drop behind. Returns NULL if SDL can't provide it (headless / non-
+// Windows), which falls back to an ownerless dialog.
+#ifdef _WIN32
+static HWND sdlWindowHwnd(SDL_Window* window) {
+    if (!window) return nullptr;
+    SDL_SysWMinfo wmInfo;
+    SDL_VERSION(&wmInfo.version);
+    if (!SDL_GetWindowWMInfo(window, &wmInfo)) return nullptr;
+    return wmInfo.info.win.window;
+}
+
+// Scope guard: while a common-dialog is open, drop the SDL window out
+// of fullscreen (Windows misbehaves badly when a modal dialog stacks
+// over a fullscreen-desktop window — the app can end up hidden). On
+// destruction, restores fullscreen if we had it.
+class DialogFullscreenGuard {
+public:
+    DialogFullscreenGuard(SDL_Window* w) : m_win(w), m_wasFullscreen(false) {
+        if (!m_win) return;
+        Uint32 flags = SDL_GetWindowFlags(m_win);
+        if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+            m_wasFullscreen = true;
+            SDL_SetWindowFullscreen(m_win, 0);
+        }
+    }
+    ~DialogFullscreenGuard() {
+        if (m_wasFullscreen && m_win) {
+            SDL_SetWindowFullscreen(m_win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        }
+    }
+    DialogFullscreenGuard(const DialogFullscreenGuard&) = delete;
+    DialogFullscreenGuard& operator=(const DialogFullscreenGuard&) = delete;
+private:
+    SDL_Window* m_win;
+    bool        m_wasFullscreen;
+};
+#endif
+
 void GUIManager::processFrame() {
 #ifdef SDL2_FOUND
 #ifdef IMGUI_FOUND
@@ -944,12 +987,32 @@ void GUIManager::processFrame() {
             m_running = false;
         }
         if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_RESIZED) {
-            m_windowWidth = event.window.data1;
-            m_windowHeight = event.window.data2;
-            // Recreate bloom buffers at new size
-            cleanupBloom();
-            initBloom();
+            int w = event.window.data1;
+            int h = event.window.data2;
+            // Minimize fires a 0×0 resize on Windows. Recreating bloom
+            // FBOs at 0×0 corrupts the GL state and the app never
+            // recovers on restore. Ignore any non-positive size — we'll
+            // get another RESIZED event with real dimensions when the
+            // window is restored.
+            if (w > 0 && h > 0) {
+                m_windowWidth  = w;
+                m_windowHeight = h;
+                cleanupBloom();
+                initBloom();
+            }
         }
+    }
+
+    // While the window is minimized, skip the entire render + swap.
+    // SDL_GL_SwapWindow on a fullscreen minimized window can stall for
+    // seconds waiting for the DWM composition path to become available
+    // again, which is what caused the ~10 s black screen after Win+D.
+    // Still pump SDL events so the RESTORED event lands, and yield
+    // briefly to the OS so we don't burn a core.
+    Uint32 winFlags = SDL_GetWindowFlags(m_window);
+    if (winFlags & SDL_WINDOW_MINIMIZED) {
+        SDL_Delay(16);
+        return;
     }
 
     // Start ImGui frame
@@ -978,14 +1041,23 @@ void GUIManager::processFrame() {
     spaceWasPressed = spaceIsPressed;
 
     // 'A' key: open a WAV file dialog and load into the selected track.
+    // Ctrl+A: clear the audio from the selected track (strip stays).
     // Uses ImGui's event-based IsKeyPressed (not the poll-based SDL keystate)
     // so a quick tap is caught even when the frame rate is low.
-    if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput) {
+    if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput && io.KeyCtrl) {
+        int idx = m_audioEngine->getSelectedTrack();
+        if (idx >= 0 && idx < m_audioEngine->getTrackCount()) {
+            m_audioEngine->clearTrackAudio(idx);
+        }
+    } else if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput && !io.KeyCtrl) {
 #ifdef _WIN32
+        // Drop out of fullscreen for the duration of the dialog —
+        // otherwise Windows can hide the DAW behind it.
+        DialogFullscreenGuard fsGuard(m_window);
         char filename[MAX_PATH] = "";
         OPENFILENAMEA ofn = {};
         ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner   = nullptr;
+        ofn.hwndOwner   = sdlWindowHwnd(m_window);
         ofn.lpstrFilter = "WAV files\0*.wav\0All files\0*.*\0";
         ofn.lpstrFile   = filename;
         ofn.nMaxFile    = sizeof(filename);
@@ -1164,30 +1236,64 @@ void GUIManager::renderToolbar() {
 #ifdef IMGUI_FOUND
     ImGuiIO& io = ImGui::GetIO();
 
-    if (ImGui::Button("+ Add Track")) {
-        m_audioEngine->addTrack();
+    // File menu — Open / Save / Revert / New in a single dropdown.
+    // Uses a button + BeginPopup rather than the main menu bar so it
+    // stays visually consistent with the other toolbar buttons.
+    static bool sPendingNewSession = false;   // opens modal after popup closes
+    if (ImGui::Button("File")) {
+        ImGui::OpenPopup("FileMenu");
     }
-    ImGui::SameLine();
-
-    if (ImGui::Button("Save Session")) {
-        saveSession();
-    }
-    ImGui::SameLine();
-
-    if (ImGui::Button("Open Session")) {
-        openSession();
-    }
-    ImGui::SameLine();
-
-    int selectedTrack = m_audioEngine->getSelectedTrack();
-    if (selectedTrack >= 0) {
-        if (ImGui::Button("- Delete Track")) {
-            m_audioEngine->deleteTrack(selectedTrack);
+    if (ImGui::BeginPopup("FileMenu")) {
+        if (ImGui::MenuItem("Open session")) openSession();
+        if (ImGui::MenuItem("Save"))         saveSession();
+        if (ImGui::MenuItem("Save As"))      saveSessionAs();
+        // Revert enabled only when a session file is actually open.
+        bool canRevert = !m_currentSessionPath.empty();
+        if (!canRevert) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Revert")) revertSession();
+        if (!canRevert) ImGui::EndDisabled();
+        ImGui::Separator();
+        if (ImGui::MenuItem("New session")) {
+            // If there are unsaved changes, ask first. Otherwise just wipe.
+            if (m_audioEngine && m_audioEngine->isSessionDirty()) {
+                sPendingNewSession = true;
+            } else {
+                closeSession();
+            }
         }
-    } else {
-        ImGui::BeginDisabled();
-        ImGui::Button("- Delete Track");
-        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+    // Popup must be opened *after* the menu popup has closed, otherwise
+    // ImGui's popup stack refuses to nest a modal on top of a normal one.
+    if (sPendingNewSession) {
+        ImGui::OpenPopup("Unsaved changes");
+        sPendingNewSession = false;
+    }
+    // The modal itself — Save / Don't Save / Cancel.
+    if (ImGui::BeginPopupModal("Unsaved changes", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("The current session has unsaved changes.");
+        ImGui::TextUnformatted("Save before starting a new session?");
+        ImGui::Separator();
+        if (ImGui::Button("Save", ImVec2(110, 0))) {
+            saveSession();
+            // saveSession() calls clearSessionDirty on success; only wipe
+            // if the user actually completed the save dialog.
+            if (m_audioEngine && !m_audioEngine->isSessionDirty()) {
+                closeSession();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", ImVec2(110, 0))) {
+            closeSession();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
     ImGui::SameLine();
 
@@ -1293,60 +1399,6 @@ void GUIManager::renderToolbar() {
         ImGui::TextColored(statusColor, "STOPPED");
     }
     ImGui::SameLine();
-
-    // Controller mode dropdown
-    ImGui::Text("Mode:");
-    ImGui::SameLine();
-    const char* modeNames[] = { "Custom", "Custom Mackie", "Mackie", "MidiRel" };
-    if (ImGui::BeginCombo("##ControllerMode", modeNames[m_controllerMode], ImGuiComboFlags_WidthFitPreview)) {
-        for (int i = 0; i < 4; i++) {
-            bool isSelected = (m_controllerMode == i);
-            if (ImGui::Selectable(modeNames[i], isSelected)) {
-                m_controllerMode = i;
-                m_audioEngine->setControllerMode(m_controllerMode);
-            }
-            if (isSelected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        ImGui::EndCombo();
-    }
-    m_audioEngine->setControllerMode(m_controllerMode);
-
-    // Encoder curve toggle and button
-    ImGui::SameLine();
-    VelocityCurve& curve = m_serialController->getVelocityCurve();
-
-    ImVec2 checkboxPos = ImGui::GetCursorScreenPos();
-    float checkboxSize = ImGui::GetFrameHeight();
-    ImGui::GetWindowDrawList()->AddRect(
-        ImVec2(checkboxPos.x - 1, checkboxPos.y - 1),
-        ImVec2(checkboxPos.x + checkboxSize + 1, checkboxPos.y + checkboxSize + 1),
-        IM_COL32(128, 128, 128, 255),
-        0.0f, 0, 1.0f
-    );
-
-    ImGui::Checkbox("##curveEnabled", &curve.enabled);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Enable/disable velocity curve effect");
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Curve")) {
-        m_showVelocityCurveEditor = !m_showVelocityCurveEditor;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Encoder velocity curve editor");
-    }
-
-    // Encoder sensitivity slider
-    ImGui::SameLine();
-    ImGui::Text("Sens:");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(80);
-    ImGui::SliderFloat("##baseMult", &curve.baseMultiplier, 0.33f, 3.0f, "%.2fx");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Base encoder sensitivity.\nAdjusts ratio of turns to screen movement.\n0.33x = slower, 3x = faster");
-    }
 
     // Test Page button
     ImGui::SameLine();
@@ -1594,18 +1646,27 @@ void GUIManager::renderTrackPanel(float width, float height) {
         static char nameBuffer[128] = "";
         int numPairs = m_audioEngine->getNumStereoPairs();
 
-        // Match the arrangement view's per-track vertical slot so each
-        // header block aligns with its waveform strip. Controls stack from
-        // the top with fixed heights; empty space at the bottom when there
-        // are few tracks. When there are enough tracks that controls no
-        // longer fit, they clip inside their fixed slot (no scroll).
+        // Per-track slot height: auto-fit up to FIT_LIMIT tracks (each
+        // gets 1/N of the available space), then LOCK at 1/FIT_LIMIT and
+        // let the outer BeginChild's scrollbar handle track FIT_LIMIT+1
+        // onward. Both this panel AND the arrangement view use the
+        // identical formula so the horizontal separators between tracks
+        // line up perfectly regardless of track count.
+        static constexpr int    FIT_LIMIT    = 5;
+        static constexpr float  MIN_TRACK_H  = 60.0f;
         float availableHeight = ImGui::GetContentRegionAvail().y;
-        float perTrackHeight = availableHeight / (float)trackCount;
-        // Reserve pixels for the between-track separator so blocks + rules
-        // still add up to availableHeight.
         float separatorH = ImGui::GetTextLineHeightWithSpacing() * 0.5f;
-        float perTrackBlockH = perTrackHeight - separatorH;
-        if (perTrackBlockH < 30.0f) perTrackBlockH = 30.0f;
+        int   divisor    = (trackCount < FIT_LIMIT) ? trackCount : FIT_LIMIT;
+        float perTrackH  = availableHeight / (float)divisor;
+        if (perTrackH < MIN_TRACK_H) perTrackH = MIN_TRACK_H;
+        float perTrackBlockH = perTrackH - separatorH;
+
+        // Outer scrollable container. Apply the shared scroll offset from
+        // the last frame so the two panels start in sync; we'll capture
+        // any wheel-scroll that happens here back into it at the end.
+        ImGui::BeginChild("trackListScroll", ImVec2(0, 0), false,
+                          ImGuiWindowFlags_NoBackground);
+        ImGui::SetScrollY(m_trackScrollY);
 
         for (int i = 0; i < trackCount; i++) {
             Track* track = m_audioEngine->getTrack(i);
@@ -1651,6 +1712,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                                      ImGuiInputTextFlags_EnterReturnsTrue |
                                      ImGuiInputTextFlags_AutoSelectAll)) {
                     track->name = nameBuffer;
+                    m_audioEngine->markSessionDirty();
                     editingTrackName = -1;
                 }
                 if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
@@ -1728,13 +1790,15 @@ void GUIManager::renderTrackPanel(float width, float height) {
             ImGui::Text("Vol");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##vol", &track->volume, 0.0f, 1.0f, "%.2f");
+            if (ImGui::SliderFloat("##vol", &track->volume, 0.0f, 1.0f, "%.2f"))
+                m_audioEngine->markSessionDirty();
 
             // --- Pan slider ---
             ImGui::Text("Pan");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##pan", &track->pan, -1.0f, 1.0f, "%.2f");
+            if (ImGui::SliderFloat("##pan", &track->pan, -1.0f, 1.0f, "%.2f"))
+                m_audioEngine->markSessionDirty();
 
             // --- Mute / Solo / Record-arm buttons ---
             // Push all three button-state colours (Button + Hovered + Active)
@@ -1748,19 +1812,19 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, c);
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,  c);
             };
-            // Mute
-            if (track->muted) pushBtnColor(ImVec4(0.85f, 0.60f, 0.00f, 1.0f));
-            if (ImGui::Button("M", msrBtnSize)) track->muted = !track->muted;
+            // Mute — green when active (mirrors the controller's LED 0)
+            if (track->muted) pushBtnColor(ImVec4(0.00f, 0.70f, 0.30f, 1.0f));
+            if (ImGui::Button("M", msrBtnSize)) { track->muted = !track->muted; m_audioEngine->markSessionDirty(); }
             if (track->muted) ImGui::PopStyleColor(3);
             ImGui::SameLine();
-            // Solo
-            if (track->solo) pushBtnColor(ImVec4(0.00f, 0.70f, 0.30f, 1.0f));
-            if (ImGui::Button("S", msrBtnSize)) track->solo = !track->solo;
+            // Solo — yellow when active (mirrors the controller's LED 1)
+            if (track->solo) pushBtnColor(ImVec4(0.85f, 0.75f, 0.00f, 1.0f));
+            if (ImGui::Button("S", msrBtnSize)) { track->solo = !track->solo; m_audioEngine->markSessionDirty(); }
             if (track->solo) ImGui::PopStyleColor(3);
             ImGui::SameLine();
             // Record arm
             if (track->armed) pushBtnColor(ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
-            if (ImGui::Button("R", msrBtnSize)) track->armed = !track->armed;
+            if (ImGui::Button("R", msrBtnSize)) { track->armed = !track->armed; m_audioEngine->markSessionDirty(); }
             if (track->armed) ImGui::PopStyleColor(3);
 
             // --- Output pair dropdown ---
@@ -1773,7 +1837,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                         bool sel = (track->outputPair == p);
                         char label[32];
                         sprintf(label, "Ch %d-%d", (p * 2) + 1, (p * 2) + 2);
-                        if (ImGui::Selectable(label, sel)) track->outputPair = p;
+                        if (ImGui::Selectable(label, sel)) { track->outputPair = p; m_audioEngine->markSessionDirty(); }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
                     ImGui::EndCombo();
@@ -1789,6 +1853,10 @@ void GUIManager::renderTrackPanel(float width, float height) {
             ImGui::PopStyleColor(kTrackStyleCount);
             ImGui::PopID();
         }
+        // Capture any wheel-scroll into the shared offset so the
+        // arrangement view stays in lock-step next frame.
+        m_trackScrollY = ImGui::GetScrollY();
+        ImGui::EndChild();   // trackListScroll
     }
 
     // Helper lambda to draw slider grab as stroke outline and store for UI glow
@@ -1849,17 +1917,38 @@ void GUIManager::renderWaveform(float height) {
     int selectedTrack = m_audioEngine->getSelectedTrack();
     int trackCount = m_audioEngine->getTrackCount();
 
-    // Dynamic per-track waveform height: split the remaining vertical space
-    // in the arrangement window evenly between all tracks. 1 track fills the
-    // whole area, 2 tracks split 50/50, 3 tracks each get a third, etc.
-    // The slider-set m_trackHeight is only used as a fallback when the count
-    // is zero (which never actually enters the loop below).
-    float availableHeight = ImGui::GetContentRegionAvail().y;
-    float perTrackOverhead = 50.0f;  // label text + label padding + Spacing()
-    float perTrackWaveformHeight = (trackCount > 0)
-        ? (availableHeight / trackCount) - perTrackOverhead
-        : m_trackHeight;
-    if (perTrackWaveformHeight < 20.0f) perTrackWaveformHeight = 20.0f;
+    // Per-track slot height — MUST match the left panel exactly so the
+    // horizontal separators line up. Auto-fit up to FIT_LIMIT tracks,
+    // then lock at 1/FIT_LIMIT and let the scrollbar handle overflow.
+    static constexpr int    FIT_LIMIT_ARR   = 5;
+    static constexpr float  MIN_TRACK_H_ARR = 60.0f;
+    float availableHeight_arr = ImGui::GetContentRegionAvail().y;
+    float separatorH_arr = ImGui::GetTextLineHeightWithSpacing() * 0.5f;
+    int   divisor_arr    = (trackCount < FIT_LIMIT_ARR) ? trackCount : FIT_LIMIT_ARR;
+    if (divisor_arr < 1) divisor_arr = 1;   // avoid div by zero when trackCount==0
+    float perTrackH_arr  = availableHeight_arr / (float)divisor_arr;
+    if (perTrackH_arr < MIN_TRACK_H_ARR) perTrackH_arr = MIN_TRACK_H_ARR;
+    float perTrackWaveformHeight = perTrackH_arr - separatorH_arr;
+
+    ImGui::BeginChild("arrangementScroll", ImVec2(0, 0), false,
+                      ImGuiWindowFlags_NoBackground);
+    ImGui::SetScrollY(m_trackScrollY);
+
+    // First drawn track owns the marker triangle; every track below extends
+    // its marker/playhead line into the separator gap so the vertical stack
+    // reads as one unbroken line rather than a series of segments.
+    bool isFirstArrangementTrack = true;
+    // Captured from the FIRST drawn track: X-axis mapping (frame → pixel)
+    // used by the after-loop overlay that draws markers, playhead, the
+    // top triangles, and the bottom horizontal bar. The overlay pins those
+    // to the arrangement child's screen bounds so scrolling the tracks
+    // never scrolls the triangles/bar out of view.
+    bool   arrHasDrawnTrack     = false;
+    float  arrLastCursorX       = 0.0f;
+    float  arrLastWaveW         = 0.0f;
+    size_t arrLastViewStart     = 0;
+    size_t arrLastViewEnd       = 0;
+    size_t arrLastVisibleFrames = 1;
 
     for (int i = 0; i < trackCount; i++) {
         const Track* track = m_audioEngine->getTrack(i);
@@ -1875,7 +1964,7 @@ void GUIManager::renderWaveform(float height) {
             size_t playbackPos = m_audioEngine->getPlaybackPosition();
 
             float availableWidth = ImGui::GetContentRegionAvail().x;
-            float labelPadding = 20.0f;
+            float labelPadding = 0.0f;   // no track-name label here anymore
             ImVec2 waveformSize(availableWidth, perTrackWaveformHeight);
             ImVec2 cursorPos = ImGui::GetCursorScreenPos();
             cursorPos.y += labelPadding;
@@ -2187,119 +2276,20 @@ void GUIManager::renderWaveform(float height) {
                 }
             }
 
-            // Draw markers
-            float bottomY = cursorPos.y + waveformSize.y - 3;
-            ImU32 yellowColor = IM_COL32(255, 220, 0, 255);
-            ImU32 redColor = IM_COL32(255, 50, 50, 255);
-
-            auto storeLineCmd = [this](float x1, float y1, float x2, float y2, ImU32 color, float thickness) {
-                LineDrawCmd cmd;
-                cmd.x1 = x1; cmd.y1 = y1; cmd.x2 = x2; cmd.y2 = y2;
-                cmd.color = color;
-                cmd.thickness = thickness;
-                cmd.isTriangle = false;
-                cmd.isText = false;
-                m_lineDrawCmds.push_back(cmd);
-            };
-
-            // Marker lines between markers
-            if (m_audioEngine->isMarkerEnabled(0) && m_audioEngine->isMarkerEnabled(1)) {
-                size_t pos0 = m_audioEngine->getMarkerPosition(0);
-                size_t pos1 = m_audioEngine->getMarkerPosition(1);
-                size_t drawStart = (pos0 < viewStart) ? viewStart : pos0;
-                size_t drawEnd = (pos1 > viewEnd) ? viewEnd : pos1;
-                if (drawStart < drawEnd && drawEnd > viewStart && drawStart < viewEnd) {
-                    float x1 = cursorPos.x + ((float)(drawStart - viewStart) / visibleFrames) * waveformSize.x;
-                    float x2 = cursorPos.x + ((float)(drawEnd - viewStart) / visibleFrames) * waveformSize.x;
-                    drawList->AddLine(ImVec2(x1, bottomY), ImVec2(x2, bottomY), yellowColor, 3.0f);
-                    storeLineCmd(x1, bottomY, x2, bottomY, yellowColor, 3.0f);
-                }
+            // Marker / playhead / triangle / horizontal-bar drawing is
+            // deferred until after the per-track loop so it can be pinned
+            // to the arrangement child's screen bounds (see below) instead
+            // of scrolling with the track content. We only capture the
+            // first drawn track's X mapping here.
+            if (isFirstArrangementTrack) {
+                arrHasDrawnTrack     = true;
+                arrLastCursorX       = cursorPos.x;
+                arrLastWaveW         = waveformSize.x;
+                arrLastViewStart     = viewStart;
+                arrLastViewEnd       = viewEnd;
+                arrLastVisibleFrames = visibleFrames > 0 ? visibleFrames : 1;
             }
-
-            if (m_audioEngine->isMarkerEnabled(1) && m_audioEngine->isMarkerEnabled(2)) {
-                size_t pos1 = m_audioEngine->getMarkerPosition(1);
-                size_t pos2 = m_audioEngine->getMarkerPosition(2);
-                size_t drawStart = (pos1 < viewStart) ? viewStart : pos1;
-                size_t drawEnd = (pos2 > viewEnd) ? viewEnd : pos2;
-                if (drawStart < drawEnd && drawEnd > viewStart && drawStart < viewEnd) {
-                    float x1 = cursorPos.x + ((float)(drawStart - viewStart) / visibleFrames) * waveformSize.x;
-                    float x2 = cursorPos.x + ((float)(drawEnd - viewStart) / visibleFrames) * waveformSize.x;
-                    drawList->AddLine(ImVec2(x1, bottomY), ImVec2(x2, bottomY), redColor, 3.0f);
-                    storeLineCmd(x1, bottomY, x2, bottomY, redColor, 3.0f);
-                }
-            }
-
-            if (m_audioEngine->isMarkerEnabled(2) && m_audioEngine->isMarkerEnabled(3)) {
-                size_t pos2 = m_audioEngine->getMarkerPosition(2);
-                size_t pos3 = m_audioEngine->getMarkerPosition(3);
-                size_t drawStart = (pos2 < viewStart) ? viewStart : pos2;
-                size_t drawEnd = (pos3 > viewEnd) ? viewEnd : pos3;
-                if (drawStart < drawEnd && drawEnd > viewStart && drawStart < viewEnd) {
-                    float x1 = cursorPos.x + ((float)(drawStart - viewStart) / visibleFrames) * waveformSize.x;
-                    float x2 = cursorPos.x + ((float)(drawEnd - viewStart) / visibleFrames) * waveformSize.x;
-                    drawList->AddLine(ImVec2(x1, bottomY), ImVec2(x2, bottomY), yellowColor, 3.0f);
-                    storeLineCmd(x1, bottomY, x2, bottomY, yellowColor, 3.0f);
-                }
-            }
-
-            // Draw marker labels
-            const char* markerLabels[4] = {"L", "L", "R", "R"};
-            for (int m = 0; m < 4; m++) {
-                if (m_audioEngine->isMarkerEnabled(m)) {
-                    size_t markerPos = m_audioEngine->getMarkerPosition(m);
-                    if (markerPos >= viewStart && markerPos < viewEnd) {
-                        float markerX = cursorPos.x + ((float)(markerPos - viewStart) / visibleFrames) * waveformSize.x;
-
-                        ImU32 markerColor = (m == 0 || m == 3) ? yellowColor : redColor;
-
-                        drawList->AddLine(ImVec2(markerX, cursorPos.y),
-                                         ImVec2(markerX, cursorPos.y + waveformSize.y),
-                                         markerColor, 2.0f);
-                        storeLineCmd(markerX, cursorPos.y, markerX, cursorPos.y + waveformSize.y, markerColor, 2.0f);
-
-                        float arrowTop = cursorPos.y + 2;
-                        float arrowBottom = cursorPos.y + 14;
-                        float arrowWidth = 6;
-                        drawList->AddTriangleFilled(
-                            ImVec2(markerX, arrowBottom),
-                            ImVec2(markerX - arrowWidth, arrowTop),
-                            ImVec2(markerX + arrowWidth, arrowTop),
-                            markerColor);
-
-                        LineDrawCmd triCmd;
-                        triCmd.isTriangle = true;
-                        triCmd.isText = false;
-                        triCmd.tx1 = markerX; triCmd.ty1 = arrowBottom;
-                        triCmd.tx2 = markerX - arrowWidth; triCmd.ty2 = arrowTop;
-                        triCmd.tx3 = markerX + arrowWidth; triCmd.ty3 = arrowTop;
-                        triCmd.color = markerColor;
-                        m_lineDrawCmds.push_back(triCmd);
-
-                        float labelY = cursorPos.y - labelPadding + 2;
-                        drawList->AddText(ImVec2(markerX - 4, labelY), markerColor, markerLabels[m]);
-
-                        LineDrawCmd textCmd;
-                        textCmd.isTriangle = false;
-                        textCmd.isText = true;
-                        textCmd.textX = markerX - 4;
-                        textCmd.textY = labelY;
-                        textCmd.color = markerColor;
-                        strncpy(textCmd.text, markerLabels[m], 7);
-                        textCmd.text[7] = '\0';
-                        m_lineDrawCmds.push_back(textCmd);
-                    }
-                }
-            }
-
-            // Draw playhead
-            if (playbackPos >= viewStart && playbackPos < viewEnd) {
-                float playbackX = cursorPos.x + ((float)(playbackPos - viewStart) / visibleFrames) * waveformSize.x;
-                ImU32 playheadColor = IM_COL32(50, 220, 50, 255);
-                drawList->AddLine(ImVec2(playbackX, cursorPos.y),
-                                 ImVec2(playbackX, cursorPos.y + waveformSize.y),
-                                 playheadColor, 2.0f);
-                storeLineCmd(playbackX, cursorPos.y, playbackX, cursorPos.y + waveformSize.y, playheadColor, 2.0f);
-            }
+            isFirstArrangementTrack = false;
 
             // Horizontal separator between tracks — visually pairs with the
             // matching Separator in the left panel's TRACKS view, and picks
@@ -2317,7 +2307,7 @@ void GUIManager::renderWaveform(float height) {
             bool isSelected = (selectedTrack == i);
 
             float availableWidth = ImGui::GetContentRegionAvail().x;
-            float labelPadding = 20.0f;
+            float labelPadding = 0.0f;   // no track-name label here anymore
             ImVec2 waveformSize(availableWidth, perTrackWaveformHeight);
             ImVec2 cursorPos = ImGui::GetCursorScreenPos();
             cursorPos.y += labelPadding;
@@ -2350,6 +2340,143 @@ void GUIManager::renderWaveform(float height) {
             ImGui::Separator();
         }
     }
+
+    // Marker + playhead overlay — pinned to the arrangement child's
+    // screen bounds so triangles, vertical lines, and the loop/rec bar
+    // stay fixed at the top/bottom edges regardless of vertical scroll.
+    if (arrHasDrawnTrack) {
+        ImVec2 childPos  = ImGui::GetWindowPos();   // fixed in screen space
+        ImVec2 childSize = ImGui::GetWindowSize();
+        float overlayTop    = childPos.y;
+        float overlayBottom = childPos.y + childSize.y - 3;
+
+        size_t playbackPos = m_audioEngine->getPlaybackPosition();
+
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        ImU32 yellowColor  = IM_COL32(255, 220, 0, 255);
+        ImU32 redColor     = IM_COL32(255,  50, 50, 255);
+        ImU32 playheadColor = IM_COL32(50, 220, 50, 255);
+
+        auto storeLineCmd = [this](float x1, float y1, float x2, float y2, ImU32 color, float thickness) {
+            LineDrawCmd cmd;
+            cmd.x1 = x1; cmd.y1 = y1; cmd.x2 = x2; cmd.y2 = y2;
+            cmd.color = color;
+            cmd.thickness = thickness;
+            cmd.isTriangle = false;
+            cmd.isText = false;
+            m_lineDrawCmds.push_back(cmd);
+        };
+
+        auto frameToX = [&](size_t frame) {
+            return arrLastCursorX +
+                   ((float)(frame - arrLastViewStart) / (float)arrLastVisibleFrames) * arrLastWaveW;
+        };
+
+        // Vertical marker lines + top triangles + labels.
+        const char* markerLabels[4] = {"L", "L", "R", "R"};
+        for (int m = 0; m < 4; m++) {
+            if (!m_audioEngine->isMarkerEnabled(m)) continue;
+            size_t markerPos = m_audioEngine->getMarkerPosition(m);
+            if (markerPos < arrLastViewStart || markerPos >= arrLastViewEnd) continue;
+
+            float markerX     = frameToX(markerPos);
+            ImU32 markerColor = (m == 0 || m == 3) ? yellowColor : redColor;
+
+            drawList->AddLine(ImVec2(markerX, overlayTop),
+                              ImVec2(markerX, overlayBottom),
+                              markerColor, 2.0f);
+            storeLineCmd(markerX, overlayTop, markerX, overlayBottom, markerColor, 2.0f);
+
+            float arrowTop    = overlayTop + 2;
+            float arrowBottom = overlayTop + 14;
+            float arrowWidth  = 6;
+            drawList->AddTriangleFilled(
+                ImVec2(markerX,               arrowBottom),
+                ImVec2(markerX - arrowWidth,  arrowTop),
+                ImVec2(markerX + arrowWidth,  arrowTop),
+                markerColor);
+
+            LineDrawCmd triCmd;
+            triCmd.isTriangle = true;
+            triCmd.isText     = false;
+            triCmd.tx1 = markerX;              triCmd.ty1 = arrowBottom;
+            triCmd.tx2 = markerX - arrowWidth; triCmd.ty2 = arrowTop;
+            triCmd.tx3 = markerX + arrowWidth; triCmd.ty3 = arrowTop;
+            triCmd.color = markerColor;
+            m_lineDrawCmds.push_back(triCmd);
+
+            float labelY = overlayTop + 2;
+            drawList->AddText(ImVec2(markerX - 4, labelY), markerColor, markerLabels[m]);
+
+            LineDrawCmd textCmd;
+            textCmd.isTriangle = false;
+            textCmd.isText     = true;
+            textCmd.textX = markerX - 4;
+            textCmd.textY = labelY;
+            textCmd.color = markerColor;
+            strncpy(textCmd.text, markerLabels[m], 7);
+            textCmd.text[7] = '\0';
+            m_lineDrawCmds.push_back(textCmd);
+        }
+
+        // Playhead — same fixed vertical span as the markers.
+        if (playbackPos >= arrLastViewStart && playbackPos < arrLastViewEnd) {
+            float playbackX = frameToX(playbackPos);
+            drawList->AddLine(ImVec2(playbackX, overlayTop),
+                              ImVec2(playbackX, overlayBottom),
+                              playheadColor, 2.0f);
+            storeLineCmd(playbackX, overlayTop, playbackX, overlayBottom, playheadColor, 2.0f);
+        }
+
+        // Loop/rec horizontal bars — pinned to the bottom edge of the
+        // arrangement child window (does not scroll away). When BOTH
+        // markers of a pair are defined but the pair is currently OFF
+        // (isMarkerEnabled false, markerEverSet true), the bar draws
+        // dashed to indicate the region still exists but is inactive.
+        auto drawDashed = [&](float x1, float x2, float y, ImU32 color, float thickness) {
+            const float dashLen = 8.0f;
+            const float gapLen  = 5.0f;
+            float x = x1;
+            while (x < x2) {
+                float xe = x + dashLen;
+                if (xe > x2) xe = x2;
+                drawList->AddLine(ImVec2(x, y), ImVec2(xe, y), color, thickness);
+                storeLineCmd(x, y, xe, y, color, thickness);
+                x = xe + gapLen;
+            }
+        };
+        auto drawBar = [&](int mA, int mB, ImU32 color) {
+            bool bothOn  = m_audioEngine->isMarkerEnabled(mA) &&
+                           m_audioEngine->isMarkerEnabled(mB);
+            bool bothSet = m_audioEngine->markerEverSet(mA) &&
+                           m_audioEngine->markerEverSet(mB);
+            if (!bothOn && !bothSet) return;
+
+            size_t posA = m_audioEngine->getMarkerPosition(mA);
+            size_t posB = m_audioEngine->getMarkerPosition(mB);
+            size_t drawStart = (posA < arrLastViewStart) ? arrLastViewStart : posA;
+            size_t drawEnd   = (posB > arrLastViewEnd)   ? arrLastViewEnd   : posB;
+            if (drawStart >= drawEnd)             return;
+            if (drawEnd   <= arrLastViewStart)    return;
+            if (drawStart >= arrLastViewEnd)      return;
+            float x1 = frameToX(drawStart);
+            float x2 = frameToX(drawEnd);
+            if (bothOn) {
+                drawList->AddLine(ImVec2(x1, overlayBottom), ImVec2(x2, overlayBottom), color, 3.0f);
+                storeLineCmd(x1, overlayBottom, x2, overlayBottom, color, 3.0f);
+            } else {
+                drawDashed(x1, x2, overlayBottom, color, 3.0f);
+            }
+        };
+        drawBar(0, 1, yellowColor);   // loop-left  → rec-left
+        drawBar(1, 2, redColor);      // rec-left   → rec-right
+        drawBar(2, 3, yellowColor);   // rec-right  → loop-right
+    }
+
+    // Capture the wheel-scroll for next frame so the left panel and
+    // arrangement view stay in lock-step.
+    m_trackScrollY = ImGui::GetScrollY();
+    ImGui::EndChild();   // arrangementScroll
 
     if (trackCount == 0) {
         ImVec4 hintColor = (m_colorScheme == 1)
@@ -2960,15 +3087,29 @@ void GUIManager::saveSettings() {
 }
 
 void GUIManager::saveSession() {
+    // Overwrite the current session file with no prompt. Only falls back
+    // to Save As if we don't yet have a target path (fresh session, or a
+    // session loaded from disk hasn't been re-saved yet — actually load
+    // sets m_currentSessionPath too, so in practice this branch fires
+    // only when nothing has been opened or saved this run).
+    if (m_currentSessionPath.empty()) {
+        saveSessionAs();
+        return;
+    }
+    saveSessionToPath(m_currentSessionPath);
+}
+
+void GUIManager::saveSessionAs() {
 #ifdef _WIN32
+    DialogFullscreenGuard fsGuard(m_window);
     char filename[MAX_PATH] = "session.json";
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = nullptr;
+    ofn.hwndOwner   = sdlWindowHwnd(m_window);
     ofn.lpstrFilter = "DAW session (*.json)\0*.json\0All files\0*.*\0";
     ofn.lpstrFile   = filename;
     ofn.nMaxFile    = sizeof(filename);
-    ofn.lpstrTitle  = "Save DAW Session";
+    ofn.lpstrTitle  = "Save DAW Session As";
     ofn.lpstrDefExt = "json";
     ofn.lpstrInitialDir = m_lastSessionDir.empty() ? nullptr
                                                    : m_lastSessionDir.c_str();
@@ -2979,7 +3120,13 @@ void GUIManager::saveSession() {
         if (slash) m_lastSessionDir.assign(filename, slash - filename);
         saveSettings();
     }
+    saveSessionToPath(filename);
+#endif
+}
 
+void GUIManager::saveSessionToPath(const std::string& filenameStr) {
+#ifdef _WIN32
+    const char* filename = filenameStr.c_str();
     std::ofstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Session save failed: " << filename << std::endl;
@@ -3043,14 +3190,18 @@ void GUIManager::saveSession() {
     file << "}\n";
     file.close();
     std::cout << "Session saved to " << filename << std::endl;
+    m_currentSessionPath = filename;   // enables Revert
+    if (m_audioEngine) m_audioEngine->clearSessionDirty();
 #endif
 }
 
 void GUIManager::openSession() {
 #ifdef _WIN32
+    DialogFullscreenGuard fsGuard(m_window);
     char filename[MAX_PATH] = "";
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = sdlWindowHwnd(m_window);
     ofn.lpstrFilter = "DAW session (*.json)\0*.json\0All files\0*.*\0";
     ofn.lpstrFile   = filename;
     ofn.nMaxFile    = sizeof(filename);
@@ -3225,13 +3376,61 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
     }
 
     std::cout << "Session loaded from " << filename << std::endl;
+    m_currentSessionPath = filename;   // enables Revert
+    if (m_audioEngine) m_audioEngine->clearSessionDirty();
 #endif
+}
+
+void GUIManager::revertSession() {
+    // Re-load the currently-open session file, discarding any unsaved
+    // changes since the last open / save. No-op if no session has been
+    // opened this DAW run.
+    if (m_currentSessionPath.empty()) return;
+    loadSessionFromFile(m_currentSessionPath);
+}
+
+void GUIManager::closeSession() {
+    // Wipe all tracks, markers, and per-session state — leaves the DAW
+    // running with a blank slate ready for a new session or fresh audio.
+    if (!m_audioEngine) return;
+    for (int i = m_audioEngine->getTrackCount() - 1; i >= 0; i--) {
+        m_audioEngine->deleteTrack(i);
+    }
+    for (int m = 0; m < 4; m++) m_audioEngine->resetMarker(m);
+    m_audioEngine->setLoopEnabled(false);
+    m_audioEngine->setRecordEnabled(false);
+    m_audioEngine->setPlaybackPosition(0);
+    m_currentSessionPath.clear();
+    m_audioEngine->clearSessionDirty();
 }
 
 void GUIManager::uploadWaveformTexture(Track* t) {
     if (!t) return;
     size_t total = t->getTotalFrames();
-    if (total == 0) return;
+    // No audio (freshly cleared or never loaded): release any stale GPU
+    // handles so subsequent hasAudio() checks and (waveformTex == 0) tests
+    // agree, then bail. Marking the version as up-to-date prevents this
+    // path from re-firing every frame while the strip stays empty.
+    if (total == 0) {
+        if (t->waveformTex) {
+            GLuint old = (GLuint)t->waveformTex;
+            glDeleteTextures(1, &old);
+            t->waveformTex = 0;
+        }
+        if (t->waveformDetailTex) {
+            GLuint old = (GLuint)t->waveformDetailTex;
+            glDeleteTextures(1, &old);
+            t->waveformDetailTex = 0;
+            t->waveformDetailW = 0;
+            t->waveformDetailH = 0;
+            t->waveformDetailFPB = 0;
+            t->waveformDetailStart = 0;
+            t->waveformDetailEnd = 0;
+        }
+        t->waveformTexVersion = t->audioVersion;
+        t->waveformDetailVersion = t->audioVersion;
+        return;
+    }
     // Delete previous texture if it exists (audio was reloaded).
     if (t->waveformTex) {
         GLuint old = (GLuint)t->waveformTex;

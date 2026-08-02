@@ -444,6 +444,8 @@ bool loopLeftLocal    = false; // pad 20 -> LED 4. Just predictive; DAW is autho
 bool recordLeftLocal  = false; // pad 21 -> LED 5. Just predictive; DAW is authoritative.
 bool recordRightLocal = false; // pad 22 -> LED 6. Just predictive; DAW is authoritative.
 bool loopRightLocal   = false; // pad 23 -> LED 7. Just predictive; DAW is authoritative.
+bool muteLedLocal     = false; // pad 18 -> LED 0. Predictive on tap-release; DAW confirms.
+bool soloLedLocal     = false; // pad 17 -> LED 1. Predictive on tap-release; DAW confirms.
 bool modifierHeld     = false; // pad 26. Also tracked DAW-side; we mirror here to
                                // decide whether pad 19 should flash-reject instead
                                // of toggling the play LED.
@@ -894,6 +896,8 @@ void performReset() {
     loopRightLocal    = false;
     recordLeftLocal   = false;
     recordRightLocal  = false;
+    muteLedLocal      = false;
+    soloLedLocal      = false;
     loopPairDefined   = false;
     recordPairDefined = false;
     // All LEDs solid on. Hardware only — mirrors stay at their reset
@@ -1355,6 +1359,8 @@ void processSerialCommands() {
                             // Always update the local mirror so state stays
                             // in sync — but suppress the physical write for
                             // marker LEDs while text-input mode owns them.
+                            if (channel == 0) muteLedLocal     = on;
+                            if (channel == 1) soloLedLocal     = on;
                             if (channel == 3) playLedLocal     = on;
                             if (channel == 4) loopLeftLocal    = on;
                             if (channel == 5) recordLeftLocal  = on;
@@ -1666,10 +1672,29 @@ void handleTouchReleased(int touchNum) {
         pad15PressMs        = 0;
         pad15LongPressFired = false;
     }
+    // Pad 18's 3-second hold triggers a local reset gesture. When that
+    // fires we must suppress the RELEASE:18 forward, otherwise the DAW's
+    // pad-18 tap-release handler would immediately toggle mute on top of
+    // the reset.
+    bool suppressReleaseSend = false;
     if (touchNum == 18) {
-        if (pad18ResetFired) resetShowFinish();
+        if (pad18ResetFired) {
+            resetShowFinish();
+            suppressReleaseSend = true;
+        } else {
+            // Tap release: predictively toggle mute LED so it responds
+            // instantly instead of waiting for the DAW's LED:0 round-trip.
+            muteLedLocal = !muteLedLocal;
+            ledSet(0, muteLedLocal);
+        }
         pad18PressMs    = 0;
         pad18ResetFired = false;
+    }
+    if (touchNum == 17) {
+        // Tap release: predictive solo LED toggle, same responsiveness
+        // trick as pad 18 (mute) and pad 19 (play).
+        soloLedLocal = !soloLedLocal;
+        ledSet(1, soloLedLocal);
     }
     if (touchNum == 19) {
         // Replay deferred press-action if the tap wasn't consumed by a
@@ -1678,7 +1703,7 @@ void handleTouchReleased(int touchNum) {
         pad19Held           = false;
         pad19UsedAsModifier = false;
         if (!wasModifier) firePad19Deferred();
-    } else {
+    } else if (!suppressReleaseSend) {
         Serial.print("RELEASE:");
         Serial.println(touchNum);
     }

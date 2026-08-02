@@ -253,4 +253,17 @@ struct Track {
     bool hasAudio() const {
         return !audioData.empty() && channels > 0;
     }
+
+    // Drop the audio samples and everything derived from them. Keeps the
+    // track's name, colour, and mixer state (vol/pan/mute/solo/pair) so the
+    // channel strip is preserved and can be re-loaded with new material.
+    // Bumps audioVersion so the GUI releases its GPU waveform texture.
+    void clearAudio() {
+        audioData.clear();
+        audioData.shrink_to_fit();
+        channels = 0;
+        filePath.clear();
+        peakPyramid.clear();
+        audioVersion++;
+    }
 };
