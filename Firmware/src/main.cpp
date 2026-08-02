@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <Wire.h>
 
 // --- 6 Encoders ---
@@ -555,6 +555,33 @@ bool     recordPairDefined     = false;
 bool     flashModeDeleteArmed  = false;
 static const uint32_t FAST_FLASH_HALFPERIOD_MS = 50;   // 10 Hz square wave
 
+// Pad-19-modifier combo lock. When 19 is held and the user then presses
+// 14 (return-to-start ON) or 15 (return-to-start OFF / "stop in place"),
+// the combo fires and takes exclusive control of the controller: every
+// other press is dropped until BOTH combo pads are released. Prevents
+// accidental other-key presses while the user's fingers are still on
+// the combo pair.
+bool comboFired = false;
+
+// Pad-15 hold-to-delete-all-loops. Short tap toggles loop-edit mode
+// (deferred until release so the two behaviours can share the pad); a
+// hold of DELETE_ALL_HOLD_MS wipes both marker pairs and runs a
+// 1-second fade-out on LEDs 4/5/6/7 as the acknowledgement.
+static const uint32_t DELETE_ALL_HOLD_MS   = 1000;
+static const uint32_t DELETE_ALL_FADE_MS   = 1000;
+uint32_t pad15PressMs        = 0;
+bool     pad15LongPressFired = false;
+uint32_t deleteAllFadeStartMs = 0;   // 0 = idle; else fade in progress
+
+// Hard-reset gesture: hold pad 18 for 3 s. All 9 LEDs light + OLED shows
+// "RESET" for as long as pad 18 stays held; on release, LEDs are
+// repainted from the mirrors (which the DAW has been updating during the
+// hold via RESYNC-triggered pushes) and the OLED lock lifts.
+static const uint32_t RESET_HOLD_MS = 3000;
+uint32_t pad18PressMs    = 0;
+bool     pad18ResetFired = false;
+bool     resetShowActive = false;
+
 // Pad 19 used as a modifier for the "delete marker pair" gesture: hold 19
 // and tap 20/23 to wipe the loop pair, or tap 21/22 to wipe the record
 // pair. Pad 19 handling is deferred to release so a tapped combo doesn't
@@ -595,9 +622,11 @@ void flashStep() {
     // Our wiring: PWM=0 => fully on, PWM=4095 => off. Invert.
     uint16_t pwm = (uint16_t)(4095 - brightness);
 
-    // Play LED: always flashes while clear-markers mode is active — it is
-    // the mode indicator.
+    // Play LED (3) AND pad-24 LED (8) both flash in-phase while clear-
+    // markers mode is active — 24 is now also a mode indicator alongside
+    // 19. Delete-arm overrides LED 8 to solid on (see below).
     pca9685SetPWM(3, pwm);
+    if (!flashModeDeleteArmed) pca9685SetPWM(8, pwm);
     if (flashModeDeleteArmed) {
         // Delete-arm mode: DEFINED pairs get a fast square-wave "warning"
         // flash; undefined pairs stay dark. Enabled/disabled pair state
@@ -654,6 +683,7 @@ void enterFlashMode() {
     flashLastUpdateMs = 0;
     // Consume the modifier — a subsequent release of pad 26 shouldn't matter.
     modifierHeld      = false;
+    Serial.println("DEBUG:FLASH:ON");
 }
 
 // Build the line-2 string for the current text-input state, left-justified.
@@ -792,6 +822,122 @@ void textInputFadeStep() {
 // its GUI can render a live-updating preview of what the user is typing.
 // Sent as "RENAMEBUF:<committed><pending>" — a single string. On text-input
 // exit we send "RENAMEEND" so the DAW can drop the preview UI.
+// Delete both loop and record pairs (pad-15 hold gesture). Wipes local
+// state, tells the DAW via DELETEPAIR messages, and starts a 1 second
+// fade-out on the four pair LEDs (4/5/6/7) as visual confirmation.
+void performDeleteAllLoops() {
+    // Clear firmware-side mirrors and definition flags.
+    loopLeftLocal     = false;
+    loopRightLocal    = false;
+    recordLeftLocal   = false;
+    recordRightLocal  = false;
+    loopPairDefined   = false;
+    recordPairDefined = false;
+    if (flashMode) { flashMode = false; flashModeDeleteArmed = false; ledSet(8, false); }
+    // Tell DAW.
+    Serial.println("DELETEPAIR:LOOP");
+    Serial.println("DELETEPAIR:REC");
+    // Kick off the LED fade — the stepper below drives the four pair
+    // channels every loop() tick until the fade time elapses.
+    deleteAllFadeStartMs = millis();
+    // Snap all four to full-on at the start of the fade.
+    pca9685SetPWM(4, 0);
+    pca9685SetPWM(5, 0);
+    pca9685SetPWM(6, 0);
+    pca9685SetPWM(7, 0);
+}
+
+// Fade LEDs 4/5/6/7 from full-on to off linearly over DELETE_ALL_FADE_MS.
+// While the fade is active, incoming DAW LED commands for these channels
+// are suppressed (see the LED handler) so the animation doesn't stutter.
+void deleteAllFadeStep() {
+    if (deleteAllFadeStartMs == 0) return;
+    uint32_t elapsed = millis() - deleteAllFadeStartMs;
+    if (elapsed >= DELETE_ALL_FADE_MS) {
+        // Land at off and stop.
+        pca9685SetPWM(4, 4095);
+        pca9685SetPWM(5, 4095);
+        pca9685SetPWM(6, 4095);
+        pca9685SetPWM(7, 4095);
+        deleteAllFadeStartMs = 0;
+        return;
+    }
+    // Linear fade: brightness = 1 - elapsed/FADE. PWM inverted (0=on).
+    uint32_t brightness = (uint32_t)((uint64_t)(DELETE_ALL_FADE_MS - elapsed) * 4095 / DELETE_ALL_FADE_MS);
+    uint16_t pwm = (uint16_t)(4095 - brightness);
+    pca9685SetPWM(4, pwm);
+    pca9685SetPWM(5, pwm);
+    pca9685SetPWM(6, pwm);
+    pca9685SetPWM(7, pwm);
+}
+
+// Hard reset. Called when pad 18 has been held for RESET_HOLD_MS. Lights
+// all 9 LEDs solid, shows "RESET" on the OLED, and asks the DAW to
+// re-push its authoritative state. After RESET_SHOW_MS elapses,
+// resetShowFinish() drops the LEDs to whatever mirrors say (which are
+// blank until the DAW's next updateController tick paints them back).
+void performReset() {
+    // Exit anything modal that's local to the firmware.
+    if (flashMode) { flashMode = false; flashModeDeleteArmed = false; }
+    if (textInputMode) textInputExit();
+    // Clear held-state trackers. LED mirrors reset too — they'll be
+    // repainted by the LED:N:ON/OFF and PAIRDEF:*:* messages the DAW
+    // sends after we've told it to RESYNC.
+    modifierHeld = false;
+    pad3Held = false;
+    pad14Held = false;
+    pad15Held = false;
+    pad19Held = false;
+    pad19UsedAsModifier = false;
+    playLedLocal      = false;
+    loopLeftLocal     = false;
+    loopRightLocal    = false;
+    recordLeftLocal   = false;
+    recordRightLocal  = false;
+    loopPairDefined   = false;
+    recordPairDefined = false;
+    // All LEDs solid on. Hardware only — mirrors stay at their reset
+    // value so nothing accidentally re-lights them via ledSet().
+    for (int ch = 0; ch < 9; ch++) pca9685SetPWM(ch, 0);
+    // OLED "RESET" held until pad-18 release. Very-far-future hard lock
+    // so DAW OLED pushes are deferred throughout the hold.
+    snprintf(oledLine1, sizeof(oledLine1), "RESET");
+    snprintf(oledLine2, sizeof(oledLine2), " ");
+    oledLine1Changed = true;
+    oledLine2Changed = true;
+    oledLockUntilMs = 0xFFFFFFFFu;   // effectively forever; cleared on release
+    oledLockIsSoft  = false;
+    resetShowActive = true;
+    // Tell the DAW to invalidate its LED/OLED caches and re-push
+    // everything so its mirrors here fill in during the hold.
+    Serial.println("RESYNC");
+}
+
+// Called on pad 18 release when resetShowActive is set — repaints the
+// LEDs from the mirrors the DAW has been filling in during the hold and
+// releases the OLED lock so DAW pushes can update it again.
+void resetShowFinish() {
+    if (!resetShowActive) return;
+    resetShowActive = false;
+    ledSet(3, playLedLocal);
+    ledSet(4, loopLeftLocal);
+    ledSet(5, recordLeftLocal);
+    ledSet(6, recordRightLocal);
+    ledSet(7, loopRightLocal);
+    pca9685SetPWM(8, 4095);   // pan-modifier LED is momentary; end off
+    pca9685SetPWM(0, 4095);   // LEDs 0-2 unused, ensure off
+    pca9685SetPWM(1, 4095);
+    pca9685SetPWM(2, 4095);
+    oledLockUntilMs = 0;
+    oledLockIsSoft  = false;
+    // Blank OLED lines — DAW's next OLED push (STOPPED / PLAYING / etc.)
+    // will paint the real state within a frame or two.
+    snprintf(oledLine1, sizeof(oledLine1), " ");
+    snprintf(oledLine2, sizeof(oledLine2), " ");
+    oledLine1Changed = true;
+    oledLine2Changed = true;
+}
+
 // Kick off a 3-blink acknowledgement on the specified pair (1 = loop
 // LEDs 4+7, 2 = record LEDs 5+6). Also pre-clears the corresponding
 // local mirrors so no stray "on" flashes through after the sequence.
@@ -828,18 +974,17 @@ void markerDeleteFlashStep() {
 }
 
 // Called on pad 19 release when the tap wasn't consumed by a delete
-// combo. Replays whatever pad 19's press-action would have been: forward
-// to DAW for the 14+19 return-on-stop combo, or toggle play/stop locally
-// + notify DAW. The old 26+19 entry into clear-markers mode has been
-// retired — pad 15 alone now toggles that mode.
+// combo. Predictively toggles the play LED locally so the user gets
+// instant feedback on tap, then notifies the DAW. DAW's cache-diff
+// next tick sends LED:3:X and re-syncs the mirror — if it turns out
+// play() no-op'd (no audio loaded, etc.) the DAW's authoritative send
+// undoes our predictive toggle within ~1 frame.
 void firePad19Deferred() {
-    if (pad14Held) {
-        Serial.println("TOUCH:19");   // DAW handles the combo
-    } else {
+    if (!pad14Held) {
         playLedLocal = !playLedLocal;
         ledSet(3, playLedLocal);
-        Serial.println("TOUCH:19");
     }
+    Serial.println("TOUCH:19");
     Serial.println("RELEASE:19");
 }
 
@@ -873,6 +1018,7 @@ void textInputRender() {
 
 void exitFlashMode() {
     flashMode = false;
+    Serial.println("DEBUG:FLASH:OFF");
     // Clear the in-mode delete-arm state and its LED.
     if (flashModeDeleteArmed) {
         flashModeDeleteArmed = false;
@@ -886,17 +1032,12 @@ void exitFlashMode() {
     ledSet(5, recordLeftLocal);
     ledSet(6, recordRightLocal);
     ledSet(7, loopRightLocal);
-    // Show "EXIT" for 2 s in DESCRIPTIVE mode only — diagnostic mode is a
-    // pure button/encoder-name display and shouldn't get status banners.
-    // The DAW schedules a playback-state push for after this lock expires.
-    if (displayMode) {
-        snprintf(oledLine1, sizeof(oledLine1), "EXIT");
-        snprintf(oledLine2, sizeof(oledLine2), " ");
-        oledLine1Changed = true;
-        oledLine2Changed = true;
-        oledLockUntilMs  = millis() + 2000;
-        oledLockIsSoft   = false;
-    }
+    // LED 8 was flashing in-sync with the mode indicator (or solid on if
+    // delete-arm was engaged). Force off now — pan-mod press/release will
+    // reassert it if the user actually holds pad 24 later.
+    ledSet(8, false);
+    // No "EXIT" banner — DAW's playback-state push (STOPPED / PLAYING)
+    // is the persistent display; nothing transient to announce.
 }
 
 void pca9685SetPWM(uint8_t channel, uint16_t value) {
@@ -1108,10 +1249,13 @@ void processSerialCommands() {
             else if (serialInputBuffer == "PAIRDEF:REC:1")  { recordPairDefined = true;  }
             else if (serialInputBuffer == "PAIRDEF:REC:0")  { recordPairDefined = false; }
             else if (serialInputBuffer == "SETMODE:DIAG") {
-                setDisplayMode(false);
+                // Skip while the reset show is up — setDisplayMode would
+                // overwrite line 1 (with "DISPLAY DIAGNOSTIC") and clear
+                // our lock, letting DISPFORCE:STOPPED erase "RESET".
+                if (!resetShowActive) setDisplayMode(false);
             }
             else if (serialInputBuffer == "SETMODE:DESC") {
-                setDisplayMode(true);
+                if (!resetShowActive) setDisplayMode(true);
             }
             // TEXTIN:OFF   — leave text-input mode (cursor stops blinking).
             // TEXTIN:text  — enter text-input mode on line 2 with initial
@@ -1216,9 +1360,15 @@ void processSerialCommands() {
                             if (channel == 5) recordLeftLocal  = on;
                             if (channel == 6) recordRightLocal = on;
                             if (channel == 7) loopRightLocal   = on;
-                            bool suppressWrite = textInputMode &&
-                                                 (channel == 4 || channel == 5 ||
-                                                  channel == 6 || channel == 7);
+                            bool inDeleteAllFade = (deleteAllFadeStartMs != 0 &&
+                                                    (channel == 4 || channel == 5 ||
+                                                     channel == 6 || channel == 7));
+                            bool suppressWrite =
+                                (textInputMode &&
+                                 (channel == 4 || channel == 5 ||
+                                  channel == 6 || channel == 7))
+                                || resetShowActive
+                                || inDeleteAllFade;
                             if (!suppressWrite) {
                                 pca9685SetPWM(channel, on ? 0 : 4095);
                             }
@@ -1232,6 +1382,315 @@ void processSerialCommands() {
         } else {
             serialInputBuffer += c;
         }
+    }
+}
+
+// ==================== TOUCH DISPATCH HELPERS ====================
+// Pure extraction of what used to be one giant nested if/else inside
+// loop(). Behaviour is identical — same suppressTouchSend rules, same
+// per-pad side effects — the shape is just split into named functions
+// so new modes and new pads can be added without swelling loop().
+
+// Text-input (naming) mode press handler. Consumes the letter pads plus
+// pads 15 / 20 / 21 WHEN text-input mode is active; all other pads (or
+// any pad when text-input is off) fall out to the flashMode / normal
+// dispatcher. Always suppresses the raw TOUCH send when it consumes.
+// Returns true when the pad was consumed here.
+bool handleTouchTextInputMode(int touchNum) {
+    if (!textInputMode) return false;
+    int letterIdx = letterPadIndex(touchNum);
+    if (letterIdx < 0 &&
+        touchNum != 20 && touchNum != 21 && touchNum != 15) {
+        return false;
+    }
+    if (letterIdx >= 0) {
+        // Letter-pad cycle. Fresh pad starts on its first letter; the
+        // same pad again advances to the next in its 2-3 letter set.
+        const LetterPad& lp = LETTER_PADS[letterIdx];
+        int nLetters = (int)strlen(lp.letters);
+        if (textInputCurrentPad == (int8_t)lp.pad) {
+            textInputCurrentIdx = (textInputCurrentIdx + 1) % nLetters;
+        } else {
+            textInputCurrentPad = (int8_t)lp.pad;
+            textInputCurrentIdx = 0;
+        }
+        textInputPending = lp.letters[textInputCurrentIdx];
+        textInputRender();
+    } else if (touchNum == 20) {
+        // Commit pending (or a space) at cursor position; advance cursor.
+        // In the middle of the buffer this REPLACES; at the end it
+        // appends and grows the buffer.
+        int len = (int)strlen(textInputBuffer);
+        int cap = (int)sizeof(textInputBuffer) - 1;
+        char c = (textInputPending != 0) ? textInputPending : ' ';
+        if (textInputCursorPos < len) {
+            textInputBuffer[textInputCursorPos] = c;
+            textInputCursorPos++;
+        } else if (len < cap) {
+            textInputBuffer[len]     = c;
+            textInputBuffer[len + 1] = '\0';
+            textInputCursorPos = (int8_t)(len + 1);
+        }
+        textInputPending    = 0;
+        textInputCurrentPad = -1;
+        textInputRender();
+    } else if (touchNum == 21) {
+        // Finalise: auto-commit pending at cursor, send NAME to DAW, exit.
+        if (textInputPending != 0) {
+            int len = (int)strlen(textInputBuffer);
+            int cap = (int)sizeof(textInputBuffer) - 1;
+            if (textInputCursorPos < len) {
+                textInputBuffer[textInputCursorPos] = textInputPending;
+            } else if (len < cap) {
+                textInputBuffer[len]     = textInputPending;
+                textInputBuffer[len + 1] = '\0';
+            }
+            textInputPending    = 0;
+            textInputCurrentPad = -1;
+        }
+        Serial.print("NAME:");
+        Serial.println(textInputBuffer);
+        textInputExit();
+    } else if (touchNum == 15) {
+        // Clear letter at cursor — blanks the slot so the flashing
+        // cursor is the only thing visible there.
+        int len = (int)strlen(textInputBuffer);
+        if (textInputCursorPos < len) {
+            textInputBuffer[textInputCursorPos] = ' ';
+        }
+        textInputPending    = 0;
+        textInputCurrentPad = -1;
+        textInputRender();
+    }
+    return true;
+}
+
+// Clear/restore-markers mode ("flashMode") press handler.
+// Returns true when the raw TOUCH send should be suppressed (locally-
+// consumed presses like pad 24's arm toggle or the pair-delete combos).
+bool handleTouchFlashMode(int touchNum) {
+    if (touchNum == 15) {
+        // Exit flashMode. Natural TOUCH:15 below toggles DAW clearMode.
+        exitFlashMode();
+        return false;
+    }
+    if (touchNum == 24) {
+        // Toggle delete-arm; only allowed if something's actually there
+        // to delete. Local-only — DAW never sees the tap.
+        if (flashModeDeleteArmed) {
+            flashModeDeleteArmed = false;
+            ledSet(8, false);
+        } else if (loopPairDefined || recordPairDefined) {
+            flashModeDeleteArmed = true;
+            ledSet(8, true);
+        }
+        return true;
+    }
+    if (flashModeDeleteArmed &&
+        (touchNum == 20 || touchNum == 23) && loopPairDefined) {
+        // Delete the loop pair. Local mirrors updated so LED animation
+        // is snappy; DAW gets DELETEPAIR:LOOP. Suppress TOUCH:N —
+        // otherwise the clear-mode toggle handler would re-enable it.
+        loopLeftLocal   = false;
+        loopRightLocal  = false;
+        loopPairDefined = false;
+        Serial.println("DELETEPAIR:LOOP");
+        if (!loopPairDefined && !recordPairDefined) {
+            flashModeDeleteArmed = false;
+            ledSet(8, false);
+        }
+        return true;
+    }
+    if (flashModeDeleteArmed &&
+        (touchNum == 21 || touchNum == 22) && recordPairDefined) {
+        recordLeftLocal   = false;
+        recordRightLocal  = false;
+        recordPairDefined = false;
+        Serial.println("DELETEPAIR:REC");
+        if (!loopPairDefined && !recordPairDefined) {
+            flashModeDeleteArmed = false;
+            ledSet(8, false);
+        }
+        return true;
+    }
+    // Other pads: no local action; TOUCH:N goes to DAW to toggle pair
+    // enable / trigger jump / etc. LED updates come back via LED:N:X.
+    return false;
+}
+
+// Normal-mode press handler (neither text-input nor flashMode).
+// Returns true when the raw TOUCH send should be suppressed.
+bool handleTouchNormalMode(int touchNum) {
+    if (touchNum == 3) {
+        pad3Held = true;
+        return false;
+    }
+    if (touchNum == 18) {
+        // Start the 3-second reset timer; fire is decided in loop().
+        pad18PressMs    = millis();
+        pad18ResetFired = false;
+        return false;
+    }
+    if (touchNum == 14) {
+        // 19 + 14 = return-to-start ON. Otherwise just track held state.
+        if (pad19Held) {
+            Serial.println("RETURNONSTOP:1");
+            pad19UsedAsModifier = true;
+            comboFired          = true;
+            pad14Held           = true;
+            return true;
+        }
+        pad14Held = true;
+        return false;
+    }
+    if (touchNum == 15) {
+        // 19 + 15 = return-to-start OFF ("stop in place"). Otherwise
+        // record press time — short tap toggles loop-edit, hold = delete-all.
+        if (pad19Held) {
+            Serial.println("RETURNONSTOP:0");
+            pad19UsedAsModifier = true;
+            comboFired          = true;
+            pad15Held           = true;
+            return true;
+        }
+        pad15PressMs        = millis();
+        pad15LongPressFired = false;
+        return true;
+    }
+    if (touchNum == 23 && pad3Held) {
+        // Pad 3 + pad 23 = display-mode switch. Refuse switching to
+        // descriptive if the DAW isn't sending heartbeats — descriptive
+        // is useless without OLED text pushes.
+        bool switchingToDesc = !displayMode;
+        bool dawConnected = (millis() - lastDawHeartbeatMs)
+                             < DAW_HEARTBEAT_TIMEOUT_MS;
+        if (switchingToDesc && !dawConnected) {
+            snprintf(oledLine2, sizeof(oledLine2), "DAW NOT CONNECTED");
+            oledLine2Changed = true;
+            oledLockUntilMs  = millis() + 3000;
+            oledLockIsSoft   = false;
+        } else {
+            setDisplayMode(!displayMode);
+        }
+        // Consumed by the mode switch — forwarding would fire a spurious
+        // loop-right jump on the freshly-active descriptive side.
+        return true;
+    }
+    if (touchNum == 26) {
+        modifierHeld = true;
+        return false;
+    }
+    if (touchNum == 24) {
+        // Momentary pan-modifier: LED 8 on while held.
+        ledSet(8, true);
+        return false;
+    }
+    if (touchNum == 19) {
+        // Defer press action to release so holding 19 as a delete-
+        // modifier doesn't fire play/stop. firePad19Deferred() replays.
+        pad19Held           = true;
+        pad19UsedAsModifier = false;
+        return true;
+    }
+    if ((touchNum == 20 || touchNum == 23) && pad19Held) {
+        pad19UsedAsModifier = true;
+        startMarkerDeleteFlash(1);
+        Serial.println("DELETEPAIR:LOOP");
+        return true;
+    }
+    if ((touchNum == 21 || touchNum == 22) && pad19Held) {
+        pad19UsedAsModifier = true;
+        startMarkerDeleteFlash(2);
+        Serial.println("DELETEPAIR:REC");
+        return true;
+    }
+    // Pads 20-23 without pad 19 held: no local action.
+    return false;
+}
+
+// Top-level press dispatcher. Handles cross-cutting bookkeeping (soft
+// lock release, disconnect-to-diag flip), calls whichever mode handler
+// owns the press, then either forwards TOUCH:N to the DAW or not, and
+// finally writes the diagnostic-mode auto-status line.
+void handleTouchPressed(int touchNum) {
+    if (oledLockIsSoft && millis() < oledLockUntilMs) {
+        oledLockUntilMs = 0;
+        oledLockIsSoft  = false;
+    }
+    if (pendingSwitchToDiagOnActivity) {
+        pendingSwitchToDiagOnActivity = false;
+        setDisplayMode(false);
+    }
+    // Combo lock: after 19+14 or 19+15 has fired, every other press is
+    // suppressed until both combo pads are physically released. Prevents
+    // stray taps while the user still has both fingers down.
+    if (comboFired) return;
+    bool suppressTouchSend = false;
+    if (handleTouchTextInputMode(touchNum)) {
+        suppressTouchSend = true;
+    } else if (flashMode) {
+        suppressTouchSend = handleTouchFlashMode(touchNum);
+    } else {
+        suppressTouchSend = handleTouchNormalMode(touchNum);
+    }
+    if (!suppressTouchSend) {
+        Serial.print("TOUCH:");
+        Serial.println(touchNum);
+    }
+    if (!displayMode && millis() >= oledLockUntilMs) {
+        snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d ON", touchNum);
+        oledLine2Changed = true;
+    }
+}
+
+// Release dispatcher. Resets per-pad held-state trackers, closes long-
+// press windows, replays the deferred pad-19 action, and forwards a
+// RELEASE:N to the DAW for pads that don't need special release handling.
+void handleTouchReleased(int touchNum) {
+    if (touchNum == 26) modifierHeld = false;
+    // Pad 24 release: only turn off LED 8 outside flash mode. Inside
+    // flashMode LED 8 tracks the delete-arm toggle, not the physical hold.
+    if (touchNum == 24 && !flashMode) ledSet(8, false);
+    if (touchNum == 3)  pad3Held  = false;
+    if (touchNum == 14) pad14Held = false;
+    if (touchNum == 15) {
+        pad15Held = false;
+        // Short tap = toggle loop-edit. Long-press already fired the
+        // delete-all gesture (clears pad15PressMs); skip in that case.
+        if (!pad15LongPressFired && pad15PressMs != 0) {
+            if (flashMode) exitFlashMode();
+            else           enterFlashMode();
+            Serial.println("TOUCH:15");
+            Serial.println("RELEASE:15");
+        }
+        pad15PressMs        = 0;
+        pad15LongPressFired = false;
+    }
+    if (touchNum == 18) {
+        if (pad18ResetFired) resetShowFinish();
+        pad18PressMs    = 0;
+        pad18ResetFired = false;
+    }
+    if (touchNum == 19) {
+        // Replay deferred press-action if the tap wasn't consumed by a
+        // delete combo. RELEASE:19 is sent from within firePad19Deferred.
+        bool wasModifier = pad19UsedAsModifier;
+        pad19Held           = false;
+        pad19UsedAsModifier = false;
+        if (!wasModifier) firePad19Deferred();
+    } else {
+        Serial.print("RELEASE:");
+        Serial.println(touchNum);
+    }
+    if (!displayMode && millis() >= oledLockUntilMs) {
+        snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d OFF", touchNum);
+        oledLine2Changed = true;
+    }
+    // Combo lock: cleared once both combo pads (19 + 14 or 19 + 15) are
+    // physically released. Checked at the very end of the release handler
+    // so all held-state flags for this release have been updated first.
+    if (comboFired && !pad19Held && !pad14Held && !pad15Held) {
+        comboFired = false;
     }
 }
 
@@ -1261,6 +1720,19 @@ void loop() {
             // clobbering any diagnostic event after user activity. Also
             // stops the pad-20/21 name-entry flash if it was active.
             if (textInputMode) textInputExit();
+            // Clean-sweep every LED and mirror so the controller doesn't
+            // sit with LEDs stuck in the last-known state after the DAW
+            // vanishes. The DAW normally sends LED:*:OFF on graceful
+            // shutdown; this covers the crash / kill / unplug paths.
+            for (int ch = 0; ch < 9; ch++) pca9685SetPWM(ch, 4095);
+            playLedLocal      = false;
+            loopLeftLocal     = false;
+            loopRightLocal    = false;
+            recordLeftLocal   = false;
+            recordRightLocal  = false;
+            loopPairDefined   = false;
+            recordPairDefined = false;
+            if (flashMode) { flashMode = false; flashModeDeleteArmed = false; }
             snprintf(oledLine1, sizeof(oledLine1), "DAW DISCONNECTED");
             snprintf(oledLine2, sizeof(oledLine2), " ");
             oledLine1Changed = true;
@@ -1348,264 +1820,11 @@ void loop() {
                 bool was = lastTouchState[chip] & (1 << i);
                 int touchNum = chip * 12 + i;  // 0-11, 12-23, 24-35
                 if (now && !was) {
-                    // Any touch press releases a soft OLED lock so the next
-                    // action's feedback appears immediately.
-                    if (oledLockIsSoft && millis() < oledLockUntilMs) {
-                        oledLockUntilMs = 0;
-                        oledLockIsSoft  = false;
-                    }
-                    // First activity after DAW disconnect drops us into
-                    // diagnostic mode so the controller stays useful.
-                    if (pendingSwitchToDiagOnActivity) {
-                        pendingSwitchToDiagOnActivity = false;
-                        setDisplayMode(false);
-                    }
-                    bool suppressTouchSend = false;
-                    // Text-input (naming) mode intercepts the letter pads
-                    // plus pads 20 / 21 and consumes them locally. Other
-                    // pads still function normally so the user can e.g.
-                    // keep adding tracks mid-name.
-                    //   letter pad -> cycle its 2-3 letters at the cursor
-                    //                 (pressing a different letter pad
-                    //                  starts a fresh cycle on that pad)
-                    //   pad 20     -> commit current letter (or a space),
-                    //                 advance cursor
-                    //   pad 21     -> auto-commit pending, send NAME to
-                    //                 DAW, exit text-input mode
-                    int letterIdx = textInputMode ? letterPadIndex(touchNum) : -1;
-                    if (textInputMode && (letterIdx >= 0 || touchNum == 20 ||
-                                          touchNum == 21 || touchNum == 15)) {
-                        if (letterIdx >= 0) {
-                            const LetterPad& lp = LETTER_PADS[letterIdx];
-                            int nLetters = (int)strlen(lp.letters);
-                            if (textInputCurrentPad == (int8_t)lp.pad) {
-                                textInputCurrentIdx = (textInputCurrentIdx + 1) % nLetters;
-                            } else {
-                                textInputCurrentPad = (int8_t)lp.pad;
-                                textInputCurrentIdx = 0;
-                            }
-                            textInputPending = lp.letters[textInputCurrentIdx];
-                            textInputRender();
-                        } else if (touchNum == 20) {
-                            // Commit at cursor position. When the cursor is
-                            // in the middle of the buffer, the pending
-                            // letter (or a space) REPLACES the character
-                            // there; cursor then advances one slot. When at
-                            // the end, we append and grow the buffer.
-                            int len = (int)strlen(textInputBuffer);
-                            int cap = (int)sizeof(textInputBuffer) - 1;
-                            char c = (textInputPending != 0) ? textInputPending : ' ';
-                            if (textInputCursorPos < len) {
-                                textInputBuffer[textInputCursorPos] = c;
-                                textInputCursorPos++;
-                            } else if (len < cap) {
-                                textInputBuffer[len]     = c;
-                                textInputBuffer[len + 1] = '\0';
-                                textInputCursorPos = (int8_t)(len + 1);
-                            }
-                            textInputPending    = 0;
-                            textInputCurrentPad = -1;
-                            textInputRender();
-                        } else if (touchNum == 21) {
-                            // Finalise: auto-commit pending at cursor, then
-                            // send NAME to DAW and exit text-input mode.
-                            if (textInputPending != 0) {
-                                int len = (int)strlen(textInputBuffer);
-                                int cap = (int)sizeof(textInputBuffer) - 1;
-                                if (textInputCursorPos < len) {
-                                    textInputBuffer[textInputCursorPos] = textInputPending;
-                                } else if (len < cap) {
-                                    textInputBuffer[len]     = textInputPending;
-                                    textInputBuffer[len + 1] = '\0';
-                                }
-                                textInputPending    = 0;
-                                textInputCurrentPad = -1;
-                            }
-                            Serial.print("NAME:");
-                            Serial.println(textInputBuffer);
-                            textInputExit();
-                        } else if (touchNum == 15) {
-                            // Clear letter at cursor: blank the slot so the
-                            // flashing cursor is the only thing visible
-                            // there. If the cursor is past the end, nothing
-                            // to do.
-                            int len = (int)strlen(textInputBuffer);
-                            if (textInputCursorPos < len) {
-                                textInputBuffer[textInputCursorPos] = ' ';
-                            }
-                            textInputPending    = 0;
-                            textInputCurrentPad = -1;
-                            textInputRender();
-                        }
-                        suppressTouchSend = true;
-                    }
-                    // Local UI reactions: predictive LED toggles so the user
-                    // sees the response instantly, before the DAW even sees
-                    // the touch event.
-                    else if (flashMode) {
-                        // Clear/restore-markers mode. Pad 26 exits. Pad 24
-                        // toggles delete-arm. Marker pads either delete a
-                        // pair (when armed) or toggle its enabled state.
-                        if (touchNum == 26) {
-                            exitFlashMode();
-                        } else if (touchNum == 24) {
-                            // Toggle delete-arm — only allowed if there's
-                            // actually something to delete. Local-only —
-                            // don't leak the press to the DAW as a normal
-                            // pan-modifier event.
-                            if (flashModeDeleteArmed) {
-                                flashModeDeleteArmed = false;
-                                ledSet(8, false);
-                            } else if (loopPairDefined || recordPairDefined) {
-                                flashModeDeleteArmed = true;
-                                ledSet(8, true);
-                            }
-                            suppressTouchSend = true;
-                        } else if (flashModeDeleteArmed &&
-                                   (touchNum == 20 || touchNum == 23) &&
-                                   loopPairDefined) {
-                            // Delete the loop pair. Local mirrors and
-                            // defined-flag update immediately for snappy
-                            // LED feedback; DAW gets the DELETEPAIR message
-                            // and confirms with LED:N:OFF / PAIRDEF:0.
-                            // MUST suppress TOUCH:N — otherwise the DAW's
-                            // clear-mode toggle handler would re-enable the
-                            // pair right after the delete.
-                            loopLeftLocal   = false;
-                            loopRightLocal  = false;
-                            loopPairDefined = false;
-                            Serial.println("DELETEPAIR:LOOP");
-                            suppressTouchSend = true;
-                            if (!loopPairDefined && !recordPairDefined) {
-                                flashModeDeleteArmed = false;
-                                ledSet(8, false);
-                            }
-                        } else if (flashModeDeleteArmed &&
-                                   (touchNum == 21 || touchNum == 22) &&
-                                   recordPairDefined) {
-                            recordLeftLocal   = false;
-                            recordRightLocal  = false;
-                            recordPairDefined = false;
-                            Serial.println("DELETEPAIR:REC");
-                            suppressTouchSend = true;
-                            if (!loopPairDefined && !recordPairDefined) {
-                                flashModeDeleteArmed = false;
-                                ledSet(8, false);
-                            }
-                        } else if (touchNum == 20 || touchNum == 23) {
-                            bool newState = !loopLeftLocal;
-                            loopLeftLocal  = newState;
-                            loopRightLocal = newState;
-                        } else if (touchNum == 21 || touchNum == 22) {
-                            bool newState = !recordLeftLocal;
-                            recordLeftLocal  = newState;
-                            recordRightLocal = newState;
-                        }
-                        // Other pads ignored while in flash mode.
-                    } else {
-                        // Normal mode.
-                        if (touchNum == 3) {
-                            pad3Held = true;
-                        } else if (touchNum == 14) {
-                            pad14Held = true;
-                        } else if (touchNum == 15) {
-                            // Pad 15 tap = enter/exit loop-edit (flashMode).
-                            // No longer tracks pad15Held for the retired
-                            // 15+19 combo — a single press toggles the mode
-                            // in and out, and the DAW-side clear-mode is
-                            // kept in sync via the deferred TOUCH:15.
-                            if (flashMode) exitFlashMode();
-                            else           enterFlashMode();
-                        } else if (touchNum == 23 && pad3Held) {
-                            // Attempting a display-mode switch. Refuse the
-                            // switch to descriptive if the DAW hasn't pinged
-                            // us recently — descriptive mode is useless
-                            // without the DAW driving the OLED text.
-                            bool switchingToDesc = !displayMode;
-                            bool dawConnected = (millis() - lastDawHeartbeatMs)
-                                                 < DAW_HEARTBEAT_TIMEOUT_MS;
-                            if (switchingToDesc && !dawConnected) {
-                                snprintf(oledLine2, sizeof(oledLine2), "DAW NOT CONNECTED");
-                                oledLine2Changed = true;
-                                oledLockUntilMs  = millis() + 3000;
-                                oledLockIsSoft   = false;  // hard lock for 3 s
-                                // Stay in diagnostic mode; nothing else to do.
-                            } else {
-                                setDisplayMode(!displayMode);
-                            }
-                            // Don't tell the DAW about this pad 23 press:
-                            // it's consumed by the mode switch, and forwarding
-                            // it would cause a spurious loop-right jump on
-                            // the newly-active descriptive side.
-                            suppressTouchSend = true;
-                        } else if (touchNum == 26) {
-                            modifierHeld = true;
-                        } else if (touchNum == 24) {
-                            // Momentary pan-modifier: light LED 8 while held.
-                            ledSet(8, true);
-                        } else if (touchNum == 19) {
-                            // Defer pad 19's press action until release so
-                            // holding 19 as a delete-modifier doesn't also
-                            // fire play/stop. firePad19Deferred() replays
-                            // the correct action on release when no combo
-                            // was consumed.
-                            pad19Held           = true;
-                            pad19UsedAsModifier = false;
-                            suppressTouchSend   = true;
-                        }
-                        // Pads 20-23: if pad 19 is being held, this is the
-                        // NEW delete-pair combo. Otherwise, plain jump-to-
-                        // marker (DAW handles via TOUCH:N as before).
-                        else if ((touchNum == 20 || touchNum == 23) && pad19Held) {
-                            pad19UsedAsModifier = true;
-                            startMarkerDeleteFlash(1);
-                            Serial.println("DELETEPAIR:LOOP");
-                            suppressTouchSend = true;
-                        } else if ((touchNum == 21 || touchNum == 22) && pad19Held) {
-                            pad19UsedAsModifier = true;
-                            startMarkerDeleteFlash(2);
-                            Serial.println("DELETEPAIR:REC");
-                            suppressTouchSend = true;
-                        }
-                        // Pads 20-23 without pad 19: no local action.
-                    }
-                    if (!suppressTouchSend) {
-                        Serial.print("TOUCH:");
-                        Serial.println(touchNum);
-                    }
-                    // Diagnostic auto-write: only in diagnostic mode + no
-                    // active mode-lock. Always shows button events (including
-                    // during clear-markers mode) — diagnostic mode is a pure
-                    // event log.
-                    if (!displayMode && millis() >= oledLockUntilMs) {
-                        snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d ON", touchNum);
-                        oledLine2Changed = true;
-                    }
+                    handleTouchPressed(touchNum);
                 } else if (!now && was) {
-                    if (touchNum == 26) modifierHeld = false;
-                    // Pad 24 release: only turn off LED 8 outside flash
-                    // mode. Inside flash mode LED 8 tracks the delete-arm
-                    // toggle, not the physical hold.
-                    if (touchNum == 24 && !flashMode) ledSet(8, false);
-                    if (touchNum == 3)  pad3Held  = false;
-                    if (touchNum == 14) pad14Held = false;
-                    if (touchNum == 15) pad15Held = false;
-                    if (touchNum == 19) {
-                        // Pad 19 release: replay deferred press-action only
-                        // if the tap wasn't consumed by a delete combo.
-                        bool wasModifier = pad19UsedAsModifier;
-                        pad19Held           = false;
-                        pad19UsedAsModifier = false;
-                        if (!wasModifier) firePad19Deferred();
-                    } else {
-                        Serial.print("RELEASE:");
-                        Serial.println(touchNum);
-                    }
-                    if (!displayMode && millis() >= oledLockUntilMs) {
-                        snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d OFF", touchNum);
-                        oledLine2Changed = true;
-                    }
+                    handleTouchReleased(touchNum);
                 }
+                // (all handling moved into handleTouchPressed / handleTouchReleased above)
             }
             lastTouchState[chip] = touchState;
         }
@@ -1630,6 +1849,25 @@ void loop() {
 
     // --- 3-blink acknowledgement for a marker-pair delete ---
     markerDeleteFlashStep();
+
+    // --- Pad 15 long-press: delete both loop and record pairs ---
+    if (pad15PressMs != 0 && !pad15LongPressFired &&
+        (millis() - pad15PressMs) >= DELETE_ALL_HOLD_MS) {
+        pad15LongPressFired = true;
+        performDeleteAllLoops();
+    }
+    // Drive the 1 s fade-out of the four pair LEDs after a delete-all.
+    deleteAllFadeStep();
+
+    // --- Hard reset: pad 18 held for RESET_HOLD_MS ---
+    // The "RESET" show stays up as long as pad 18 is held; on release
+    // resetShowFinish() (from the touch release handler) repaints from
+    // the mirrors the DAW filled in during the hold.
+    if (pad18PressMs != 0 && !pad18ResetFired &&
+        (millis() - pad18PressMs) >= RESET_HOLD_MS) {
+        pad18ResetFired = true;
+        performReset();
+    }
 
     // --- Text-input phase re-sync (every ~150 ms while typing) ---
     // Prevents DAW-side drift or initial-send latency from putting the

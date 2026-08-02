@@ -95,6 +95,13 @@ private:
     // combo at the top of the panel.
     int m_leftPanelMode = 0;
 
+    // Sticky "last folder" for the Windows file dialogs — kept SEPARATE
+    // per dialog type so browsing an audio file doesn't move the session
+    // dialog's starting folder (and vice versa). Persisted to
+    // user_settings.json so they survive DAW restarts.
+    std::string m_lastAudioDir;
+    std::string m_lastSessionDir;
+
     // Zoom smoothing toggle
     bool m_zoomSmoothing;
 

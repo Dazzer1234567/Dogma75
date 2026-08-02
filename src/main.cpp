@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <thread>
 #include "audio/audio_engine.h"
 #include "controller/serial_controller.h"
 #include "gui/gui_manager.h"
@@ -86,6 +87,9 @@ int main(int argc, char** argv) {
     serialController.setRenameBufferCallback([&audioEngine](const std::string& buf, int cursor, bool active) {
         audioEngine.handleRenameBuffer(buf, cursor, active);
     });
+    serialController.setResyncCallback([&audioEngine]() {
+        audioEngine.handleResync();
+    });
     serialController.setRenameSyncCallback([&audioEngine](int phaseMs) {
         audioEngine.handleRenameSync(phaseMs);
     });
@@ -133,6 +137,14 @@ int main(int argc, char** argv) {
 
     // Cleanup
     guiManager.shutdown();
+    // Turn every controller LED off before we close the serial port —
+    // otherwise LEDs stay lit at whatever value the last update left
+    // them, which looks like a stuck controller after the DAW quits.
+    for (int ch = 0; ch < 9; ch++) {
+        serialController.sendMessage("LED:" + std::to_string(ch) + ":OFF");
+    }
+    // Small window for the async writer thread to drain its queue.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
     serialController.shutdown();
     audioEngine.shutdown();
 

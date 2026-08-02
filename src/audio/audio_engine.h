@@ -207,6 +207,10 @@ public:
     // Called on the firmware's RENAMESYNC message; snapshots the LED-flash
     // phase so the GUI can pulse the rename preview in sync with pads.
     void handleRenameSync(int phaseMs);
+    // Firmware requested a full state re-push (hard-reset gesture).
+    // Invalidates the LED / PAIRDEF / OLED caches and the startup-push
+    // flag so updateController re-sends everything on its next tick.
+    void handleResync();
     // Read side for the GUI. Returns "" and false if no rename is active.
     // Also fills `cursorPosOut` with where the DAW should overlay the cursor.
     bool  getRenameBuffer(std::string& out, int& cursorPosOut) const;
@@ -221,16 +225,51 @@ public:
     // handles the scrub-then-resume timer.
     void updateController();
 
+    // Fast-path LED sync. Callable from ANY thread (reader thread from
+    // handleTouch, main thread from updateController). Sends the LED
+    // command immediately via the async writer + updates the "last
+    // sent" cache so updateController's cache-diff won't re-send. Use
+    // whenever the DAW-side authoritative state has just changed and
+    // we want the LED to track it with reader-thread latency (~ms)
+    // instead of waiting for the next frame.
+    void syncPlayLedNow();
+    void syncLoopPairLedsNow();
+    void syncRecordPairLedsNow();
+
 private:
     // MIDI helper methods (extracted from processMidiMessages)
     void handleJogWheel(int speed);
     void handleFaderZoom(int position, int range);
+    // handleTouch dispatch helpers. Each is a self-contained handler for
+    // one pad or one pad-group; they return true when they've fully
+    // handled the touch so handleTouch() can early-return. Pure extraction
+    // of what used to be one 340-line switch of nested ifs.
+    bool touchHandleDeletePairSentinel(int pad);
+    bool touchHandlePad26(bool pressed);
+    bool touchHandlePad15Press();
+    bool touchHandlePad12(bool pressed);
+    void touchHandlePairInClearMode(int pad);   // pads 20/21/22/23 in clear-mode
+    void touchHandlePairPad(int markerIdx);     // pads 20/21/22/23 in normal mode
     void* m_stream;
     std::atomic<bool> m_running;
     std::atomic<bool> m_testToneEnabled;
     std::atomic<bool> m_playing;
     std::atomic<int> m_outputStereoPair;
     std::atomic<size_t> m_playbackPosition;
+
+    // Play/stop click-avoidance envelope. Ramps 0<->1 at PLAY_FADE_MS
+    // (5 ms) whenever m_playing changes. Owned entirely by the audio
+    // callback thread — no atomics needed. Step is computed once when
+    // the stream's sample rate is known (in startAudio()).
+    float                m_playFadeGain = 0.0f;
+    float                m_playFadeStep = 0.0f;
+    static constexpr float PLAY_FADE_MS = 5.0f;
+    // Audio-thread-only bookkeeping for the "return to start on stop"
+    // feature: the position-jump is deferred until AFTER the fade-out
+    // has completed, so mid-fade playhead teleports don't reintroduce
+    // the click the fade was there to prevent.
+    bool                 m_prevCBPlaying     = false;
+    bool                 m_returnJumpPending = false;
 
     double m_sampleRate;
     unsigned int m_bufferSize;

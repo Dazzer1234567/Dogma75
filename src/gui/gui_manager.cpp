@@ -990,8 +990,15 @@ void GUIManager::processFrame() {
         ofn.lpstrFile   = filename;
         ofn.nMaxFile    = sizeof(filename);
         ofn.lpstrTitle  = "Load WAV into selected track";
+        ofn.lpstrInitialDir = m_lastAudioDir.empty() ? nullptr
+                                                    : m_lastAudioDir.c_str();
         ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetOpenFileNameA(&ofn)) {
+            // Remember the folder so the next audio-load dialog opens
+            // here, independent of the session dialog's history.
+            const char* slash = strrchr(filename, '\\');
+            if (slash) m_lastAudioDir.assign(filename, slash - filename);
+            saveSettings();
             int idx = m_audioEngine->getSelectedTrack();
             if (idx < 0 || idx >= m_audioEngine->getTrackCount()) {
                 idx = m_audioEngine->addTrack("");
@@ -2909,6 +2916,21 @@ void GUIManager::saveSettings() {
     file << "    \"selectedPark\": " << m_selectedParkButton << "\n";
     file << "  },\n";
     file << "\n";
+    // Sticky per-dialog last folders. JSON strings; backslashes escaped
+    // so Windows paths round-trip cleanly through the ad-hoc parser.
+    auto jsonEscape = [](const std::string& s) {
+        std::string out;
+        for (char c : s) {
+            if (c == '\\' || c == '"') { out += '\\'; out += c; }
+            else out += c;
+        }
+        return out;
+    };
+    file << "  \"dialogs\": {\n";
+    file << "    \"lastAudioDir\":   \"" << jsonEscape(m_lastAudioDir)   << "\",\n";
+    file << "    \"lastSessionDir\": \"" << jsonEscape(m_lastSessionDir) << "\"\n";
+    file << "  },\n";
+    file << "\n";
 
     // Save velocity curve settings
     if (m_serialController) {
@@ -2948,8 +2970,15 @@ void GUIManager::saveSession() {
     ofn.nMaxFile    = sizeof(filename);
     ofn.lpstrTitle  = "Save DAW Session";
     ofn.lpstrDefExt = "json";
+    ofn.lpstrInitialDir = m_lastSessionDir.empty() ? nullptr
+                                                   : m_lastSessionDir.c_str();
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetSaveFileNameA(&ofn)) return;
+    {
+        const char* slash = strrchr(filename, '\\');
+        if (slash) m_lastSessionDir.assign(filename, slash - filename);
+        saveSettings();
+    }
 
     std::ofstream file(filename);
     if (!file.is_open()) {
@@ -3027,8 +3056,15 @@ void GUIManager::openSession() {
     ofn.nMaxFile    = sizeof(filename);
     ofn.lpstrTitle  = "Open DAW Session";
     ofn.lpstrDefExt = "json";
+    ofn.lpstrInitialDir = m_lastSessionDir.empty() ? nullptr
+                                                   : m_lastSessionDir.c_str();
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameA(&ofn)) return;
+    {
+        const char* slash = strrchr(filename, '\\');
+        if (slash) m_lastSessionDir.assign(filename, slash - filename);
+        saveSettings();
+    }
     loadSessionFromFile(filename);
 #endif
 }
@@ -3427,6 +3463,19 @@ void GUIManager::loadSettings() {
         if (end == std::string::npos) return "";
         return json.substr(pos, end - pos);
     };
+
+    // Per-dialog last folders. Unescape JSON backslashes so Windows
+    // paths (which we escaped on save) round-trip correctly.
+    auto unescape = [](const std::string& s) {
+        std::string out;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '\\' && i + 1 < s.size()) { out += s[i + 1]; i++; }
+            else out += s[i];
+        }
+        return out;
+    };
+    m_lastAudioDir   = unescape(getString("lastAudioDir"));
+    m_lastSessionDir = unescape(getString("lastSessionDir"));
 
     std::string park1 = getString("park1");
     std::string park2 = getString("park2");

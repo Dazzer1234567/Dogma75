@@ -11,6 +11,17 @@
 #include <windows.h>
 #endif
 
+// Debug: append every serial in/out line to ctrl.log with a session-
+// relative ms timestamp. Used to diagnose firmware/DAW sync bugs.
+static void logCtrlLine(const char* dir, const std::string& text) {
+    static int64_t startMs = 0;
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (startMs == 0) startMs = nowMs;
+    std::ofstream f("c:\\0_CODE\\Dogma75\\ctrl.log", std::ios::app);
+    if (f.is_open()) f << (nowMs - startMs) << " " << dir << " " << text << "\n";
+}
+
 // ==================== VELOCITY CURVE IMPLEMENTATION ====================
 
 float VelocityCurve::evaluate(float normalizedInput) const {
@@ -262,6 +273,7 @@ void SerialController::shutdown() {
 void SerialController::sendMessage(const std::string& message) {
 #ifdef _WIN32
     if (!m_serialHandle) return;
+    logCtrlLine("->", message);
     // Non-blocking enqueue. The writer thread owns the actual WriteFile.
     // Drop the OLDEST heartbeat when the queue overflows — heartbeats are
     // safe to lose (firmware just uses their arrival time). Any other
@@ -412,6 +424,7 @@ void SerialController::calculateRpmAndVelocity(long delta, float& rpm, float& ve
 }
 
 void SerialController::processLine(const std::string& line) {
+    logCtrlLine("<-", line);
     // Parse encoder messages: E1-E6
     for (int enc = 1; enc <= 6; enc++) {
         std::string prefix = "E" + std::to_string(enc) + ":";
@@ -523,6 +536,20 @@ void SerialController::processLine(const std::string& line) {
             int sentinel = (line == "DELETEPAIR:LOOP") ? 200 : 201;
             m_touchCallback(sentinel, true);
         }
+        return;
+    }
+    // RETURNONSTOP:1 / :0 — 19+14 or 19+15 combo. Sentinel 202 = ON, 203 = OFF.
+    if (line == "RETURNONSTOP:1" || line == "RETURNONSTOP:0") {
+        if (m_touchCallback) {
+            int sentinel = (line == "RETURNONSTOP:1") ? 202 : 203;
+            m_touchCallback(sentinel, true);
+        }
+        return;
+    }
+    // RESYNC — firmware wants us to re-push authoritative state
+    // (mode, OLED, all LEDs, PAIRDEFs). Sent after the pad-18 hard reset.
+    if (line == "RESYNC") {
+        if (m_resyncCallback) m_resyncCallback();
         return;
     }
     // RENAMESYNC:<phaseMs> — firmware LED-flash phase snapshot at the

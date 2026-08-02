@@ -57,6 +57,9 @@ using RenameBufferCallback = std::function<void(const std::string& buffer, int c
 // flash phase (0 .. 499 ms). The DAW uses this to pulse its own preview
 // in sync with the physical LEDs.
 using RenameSyncCallback = std::function<void(int phaseMs)>;
+// Fires when the firmware asks the DAW to re-push its authoritative
+// state (LEDs, mode, OLED). Sent after the pad-18 hard-reset gesture.
+using ResyncCallback = std::function<void()>;
 
 class SerialController {
 public:
@@ -82,6 +85,7 @@ public:
     void setNameCallback(NameCallback cb) { m_nameCallback = cb; }
     void setRenameBufferCallback(RenameBufferCallback cb) { m_renameBufferCallback = cb; }
     void setRenameSyncCallback(RenameSyncCallback cb) { m_renameSyncCallback = cb; }
+    void setResyncCallback(ResyncCallback cb)         { m_resyncCallback = cb; }
 
     // Test page state (read by GUI)
     bool isTouched(int pad) const { return (pad >= 0 && pad < 36) ? m_touchState[pad] : false; }
@@ -130,6 +134,7 @@ private:
     NameCallback m_nameCallback;
     RenameBufferCallback m_renameBufferCallback;
     RenameSyncCallback   m_renameSyncCallback;
+    ResyncCallback       m_resyncCallback;
 
     // Touch state (for test page display)
     bool m_touchState[36] = {};
