@@ -10,6 +10,8 @@
 #include "track.h"
 #include "../controller/serial_controller.h"
 
+class OscSender;
+
 // ---- Undo history ----
 // One entry captures the "user-visible session state" before an action ran.
 // Audio content (per-track audioData / peak pyramid) is intentionally not
@@ -682,6 +684,31 @@ private:
     // pad 3 is down, a pad 23 press does NOT toggle loop-right on the DAW
     // side either — it's consumed by the display-mode toggle.
     std::atomic<bool> m_pad3Held{false};
+
+    // Local shadow of the TotalMix mute state for the input pair we're
+    // driving — we don't process OSC feedback yet, so this is just a
+    // toggle flag. Assumes we always mute the same pair per session.
+    std::atomic<bool> m_totalMixInputPairMuted{false};
+    // OSC sender to TotalMix FX (default 127.0.0.1:7001). Held as
+    // unique_ptr so audio_engine.h stays free of Winsock includes.
+    std::unique_ptr<OscSender> m_osc;
+    // Toggle one TotalMix strip mute via /1/mute/1/<stripIndex>. TotalMix
+    // strips are already stereo-linked in the mixer, so one message mutes
+    // the whole pair. Strip index maps to the current bank layout — with
+    // stereo linking, strip 1 = AES 1+2, strip 2 = MADI 1+2, strip 3 =
+    // MADI 3+4, etc. Strip indices above 8 need bank navigation (not
+    // implemented yet). `label` shows on the OLED (e.g. "MADI 1-2").
+    void toggleTotalMixStripMute(int stripIndex, const char* label);
+public:
+    // Session persistence + startup/load sync. The DAW doesn't listen for
+    // OSC feedback yet, so restarts would otherwise drift: TotalMix and
+    // the DAW could disagree on whether MADI 1-2 is muted. syncTotalMix…
+    // FORCES TotalMix + the controller OLED to match our shadow flag —
+    // call after any load path so external state is aligned.
+    bool getTotalMixInputPairMuted() const { return m_totalMixInputPairMuted.load(); }
+    void setTotalMixInputPairMuted(bool m) { m_totalMixInputPairMuted.store(m); }
+    void syncTotalMixMuteToHardware();
+private:
 
     // Pad 14 / pad 15 held state. Combined with pad 19 (play) to set the
     // on-stop-return-to-start flag: 14+19 turns it ON, 15+19 turns it OFF.

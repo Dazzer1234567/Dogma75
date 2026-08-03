@@ -208,6 +208,30 @@ void oledFill(uint8_t value) {
     }
 }
 
+// --- OSC-mute status indicator ---
+// A 4-pixel-wide vertical bar on the far-left of the OLED that lights up
+// when the DAW's OSC mute is active. Sent from the DAW via MUTEIND:1 / :0.
+// Redrawn on state changes AND after every text-line render (the text
+// renderer's full-width window would otherwise blank the indicator).
+bool muteIndOn = false;
+bool muteIndDirty = true;   // paint on first idle tick so boot state is defined
+
+void oledDrawMuteIndicator() {
+    if (!oledFound) return;
+    // 2 cols (each = 2 pixels) x 64 rows = 128 bytes. Chunk to stay under
+    // the Wire2 buffer, matching the existing full-screen fill pattern.
+    oledSetWindow(0x00, 0x01, 0, 63);
+    uint8_t val = muteIndOn ? 0xFF : 0x00;
+    int total = 2 * 64;
+    for (int off = 0; off < total; off += 28) {
+        int n = min(28, total - off);
+        Wire2.beginTransmission(OLED_ADDR);
+        Wire2.write(0x40);
+        for (int i = 0; i < n; i++) Wire2.write(val);
+        Wire2.endTransmission();
+    }
+}
+
 void oledTestPattern() {
     // Vertical gradient: left=dark, right=bright
     oledSetWindow(0x00, 0x7F, 0x00, 0x3F);
@@ -331,6 +355,14 @@ void oledStep() {
 
     // Idle: latch new work if a line is dirty.
     if (oledDrawing == 0) {
+        // Repaint the far-left mute indicator first — text renders overlap
+        // its columns, so any pending text draw would clobber it if we
+        // deferred the repair.
+        if (muteIndDirty) {
+            oledDrawMuteIndicator();
+            muteIndDirty = false;
+            return;
+        }
         const char* src = nullptr;
         if (oledLine1Changed) {
             oledLine1Changed = false;
@@ -396,6 +428,9 @@ void oledStep() {
     oledDrawStep++;
     if (oledDrawStep >= 32) {
         oledDrawing = 0;  // finished; next call will latch new work if pending
+        // Text render zero'd cols 0-1 across the line's row band, so the
+        // left-column mute indicator needs to be redrawn if it was on.
+        if (muteIndOn) muteIndDirty = true;
     }
 }
 
@@ -1363,6 +1398,17 @@ void processSerialCommands() {
             else if (serialInputBuffer == "MUTEFLASH:0") {
                 muteFlashActive = false;
                 pca9685SetPWM(0, muteLedLocal ? ledBrightness[0] : 4095);
+            }
+            // MUTEIND:1 / :0 — DAW toggles the far-left OSC-mute indicator
+            // bar on the OLED. Just latches state; next idle oledStep()
+            // renders it.
+            else if (serialInputBuffer == "MUTEIND:1") {
+                muteIndOn    = true;
+                muteIndDirty = true;
+            }
+            else if (serialInputBuffer == "MUTEIND:0") {
+                muteIndOn    = false;
+                muteIndDirty = true;
             }
             else if (serialInputBuffer.startsWith("TEXTIN:") && displayMode) {
                 String text = serialInputBuffer.substring(7);

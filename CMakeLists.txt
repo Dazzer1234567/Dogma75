@@ -22,6 +22,8 @@ set(SOURCES
     src/gui/gui_manager.h
     src/util/daw_log.cpp
     src/util/daw_log.h
+    src/osc/osc_sender.cpp
+    src/osc/osc_sender.h
 )
 
 add_executable(MinimalDAW ${SOURCES})

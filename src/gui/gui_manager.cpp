@@ -307,6 +307,12 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     loadSessionFromFile("c:\\0_CODE\\Dogma75\\Workspace\\can delete\\record test.json");
     retimeArrangement();
 
+    // Belt-and-suspenders sync in case the default session file was missing
+    // (loadSessionFromFile returns early on file-open failure without
+    // running its own sync). Cheap no-op if the file loaded fine and
+    // already synced.
+    if (m_audioEngine) m_audioEngine->syncTotalMixMuteToHardware();
+
     m_running = true;
     std::cout << "GUI initialized successfully with OpenGL " << glGetString(GL_VERSION) << std::endl;
     return true;
@@ -3879,6 +3885,7 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
     file << "  \"loopEnabled\":         " << (m_audioEngine->getLoopEnabled()          ? "true" : "false") << ",\n";
     file << "  \"recordEnabled\":       " << (m_audioEngine->getRecordEnabled()        ? "true" : "false") << ",\n";
     file << "  \"returnToStartOnStop\": " << (m_audioEngine->getReturnToStartOnStop()  ? "true" : "false") << ",\n";
+    file << "  \"totalMixMuted\":       " << (m_audioEngine->getTotalMixInputPairMuted() ? "true" : "false") << ",\n";
     file << "  \"markers\": [\n";
     for (int mi = 0; mi < 4; mi++) {
         // "everSet" round-trips whether the marker has EVER been placed,
@@ -3942,6 +3949,9 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
     file << "}\n";
     file.close();
     std::cout << "Session saved to " << filename << std::endl;
+    dawLog("Session SAVED: %s (totalMixMuted=%s)",
+           filename,
+           m_audioEngine->getTotalMixInputPairMuted() ? "true" : "false");
     m_currentSessionPath = filename;   // enables Revert
     if (m_audioEngine) {
         m_audioEngine->clearSessionDirty();
@@ -4133,6 +4143,22 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         }
     }
 
+    // OSC mute shadow — restore silently (no OSC push here; the syncTotalMix
+    // call at the end of this function forces external state to match).
+    {
+        size_t k = json.find("\"totalMixMuted\"");
+        if (k != std::string::npos) {
+            size_t colon = json.find(':', k);
+            if (colon != std::string::npos) {
+                size_t v = json.find_first_not_of(" \t\r\n", colon + 1);
+                if (v != std::string::npos) {
+                    bool muted = json.compare(v, 4, "true") == 0;
+                    m_audioEngine->setTotalMixInputPairMuted(muted);
+                }
+            }
+        }
+    }
+
     // Bookmarks array — clear then repopulate.
     m_audioEngine->clearBookmarks();
     size_t bookmarksKey = json.find("\"bookmarks\"");
@@ -4185,6 +4211,9 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
     }
 
     std::cout << "Session loaded from " << filename << std::endl;
+    dawLog("Session LOADED: %s (totalMixMuted=%s)",
+           filename,
+           m_audioEngine->getTotalMixInputPairMuted() ? "true" : "false");
     m_currentSessionPath = filename;   // enables Revert
     if (m_audioEngine) {
         m_audioEngine->clearSessionDirty();
@@ -4193,6 +4222,8 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         size_t slash = sdir.find_last_of("/\\");
         if (slash != std::string::npos) sdir.resize(slash);
         m_audioEngine->setSessionDir(sdir);
+        // Force TotalMix + controller OLED to match the loaded mute state.
+        m_audioEngine->syncTotalMixMuteToHardware();
     }
     retimeArrangement();
 #endif

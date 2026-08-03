@@ -1,5 +1,6 @@
 #include "audio_engine.h"
 #include "../util/daw_log.h"
+#include "../osc/osc_sender.h"
 #include <iostream>
 
 // Forward-declared logging helper defined further down (uses Track from
@@ -126,6 +127,17 @@ bool AudioEngine::initialize() {
     std::cout << "Audio engine initialized (PortAudio not available)" << std::endl;
 #endif
 
+    // OSC to TotalMix FX. Local TotalMix listens on Remote Controller 1's
+    // "Port incoming" — 7001 by default. Failure is non-fatal; the chord
+    // handler just no-ops if the sender never opened.
+    m_osc = std::make_unique<OscSender>();
+    if (!m_osc->init("127.0.0.1", 7001)) {
+        dawLog("OSC: init to 127.0.0.1:7001 failed");
+        m_osc.reset();
+    } else {
+        dawLog("OSC: sending to 127.0.0.1:7001");
+    }
+
     return true;
 }
 
@@ -135,6 +147,11 @@ void AudioEngine::shutdown() {
     }
 
     shutdownMidi();
+
+    if (m_osc) {
+        m_osc->shutdown();
+        m_osc.reset();
+    }
 
 #ifdef PORTAUDIO_FOUND
     if (m_stream) {
@@ -1418,6 +1435,10 @@ void AudioEngine::handleResync() {
     m_pad15Held.store(false);
     m_clearMode.store(false);
     m_scrubResumePending.store(false);
+
+    // Firmware wiped its own MUTEIND state on boot too — push the current
+    // shadow flag so the OLED bar comes back if it was on.
+    syncTotalMixMuteToHardware();
 }
 
 void AudioEngine::handleRenameBuffer(const std::string& buffer, int cursorPos, bool active) {
@@ -2139,6 +2160,44 @@ void AudioEngine::touchHandlePairPad(int markerIdx) {
     else          syncRecordPairLedsNow();
 }
 
+void AudioEngine::toggleTotalMixStripMute(int stripIndex, const char* label) {
+    bool muted = !m_totalMixInputPairMuted.load();
+    m_totalMixInputPairMuted.store(muted);
+    float v = muted ? 1.0f : 0.0f;
+    if (m_osc) {
+        char addr[32];
+        std::snprintf(addr, sizeof(addr), "/1/mute/1/%d", stripIndex);
+        m_osc->sendFloat(addr, v);
+    }
+    oledShowForce(label, muted ? "MUTED" : "UNMUTED");
+    // Push a persistent bar on the far-left of the OLED that outlives the
+    // 2-line text render (see firmware oledDrawMuteIndicator).
+    if (m_serialController) {
+        m_serialController->sendMessage(muted ? "MUTEIND:1" : "MUTEIND:0");
+    }
+    markSessionDirty();
+    dawLog("OSC mute strip %d (%s) = %s (osc=%s)",
+           stripIndex, label,
+           muted ? "MUTE" : "UNMUTE",
+           m_osc ? "on" : "off");
+}
+
+void AudioEngine::syncTotalMixMuteToHardware() {
+    // Same wire messages as a toggle, minus the flag flip + OLED text.
+    // Used to force external state to match the shadow flag (startup,
+    // after session load). Silent if OSC / serial aren't up — the caller
+    // is expected to retry via the toggle path if the user acts.
+    bool muted = m_totalMixInputPairMuted.load();
+    if (m_osc) m_osc->sendFloat("/1/mute/1/2", muted ? 1.0f : 0.0f);
+    if (m_serialController) {
+        m_serialController->sendMessage(muted ? "MUTEIND:1" : "MUTEIND:0");
+    }
+    dawLog("OSC sync: MADI 1-2 mute = %s (osc=%s serial=%s)",
+           muted ? "MUTE" : "UNMUTE",
+           m_osc            ? "on" : "off",
+           m_serialController ? "on" : "off");
+}
+
 // -------------- Top-level touch dispatcher --------------
 
 void AudioEngine::handleTouch(int pad, bool pressed) {
@@ -2189,6 +2248,14 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     if (pad == 24) { m_panModifierHeld.store(pressed); return; }
     if (pad == 3)  { m_pad3Held.store(pressed);        return; }
     if (pad == 14) { m_pad14Held.store(pressed);       return; }
+
+    // Pad 8 — OSC mute toggle for MADI 1-2 (strip 2 in TotalMix).
+    // Press-only, no chord, no undo entanglement.
+    if (pad == 8 && pressed) {
+        toggleTotalMixStripMute(2, "MADI 1-2");
+        return;
+    }
+    if (pad == 8) return;  // swallow release
 
     // Loop-edit toggle — press-only.
     if (pad == 15) {
