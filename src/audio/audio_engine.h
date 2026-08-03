@@ -5,8 +5,65 @@
 #include <string>
 #include <memory>
 #include <mutex>
+#include <deque>
+#include <functional>
 #include "track.h"
 #include "../controller/serial_controller.h"
+
+// ---- Undo history ----
+// One entry captures the "user-visible session state" before an action ran.
+// Audio content (per-track audioData / peak pyramid) is intentionally not
+// snapshotted — undo only restores metadata + transport + view state.
+struct UndoTrackState {
+    std::string name;
+    std::string filePath;
+    int         channels;
+    float       volume;
+    float       pan;
+    bool        muted;
+    bool        solo;
+    bool        armed;
+    bool        inputMonitor;
+    int         outputPair;
+    int         inputPair;
+    int         inputMonoChan;
+    bool        inputMono;
+    int         color;
+    // Optional audio snapshot — populated ONLY for tracks that are about
+    // to have their audio replaced (record start, clear, load). Otherwise
+    // stays empty so undo doesn't pay the memory cost for every action.
+    bool               hasAudioSnapshot = false;
+    std::vector<float> audioData;
+};
+struct UndoBookmark {
+    size_t      frame;
+    std::string name;
+};
+struct UndoEntry {
+    // Stable monotonic id — lets finaliseRecording find its originating
+    // entry after stop even if the deque has shifted underneath it.
+    int    id = 0;
+    // WAV paths produced by the recording take this entry captured the
+    // pre-record state of. Filled in by finaliseRecording; deleted from
+    // disk on undoPop so an unintentional take doesn't leave garbage.
+    std::vector<std::string> recordedWavPaths;
+    std::vector<UndoTrackState> tracks;
+    std::vector<UndoBookmark>   bookmarks;
+    int    selectedTrack     = -1;
+    size_t markerPositions[4] = {0,0,0,0};
+    bool   markerEnabled[4]   = {false,false,false,false};
+    bool   markerEverSet[4]   = {false,false,false,false};
+    bool   loopEnabled        = false;
+    bool   recordEnabled      = false;
+    bool   returnToStartOnStop= false;
+    bool   playing            = false;
+    size_t playbackPosition   = 0;
+    // GUI-owned view state — filled / restored via callbacks so
+    // AudioEngine doesn't need to know GUIManager internals.
+    float  guiDisplayZoom          = 1.0f;
+    size_t guiViewCenterPosition   = 0;
+    size_t guiTimelineFrames       = 0;
+};
 
 class AudioEngine {
 public:
@@ -58,6 +115,9 @@ public:
     void play();
     void stop();
     bool isPlaying() const { return m_playing.load(); }
+    // True while a take is being captured. Set on play() when any track
+    // is armed, cleared on stop().
+    bool isRecording() const { return m_recordActive.load(); }
     const std::string& getLoadedFilePath() const { return m_loadedFilePath; }
 
     // Waveform data access for visualization
@@ -82,6 +142,11 @@ public:
     void setOutputStereoPair(int pairIndex) { m_outputStereoPair.store(pairIndex); }
     int getOutputStereoPair() const { return m_outputStereoPair.load(); }
     int getNumStereoPairs() const { return m_maxOutputChannels / 2; }
+    // Input channel count comes straight from the ASIO device's advertised
+    // max input channels. We don't open an input stream yet — this only
+    // exists so the track UI can offer an input-pair dropdown that gets
+    // persisted per-track for future record wiring.
+    int getNumInputStereoPairs() const { return m_maxInputChannels / 2; }
 
     // Track management
     int addTrack(const std::string& name = "");
@@ -95,6 +160,84 @@ public:
     // Wipe audio from a track but keep the strip (name, mixer state, etc.).
     // Used by the Ctrl+A "clear audio" hotkey.
     void clearTrackAudio(int trackIndex);
+    // GUI plumbing: tells the engine where the current session lives so
+    // recorded takes can be written to <sessionDir>/recordings/*.wav.
+    // Passing an empty string reverts to the default <exe>/recordings path.
+    void setSessionDir(const std::string& dir);
+
+    // Bookmarks — lightweight positional markers dropped by pad 13. Each
+    // release of pad 13 appends the current playhead position with an
+    // empty name and immediately opens the controller's text-input mode
+    // so the user can type a name (same flow as track rename).
+    struct Bookmark {
+        size_t      frame;
+        std::string name;
+    };
+    std::vector<Bookmark> getBookmarks() const {
+        std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+        return m_bookmarkFrames;
+    }
+    void clearBookmarks() {
+        std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+        m_bookmarkFrames.clear();
+    }
+    // Loader entry point — appends a fully-formed bookmark. Used by
+    // session load; doesn't touch the naming flow.
+    void addBookmark(size_t frame, const std::string& name) {
+        std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+        m_bookmarkFrames.push_back({frame, name});
+    }
+    // Which bookmark index is currently being named via the controller;
+    // -1 when none. GUI uses this to render the live-typing preview at
+    // that bookmark's triangle instead of at a track row.
+    int getRenameBookmarkIndex() const { return m_pendingNameBookmarkIndex.load(); }
+    // The bookmark currently selected in scroll mode (index into
+    // m_bookmarkFrames, or -1). The GUI renders a full-height white
+    // vertical line at its frame position while nav is active so E3
+    // adjustments are easy to see across the whole arrangement.
+    int getSelectedBookmarkIndex() const { return m_bookmarkNavIdx; }
+    bool isBookmarkScrollMode() const { return m_bookmarkScrollMode.load(); }
+    // Pad-13-held + encoder-1 bookmark navigation posts a request here
+    // for the GUI to reposition its view around a specific frame. The
+    // GUI consumes the value (resets to -1) once per frame.
+    int64_t consumeRequestedJumpFrame() {
+        return m_requestedJumpFrame.exchange(-1);
+    }
+    // GUI pushes the arrangement's timeline extent so encoder scrub /
+    // pan / zoom can work even when no track has any audio yet (fresh
+    // session). Falls back to getTotalFrames() when nothing has been
+    // pushed. Thread-safe (atomic).
+    void   setTimelineFrames(size_t frames) { m_timelineFramesHint.store(frames); }
+    size_t getTimelineFrames() const {
+        size_t hint = m_timelineFramesHint.load();
+        size_t audioMax = getTotalFrames();
+        return audioMax > hint ? audioMax : hint;
+    }
+
+    // ---- Undo ----
+    // GUI registers a pair of hooks that fill / restore the view-state
+    // fields on an UndoEntry (zoom, scroll, timeline extent). AudioEngine
+    // calls these while it captures / restores its own fields.
+    using UndoGuiCapture = std::function<void(UndoEntry&)>;
+    using UndoGuiRestore = std::function<void(const UndoEntry&)>;
+    void setUndoGuiHooks(UndoGuiCapture cap, UndoGuiRestore res) {
+        m_undoGuiCapture = std::move(cap);
+        m_undoGuiRestore = std::move(res);
+    }
+    // Push a snapshot of current state onto the undo stack. Thread-safe.
+    // Cheap to call — capping the stack at UNDO_MAX drops the oldest.
+    void undoSnapshot();
+    // Copy the current audio buffer of every armed track into the top
+    // undo entry so a later undo can restore the pre-recording take.
+    // Called from play() when a take is starting.
+    void undoStashArmedTrackAudio();
+    // Same for a single track index — used by clear-audio / load-audio
+    // paths where the caller has already snapshotted metadata and now
+    // wants the pre-change bytes attached.
+    void undoStashTrackAudio(int trackIndex);
+    // Pop the most recent snapshot and restore state. No-op if empty.
+    // Returns true if something was restored.
+    bool undoPop();
 
     // Waveform zoom
     float getWaveformZoom() const { return m_waveformZoom; }
@@ -244,10 +387,13 @@ public:
     void syncPlayLedNow();
     void syncLoopPairLedsNow();
     void syncRecordPairLedsNow();
-    // Pushes the selected track's solo/mute state to LEDs 1 (solo) and 0
-    // (mute). Called on toggle and on track-change so the physical LEDs
+    // Pushes the selected track's mute / solo / arm state to LEDs 0 / 1
+    // / 2. Called on toggle and on track-change so the physical LEDs
     // always mirror the DAW's per-track flags.
     void syncSoloMuteLedsNow();
+    // Push MUTEFLASH:1 / :0 to the firmware whenever marker-scroll
+    // mode transitions, so LED 0 flashes while nav is active.
+    void syncMuteFlashNow();
 
 private:
     // MIDI helper methods (extracted from processMidiMessages)
@@ -315,6 +461,7 @@ private:
     double m_sampleRate;
     unsigned int m_bufferSize;
     int m_maxOutputChannels;
+    int m_maxInputChannels = 0;
 
     // Device info
     std::string m_deviceName;
@@ -339,6 +486,99 @@ private:
     std::vector<Track> m_tracks;
     int m_selectedTrack;
     int m_trackCounter;
+
+    // Record slots — one per track, parallel to m_tracks. Stored via
+    // unique_ptr because the slot contains a mutex, and putting a mutex
+    // directly in Track would forbid the vector-of-Track from moving on
+    // reallocation. Slots stay allocated across takes; buffers get reset
+    // at record-start and drained at finalise.
+    struct RecordSlot {
+        std::vector<float> buffer;
+        std::mutex         mutex;
+        int                channels = 0;   // 1 (mono) or 2 (stereo) this take
+    };
+    std::vector<std::unique_ptr<RecordSlot>> m_recordSlots;
+    std::atomic<bool>  m_recordActive{false};   // callback captures while true
+    // If the record pair (markers 1 & 2) is enabled when a take begins,
+    // capture is gated to the frame range [recLeft, recRight) — the
+    // callback drops any input samples whose absolute playhead position
+    // falls outside, and the snapshot tick overlays samples onto
+    // audioData starting at recLeft. Zero-length range disables gating
+    // (unbounded take from m_playStartPosition).
+    std::atomic<size_t> m_recordGateStart{0};
+    std::atomic<size_t> m_recordGateEnd{0};
+
+    // Bookmark positions (each pad-13 release appends the playhead).
+    mutable std::mutex     m_bookmarksMutex;
+    std::vector<Bookmark>  m_bookmarkFrames;
+    // Index of the bookmark whose name the controller is currently
+    // typing. -1 when we're not naming a bookmark.
+    std::atomic<int>       m_pendingNameBookmarkIndex{-1};
+    // Pad-13 as modifier: while held, encoder 1 walks through markers
+    // instead of scrubbing. Modifier flag suppresses the "release adds
+    // a new bookmark" behaviour when the hold was actually used to
+    // navigate. Scroll mode is a STICKY variant — once the encoder has
+    // been turned during the hold we stay in nav mode after release,
+    // and pad 13's next press exits nav mode (without adding a marker).
+    std::atomic<bool>      m_pad13Held{false};
+    std::atomic<bool>      m_pad13UsedAsModifier{false};
+    std::atomic<bool>      m_bookmarkScrollMode{false};
+    // Selection while navigating: index into m_bookmarkFrames (original
+    // insertion order). Reset to -1 outside navigation sessions. Encoder
+    // 3 uses this to know WHICH marker to move.
+    int                    m_bookmarkNavIdx = -1;
+    // Encoder-tick accumulator for bookmark nav — 200 ticks per step so
+    // a small nudge doesn't jump multiple markers.
+    long                   m_bookmarkNavAccum = 0;
+    // Set by encoder-driven bookmark nav; GUI consumes and repositions
+    // its view so this frame sits 15% from the left of the arrangement.
+    std::atomic<int64_t>   m_requestedJumpFrame{-1};
+    // True from stop() until finaliseRecording completes. Callback keeps
+    // skipping armed tracks during this window so a concurrent WAV read
+    // or a late snapshot tick can't race with playback of the same buffer.
+    std::atomic<bool>  m_finalising{false};
+    // Serialises writes to armed-track audioData from the snapshot tick
+    // and reads from finaliseRecording. Callback doesn't touch this mutex
+    // — the m_finalising flag keeps it out of the danger zone entirely.
+    std::mutex         m_recordAudioMutex;
+    // Wall-clock timestamp of the last live-record snapshot into track.audioData,
+    // used to rate-limit the copy + peak-pyramid rebuild in updateController.
+    int64_t            m_lastRecordSnapshotMs = 0;
+
+    // ---- Undo state ----
+    static constexpr size_t UNDO_MAX = 50;
+    std::deque<UndoEntry>   m_undoStack;
+    std::mutex              m_undoMutex;
+    // Monotonic id assigned to each new entry. Never reused so the
+    // finalise-recording thread can always locate its entry, or safely
+    // skip if the deque has since dropped it.
+    int                     m_nextUndoEntryId       = 1;
+    // Id of the undo entry that owns the pre-record audio for the
+    // currently-running take. Zero when no take is running.
+    int                     m_recordingUndoEntryId  = 0;
+    UndoGuiCapture          m_undoGuiCapture;
+    UndoGuiRestore          m_undoGuiRestore;
+    // Per-encoder coalescing: an encoder is treated as continuing the
+    // same "burst" if a new delta arrives within 500 ms of the previous
+    // one. Only the FIRST delta of a burst pushes an undo snapshot.
+    int64_t                 m_encoderLastDeltaMs[6] = {0,0,0,0,0,0};
+    // Guard so pad 26 tap-release fires undo only when the modifier
+    // wasn't used to gate another action during the hold.
+    bool                    m_pad26Consumed = false;
+    // Directory where new WAV takes are written on finalise. Populated by
+    // GUIManager via setSessionDir() whenever the session path changes;
+    // empty falls back to <exe>/recordings.
+    std::mutex   m_sessionDirMutex;
+    std::string  m_sessionDir;
+    // GUI-pushed arrangement extent hint (samples). Never authoritative —
+    // getTimelineFrames() returns max(this, actual max track frames).
+    std::atomic<size_t> m_timelineFramesHint{0};
+    // Ensures record slots exist for every track (called from addTrack /
+    // deleteTrack / load). Grows m_recordSlots to match m_tracks.size().
+    void ensureRecordSlots();
+    // Flushes any tracks with a populated recordBuffer to WAV on stop.
+    // Called after m_recordActive is cleared, on a worker thread.
+    void finaliseRecording();
 
     // Waveform display
     float m_waveformZoom;
@@ -416,11 +656,16 @@ private:
     int m_lastRecordRightLedState = -1;
     int m_lastLoopRightLedState   = -1;
 
-    // Solo (pad 17 / LED 1) and mute (pad 18 / LED 0) mirror the selected
-    // track's per-track flags. Cached so we only send LED updates when the
-    // effective state actually changes (track switch or toggle).
+    // Mute (pad 18 / LED 0), solo (pad 17 / LED 1), record-arm (pad 16 /
+    // LED 2) mirror the selected track's per-track flags. Cached so we
+    // only send LED updates when the effective state actually changes
+    // (track switch or toggle).
     int m_lastSoloLedState = -1;
     int m_lastMuteLedState = -1;
+    int m_lastArmLedState  = -1;
+    // Cached last MUTEFLASH state — cheap tick in updateController
+    // re-syncs when scroll mode transitions.
+    int m_lastMuteFlashState = -1;
 
     // Clear-markers mode. Firmware runs a continuous fade-flash on LEDs
     // 3/4/5/6/7 while this is true; pad presses re-route to marker clearing

@@ -20,7 +20,18 @@ struct Track {
     bool muted = false;
     bool solo = false;
     int outputPair = 0;     // Which stereo pair to output to
-    bool armed = false;     // For future recording
+    int inputPair = 0;      // Stereo pair index (0 = channels 1-2, 1 = 3-4, ...)
+    int inputMonoChan = 0;  // Mono channel index (0 = channel 1, 1 = channel 2, ...)
+    bool inputMono = false; // false = record from inputPair (stereo), true = from inputMonoChan
+    bool armed = false;     // Record-arm — armed tracks capture input during playback
+    bool inputMonitor = false; // "I" button — reserved for input-monitor wiring
+
+    // Frame range covered by the most recent recording take. The renderer
+    // paints this range in a distinct "fresh take" colour so the user can
+    // see punch-in edits at a glance. Zero-length means no fresh take.
+    // Not persisted — a session reload starts everything as "old" audio.
+    size_t freshTakeStart = 0;
+    size_t freshTakeEnd   = 0;
     int color = 0;          // Track color index (for multi-track display)
 
     // ---- Waveform peak pyramid (like Ableton/Reaper/Cubase .peak files) ----
@@ -99,6 +110,84 @@ struct Track {
             if (sample > peak.maxVal) peak.maxVal = sample;
         }
         return peak;
+    }
+
+    // Incremental variant of buildPeakPyramid: assumes the pyramid is
+    // already valid for the audioData EXCEPT possibly in the frame range
+    // [startFrame, endFrame) (which may include the tail if audioData
+    // grew). Recomputes only the base buckets that overlap that range
+    // then propagates the change up the levels. O(rangeFrames /
+    // PEAK_BASE_BUCKET) rather than O(totalFrames), so the recording
+    // snapshot tick doesn't stall the main thread.
+    void rebuildPeakPyramidRange(size_t startFrame, size_t endFrame) {
+        size_t total = getTotalFrames();
+        if (endFrame > total) endFrame = total;
+        if (startFrame >= endFrame) return;
+        if (peakPyramid.empty()) {
+            buildPeakPyramid();
+            return;
+        }
+
+        // ---- Level 0: extend + recompute affected buckets. ----
+        PeakLevel& L0 = peakPyramid[0];
+        size_t n0Needed = (total + PEAK_BASE_BUCKET - 1) / PEAK_BASE_BUCKET;
+        if (L0.buckets.size() < n0Needed) L0.buckets.resize(n0Needed);
+
+        size_t bStart = startFrame / PEAK_BASE_BUCKET;
+        size_t bEnd   = (endFrame + PEAK_BASE_BUCKET - 1) / PEAK_BASE_BUCKET;
+        if (bEnd > L0.buckets.size()) bEnd = L0.buckets.size();
+        for (size_t b = bStart; b < bEnd; b++) {
+            size_t s = b * PEAK_BASE_BUCKET;
+            size_t e = std::min(s + PEAK_BASE_BUCKET, total);
+            float mn = 0.0f, mx = 0.0f;
+            for (size_t f = s; f < e; f++) {
+                float v = getMixedSample(f);
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            L0.buckets[b] = { mn, mx };
+        }
+
+        // ---- Propagate up through existing levels. ----
+        size_t affStart = bStart;
+        size_t affEnd   = bEnd;
+        for (size_t lvl = 1; lvl < peakPyramid.size(); lvl++) {
+            PeakLevel& up   = peakPyramid[lvl];
+            PeakLevel& low  = peakPyramid[lvl - 1];
+            size_t upNeeded = (low.buckets.size() + 1) / 2;
+            if (up.buckets.size() < upNeeded) up.buckets.resize(upNeeded);
+            size_t upStart = affStart / 2;
+            size_t upEnd   = (affEnd + 1) / 2;
+            if (upEnd > up.buckets.size()) upEnd = up.buckets.size();
+            for (size_t b = upStart; b < upEnd; b++) {
+                size_t li = b * 2;
+                PeakBucket a = low.buckets[li];
+                PeakBucket n = (li + 1 < low.buckets.size()) ? low.buckets[li + 1] : a;
+                up.buckets[b] = {
+                    std::min(a.minVal, n.minVal),
+                    std::max(a.maxVal, n.maxVal)
+                };
+            }
+            affStart = upStart;
+            affEnd   = upEnd;
+        }
+
+        // ---- Grow new levels if the top exceeds 4 buckets. ----
+        while (peakPyramid.back().buckets.size() > 4) {
+            const PeakLevel& src = peakPyramid.back();
+            PeakLevel next;
+            next.framesPerBucket = src.framesPerBucket * 2;
+            next.buckets.reserve((src.buckets.size() + 1) / 2);
+            for (size_t i = 0; i < src.buckets.size(); i += 2) {
+                PeakBucket a = src.buckets[i];
+                PeakBucket b = (i + 1 < src.buckets.size()) ? src.buckets[i + 1] : a;
+                next.buckets.push_back({
+                    std::min(a.minVal, b.minVal),
+                    std::max(a.maxVal, b.maxVal)
+                });
+            }
+            peakPyramid.push_back(std::move(next));
+        }
     }
 
     // Build the peak pyramid from the current audioData. Cheap linear pass +

@@ -428,9 +428,35 @@ bool pca9685Init() {
 // definition further down.
 void pca9685SetPWM(uint8_t channel, uint16_t value);
 
-// Convenience wrapper: LED ON/OFF for open-drain wiring (PWM=0 sinks, 4095 = high-Z).
+// Per-channel "on" PWM value. 0 = max brightness, 4095 = essentially off.
+// DAW pushes these via LEDBRT:ch:value at startup and whenever the user
+// tweaks a slider. Defaults are max brightness so a fresh Teensy behaves
+// as before if it comes up without any DAW-side push.
+uint16_t ledBrightness[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+// Identify mode: when true for a channel, the physical LED flashes at a
+// fixed 2 Hz using its configured brightness, ignoring the normal on/off
+// state. Used by the DAW's LED popup's per-channel "identify" button so
+// the user can find which physical LED corresponds to each slider.
+bool     ledIdentify[9]      = { false, false, false, false, false, false, false, false, false };
+uint32_t ledIdentifyLastMs   = 0;
+bool     ledIdentifyPhase    = false;
+
+// Force-on / force-off: while true the physical LED is held steady at
+// its brightness (force-on) or dark (force-off), ignoring mirror state.
+// Used by the DAW's "All ON" / "All OFF" test buttons. Takes precedence
+// over identify so a channel is never simultaneously flashing and forced.
+// The DAW enforces mutual exclusion — both should never be true at once.
+bool     ledForceOn[9]       = { false, false, false, false, false, false, false, false, false };
+bool     ledForceOff[9]      = { false, false, false, false, false, false, false, false, false };
+
+// Convenience wrapper: LED ON/OFF for open-drain wiring (0..brightness sinks,
+// 4095 = high-Z / dark). If identify OR force-on OR force-off owns the
+// channel, the physical write is suppressed — those modes paint it directly.
 inline void ledSet(uint8_t channel, bool on) {
-    pca9685SetPWM(channel, on ? 0 : 4095);
+    if (channel < 9 && (ledIdentify[channel] || ledForceOn[channel] || ledForceOff[channel])) return;
+    uint16_t onVal = (channel < 9) ? ledBrightness[channel] : 0;
+    pca9685SetPWM(channel, on ? onVal : 4095);
 }
 
 // ---- Local UI state owned by the firmware ----
@@ -446,6 +472,7 @@ bool recordRightLocal = false; // pad 22 -> LED 6. Just predictive; DAW is autho
 bool loopRightLocal   = false; // pad 23 -> LED 7. Just predictive; DAW is authoritative.
 bool muteLedLocal     = false; // pad 18 -> LED 0. Predictive on tap-release; DAW confirms.
 bool soloLedLocal     = false; // pad 17 -> LED 1. Predictive on tap-release; DAW confirms.
+bool armLedLocal      = false; // pad 16 -> LED 2. Predictive on tap-release; DAW confirms.
 bool modifierHeld     = false; // pad 26. Also tracked DAW-side; we mirror here to
                                // decide whether pad 19 should flash-reject instead
                                // of toggling the play LED.
@@ -729,6 +756,24 @@ static void textInputBuildLine(bool showCursor) {
     oledLine2Changed = true;
 }
 
+// Mute-LED marker-scroll indicator. DAW toggles via MUTEFLASH:1 / :0.
+// Same triangle-wave timing as textInputFlash / clear-mode flash.
+bool     muteFlashActive = false;
+uint32_t muteFlashLastMs = 0;
+void muteFlashStep() {
+    if (!muteFlashActive) return;
+    uint32_t nowMs = millis();
+    if (nowMs - muteFlashLastMs < FLASH_TICK_MS) return;
+    muteFlashLastMs = nowMs;
+    uint32_t phase = nowMs % FLASH_PERIOD_MS;
+    uint32_t halfPeriod = FLASH_PERIOD_MS / 2;
+    uint32_t brightness = (phase < halfPeriod)
+        ? (phase * 4095UL) / halfPeriod
+        : ((FLASH_PERIOD_MS - phase) * 4095UL) / halfPeriod;
+    uint16_t pwm = (uint16_t)(4095 - brightness);
+    pca9685SetPWM(0, pwm);
+}
+
 // Flash LEDs 4 (pad 20) and 5 (pad 21) with the same triangle-wave used
 // by the clear-markers flashMode. Independent state so a name-entry
 // session doesn't collide with clear-markers mode.
@@ -898,6 +943,7 @@ void performReset() {
     recordRightLocal  = false;
     muteLedLocal      = false;
     soloLedLocal      = false;
+    armLedLocal       = false;
     loopPairDefined   = false;
     recordPairDefined = false;
     // All LEDs solid on. Hardware only — mirrors stay at their reset
@@ -984,7 +1030,10 @@ void markerDeleteFlashStep() {
 // play() no-op'd (no audio loaded, etc.) the DAW's authoritative send
 // undoes our predictive toggle within ~1 frame.
 void firePad19Deferred() {
-    if (!pad14Held) {
+    // Suppress the predictive play-LED toggle while marker-scroll mode
+    // owns the LED strip — LED 3 must stay dark. The DAW ignores pad-19
+    // events during scroll mode too, so the transport doesn't change.
+    if (!pad14Held && !muteFlashActive) {
         playLedLocal = !playLedLocal;
         ledSet(3, playLedLocal);
     }
@@ -1045,14 +1094,38 @@ void exitFlashMode() {
 }
 
 void pca9685SetPWM(uint8_t channel, uint16_t value) {
-    // value: 0-4095
+    // value: 0-4095.  With our open-drain wiring (LED anodes on a rail
+    // higher than PCA9685 VCC), the PWM "HIGH" phase = high-Z = LED dark,
+    // and the "LOW" phase = sinking = LED lit. So brightness scales as
+    // (4096 - OFF) / 4096 — value=0 is fully lit, value=4095 is nearly
+    // dark. The problem is "nearly": at OFF=4095 the LED still gets one
+    // count of sinking per cycle, which shows up as a faint permanent
+    // glow. The chip's LED_FULL_ON flag (bit 4 of LEDn_ON_H) forces the
+    // output permanently HIGH — genuinely off with no PWM glitch. We use
+    // it for the two boundary cases and normal PWM in between (fades).
     uint8_t reg = 0x06 + 4 * channel;
+    uint16_t onValue, offValue;
+    if (value >= 4095) {
+        // Full OFF — permanently HIGH-Z, zero LED current.
+        onValue  = 0x1000;    // FULL_ON flag
+        offValue = 0x0000;
+    } else if (value == 0) {
+        // Full ON — permanently LOW/sinking. FULL_OFF flag guarantees
+        // this across chip revisions (the ON=OFF=0 special case is not
+        // universally documented as "always LOW").
+        onValue  = 0x0000;
+        offValue = 0x1000;    // FULL_OFF flag
+    } else {
+        // Intermediate PWM (fades). Standard ON=0, OFF=value.
+        onValue  = 0x0000;
+        offValue = value;
+    }
     Wire.beginTransmission(PCA9685_ADDR);
     Wire.write(reg);
-    Wire.write(0x00);           // ON low
-    Wire.write(0x00);           // ON high
-    Wire.write(value & 0xFF);   // OFF low
-    Wire.write(value >> 8);     // OFF high
+    Wire.write(onValue  & 0xFF);
+    Wire.write(onValue  >> 8);
+    Wire.write(offValue & 0xFF);
+    Wire.write(offValue >> 8);
     Wire.endTransmission();
 }
 
@@ -1268,6 +1341,29 @@ void processSerialCommands() {
             else if (serialInputBuffer == "TEXTIN:OFF") {
                 textInputExit();
             }
+            // CANCELMODES — hard exit from every firmware-side modal UI
+            // (text-input for track naming, flashMode for loop-edit,
+            // mute-scroll flash). Used by the DAW's undo path so a
+            // rewound action can't leave the controller with stale
+            // flashing LEDs.
+            else if (serialInputBuffer == "CANCELMODES") {
+                if (textInputMode) textInputExit();
+                if (flashMode)     exitFlashMode();
+                if (muteFlashActive) {
+                    muteFlashActive = false;
+                    pca9685SetPWM(0, muteLedLocal ? ledBrightness[0] : 4095);
+                }
+            }
+            // MUTEFLASH:1 / :0 — DAW toggles a triangle-wave flash on LED 0
+            // to indicate marker-scroll mode is active.
+            else if (serialInputBuffer == "MUTEFLASH:1") {
+                muteFlashActive = true;
+                muteFlashLastMs = 0;
+            }
+            else if (serialInputBuffer == "MUTEFLASH:0") {
+                muteFlashActive = false;
+                pca9685SetPWM(0, muteLedLocal ? ledBrightness[0] : 4095);
+            }
             else if (serialInputBuffer.startsWith("TEXTIN:") && displayMode) {
                 String text = serialInputBuffer.substring(7);
                 strncpy(textInputBuffer, text.c_str(), sizeof(textInputBuffer) - 1);
@@ -1361,6 +1457,7 @@ void processSerialCommands() {
                             // marker LEDs while text-input mode owns them.
                             if (channel == 0) muteLedLocal     = on;
                             if (channel == 1) soloLedLocal     = on;
+                            if (channel == 2) armLedLocal      = on;
                             if (channel == 3) playLedLocal     = on;
                             if (channel == 4) loopLeftLocal    = on;
                             if (channel == 5) recordLeftLocal  = on;
@@ -1376,10 +1473,140 @@ void processSerialCommands() {
                                 || resetShowActive
                                 || inDeleteAllFade;
                             if (!suppressWrite) {
-                                pca9685SetPWM(channel, on ? 0 : 4095);
+                                // Use ledSet so identify-owned channels are
+                                // respected and the per-channel brightness is
+                                // applied consistently with every other write.
+                                ledSet((uint8_t)channel, on);
                             }
                             // channel 8: no state — pad 24 is a momentary modifier
                             // and the firmware drives LED 8 directly on press/release.
+                        }
+                    }
+                }
+            }
+            // LEDBRT:channel:value  (value 0-4095, 0 = brightest, 4095 = darkest)
+            // — sets a per-channel PWM value used whenever that LED is ON.
+            //   If the LED is currently ON via its mirror, re-apply immediately
+            //   so brightness slider drags respond in real time.
+            else if (serialInputBuffer.startsWith("LEDBRT:")) {
+                int firstColon  = 6;
+                int secondColon = serialInputBuffer.indexOf(':', firstColon + 1);
+                if (secondColon > 0) {
+                    int channel = serialInputBuffer.substring(firstColon + 1, secondColon).toInt();
+                    int value   = serialInputBuffer.substring(secondColon + 1).toInt();
+                    if (pca9685Found && channel >= 0 && channel < 9) {
+                        if (value < 0)    value = 0;
+                        if (value > 4095) value = 4095;
+                        ledBrightness[channel] = (uint16_t)value;
+                        // Re-apply if this LED is currently lit via its mirror
+                        // (excluding channel 8 which has no mirror — pad24 owns it).
+                        bool mirrorOn = false;
+                        switch (channel) {
+                            case 0: mirrorOn = muteLedLocal;     break;
+                            case 1: mirrorOn = soloLedLocal;     break;
+                            case 2: mirrorOn = armLedLocal;      break;
+                            case 3: mirrorOn = playLedLocal;     break;
+                            case 4: mirrorOn = loopLeftLocal;    break;
+                            case 5: mirrorOn = recordLeftLocal;  break;
+                            case 6: mirrorOn = recordRightLocal; break;
+                            case 7: mirrorOn = loopRightLocal;   break;
+                            default: break;
+                        }
+                        // Re-apply live if the LED is currently lit — via its
+                        // mirror, its force-on state, or its identify state.
+                        if (ledForceOn[channel] ||
+                            (mirrorOn && !ledIdentify[channel])) {
+                            pca9685SetPWM((uint8_t)channel, ledBrightness[channel]);
+                        }
+                    }
+                }
+            }
+            // LEDFORCEON:channel:1 / 0  or  LEDFORCEOFF:channel:1 / 0 —
+            // hold the LED steady on / off / release. Used by the DAW's
+            // "All ON" / "All OFF" test buttons. Steady state, no flash.
+            // Setting one clears the other (mutual exclusion).
+            else if (serialInputBuffer.startsWith("LEDFORCEON:") ||
+                     serialInputBuffer.startsWith("LEDFORCEOFF:")) {
+                bool  isOn      = serialInputBuffer.startsWith("LEDFORCEON:");
+                int   firstColon  = isOn ? 10 : 11;
+                int   secondColon = serialInputBuffer.indexOf(':', firstColon + 1);
+                if (secondColon > 0) {
+                    int channel = serialInputBuffer.substring(firstColon + 1, secondColon).toInt();
+                    int active  = serialInputBuffer.substring(secondColon + 1).toInt();
+                    if (pca9685Found && channel >= 0 && channel < 9) {
+                        if (active) {
+                            if (isOn) {
+                                ledForceOn[channel]  = true;
+                                ledForceOff[channel] = false;
+                                pca9685SetPWM((uint8_t)channel, ledBrightness[channel]);
+                            } else {
+                                ledForceOff[channel] = true;
+                                ledForceOn[channel]  = false;
+                                pca9685SetPWM((uint8_t)channel, 4095);
+                            }
+                        } else {
+                            // Release only the corresponding force flag.
+                            if (isOn) ledForceOn[channel]  = false;
+                            else      ledForceOff[channel] = false;
+                            // If the other force is still active, don't touch
+                            // the LED — it stays under the other's control.
+                            if (ledForceOn[channel] || ledForceOff[channel]) {
+                                // Nothing to do; other force flag owns the LED.
+                            } else {
+                                // Restore via mirror. Channel 8 has no mirror.
+                                bool mirrorOn = false;
+                                switch (channel) {
+                                    case 0: mirrorOn = muteLedLocal;     break;
+                                    case 1: mirrorOn = soloLedLocal;     break;
+                                    case 2: mirrorOn = armLedLocal;      break;
+                                    case 3: mirrorOn = playLedLocal;     break;
+                                    case 4: mirrorOn = loopLeftLocal;    break;
+                                    case 5: mirrorOn = recordLeftLocal;  break;
+                                    case 6: mirrorOn = recordRightLocal; break;
+                                    case 7: mirrorOn = loopRightLocal;   break;
+                                    default: break;
+                                }
+                                pca9685SetPWM((uint8_t)channel,
+                                              mirrorOn ? ledBrightness[channel] : 4095);
+                            }
+                        }
+                    }
+                }
+            }
+            // LEDID:channel:1  or  LEDID:channel:0  — begin / end identify.
+            // While identify is on, the loop() ticker flashes that channel at
+            // ~2 Hz. On end, we restore the normal mirror state.
+            else if (serialInputBuffer.startsWith("LEDID:")) {
+                int firstColon  = 5;
+                int secondColon = serialInputBuffer.indexOf(':', firstColon + 1);
+                if (secondColon > 0) {
+                    int channel = serialInputBuffer.substring(firstColon + 1, secondColon).toInt();
+                    int on      = serialInputBuffer.substring(secondColon + 1).toInt();
+                    if (pca9685Found && channel >= 0 && channel < 9) {
+                        if (on) {
+                            ledIdentify[channel] = true;
+                            // Force phase to on so the LED lights immediately.
+                            ledIdentifyPhase   = true;
+                            ledIdentifyLastMs  = millis();
+                            pca9685SetPWM((uint8_t)channel, ledBrightness[channel]);
+                        } else {
+                            ledIdentify[channel] = false;
+                            // Restore via mirror. Channel 8 has no mirror — just
+                            // set to off; pad 24 will re-light it if held.
+                            bool mirrorOn = false;
+                            switch (channel) {
+                                case 0: mirrorOn = muteLedLocal;     break;
+                                case 1: mirrorOn = soloLedLocal;     break;
+                                case 2: mirrorOn = armLedLocal;      break;
+                                case 3: mirrorOn = playLedLocal;     break;
+                                case 4: mirrorOn = loopLeftLocal;    break;
+                                case 5: mirrorOn = recordLeftLocal;  break;
+                                case 6: mirrorOn = recordRightLocal; break;
+                                case 7: mirrorOn = loopRightLocal;   break;
+                                default: break;
+                            }
+                            pca9685SetPWM((uint8_t)channel,
+                                          mirrorOn ? ledBrightness[channel] : 4095);
                         }
                     }
                 }
@@ -1587,8 +1814,10 @@ bool handleTouchNormalMode(int touchNum) {
         return false;
     }
     if (touchNum == 24) {
-        // Momentary pan-modifier: LED 8 on while held.
-        ledSet(8, true);
+        // Momentary pan-modifier: LED 8 on while held. Suppressed in
+        // marker-scroll mode so the LED strip stays dark apart from the
+        // mute flash.
+        if (!muteFlashActive) ledSet(8, true);
         return false;
     }
     if (touchNum == 19) {
@@ -1681,20 +1910,27 @@ void handleTouchReleased(int touchNum) {
         if (pad18ResetFired) {
             resetShowFinish();
             suppressReleaseSend = true;
-        } else {
+        } else if (!muteFlashActive) {
             // Tap release: predictively toggle mute LED so it responds
             // instantly instead of waiting for the DAW's LED:0 round-trip.
+            // Skipped in marker-scroll mode — the DAW uses pad 18 to
+            // exit scroll mode and LED 0 is owned by the flash animation.
             muteLedLocal = !muteLedLocal;
             ledSet(0, muteLedLocal);
         }
         pad18PressMs    = 0;
         pad18ResetFired = false;
     }
-    if (touchNum == 17) {
+    if (touchNum == 17 && !muteFlashActive) {
         // Tap release: predictive solo LED toggle, same responsiveness
-        // trick as pad 18 (mute) and pad 19 (play).
+        // trick as pad 18 (mute) and pad 19 (play). Skipped in scroll mode.
         soloLedLocal = !soloLedLocal;
         ledSet(1, soloLedLocal);
+    }
+    if (touchNum == 16 && !muteFlashActive) {
+        // Tap release: predictive record-arm LED toggle. Skipped in scroll mode.
+        armLedLocal = !armLedLocal;
+        ledSet(2, armLedLocal);
     }
     if (touchNum == 19) {
         // Replay deferred press-action if the tap wasn't consumed by a
@@ -1727,6 +1963,23 @@ void loop() {
 
     // --- Serial commands from DAW ---
     processSerialCommands();
+
+    // --- LED identify flasher ---
+    // For every channel with identify=true, toggle the physical LED at
+    // ~2 Hz using the channel's brightness. Cheap: one 250 ms guard + a
+    // 9-slot check per loop iteration.
+    {
+        uint32_t now = millis();
+        if (now - ledIdentifyLastMs >= 250) {
+            ledIdentifyLastMs = now;
+            ledIdentifyPhase  = !ledIdentifyPhase;
+            for (uint8_t ch = 0; ch < 9; ch++) {
+                if (ledIdentify[ch]) {
+                    pca9685SetPWM(ch, ledIdentifyPhase ? ledBrightness[ch] : 4095);
+                }
+            }
+        }
+    }
 
     // --- DAW connection watchdog ---
     // Detect the connected->disconnected transition once and display the
@@ -1868,6 +2121,7 @@ void loop() {
 
     // --- Text-input LED flash on pads 20 / 21 (name-entry mode) ---
     textInputFlashStep();
+    muteFlashStep();
 
     // --- Text-input pending-letter OLED fade ---
     textInputFadeStep();

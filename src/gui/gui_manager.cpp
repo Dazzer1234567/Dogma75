@@ -1,6 +1,7 @@
 #include "gui_manager.h"
 #include "../audio/audio_engine.h"
 #include "../controller/serial_controller.h"
+#include "../util/daw_log.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -219,6 +220,24 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     m_audioEngine = audioEngine;
     m_serialController = serialController;
 
+    // Register view-state hooks with the engine's undo system so a
+    // pad-26 undo also restores zoom / scroll / timeline extent.
+    if (m_audioEngine) {
+        m_audioEngine->setUndoGuiHooks(
+            [this](UndoEntry& e) {
+                e.guiDisplayZoom        = m_displayZoom;
+                e.guiViewCenterPosition = m_viewCenterPosition;
+                e.guiTimelineFrames     = m_timelineFrames;
+            },
+            [this](const UndoEntry& e) {
+                m_displayZoom        = e.guiDisplayZoom;
+                m_viewCenterPosition = e.guiViewCenterPosition;
+                m_timelineFrames     = e.guiTimelineFrames;
+                if (m_audioEngine) m_audioEngine->setWaveformZoom(e.guiDisplayZoom);
+            }
+        );
+    }
+
 #ifdef SDL2_FOUND
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
@@ -285,7 +304,8 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     // Auto-load default session on startup. If the file is missing (renamed
     // or on a different machine), loadSessionFromFile logs and returns
     // cleanly — the DAW just starts empty.
-    loadSessionFromFile("c:\\0_CODE\\Dogma75\\Workspace\\can delete\\beegee.json");
+    loadSessionFromFile("c:\\0_CODE\\Dogma75\\Workspace\\can delete\\record test.json");
+    retimeArrangement();
 
     m_running = true;
     std::cout << "GUI initialized successfully with OpenGL " << glGetString(GL_VERSION) << std::endl;
@@ -976,6 +996,44 @@ private:
 void GUIManager::processFrame() {
 #ifdef SDL2_FOUND
 #ifdef IMGUI_FOUND
+    // Pad-13 + E1 posts a jump-to-bookmark request via AudioEngine; when
+    // one is waiting, recentre the arrangement view so the target frame
+    // sits 15% in from the left edge. Zoom is unchanged.
+    if (m_audioEngine) {
+        int64_t jumpFrame = m_audioEngine->consumeRequestedJumpFrame();
+        if (jumpFrame >= 0 && m_timelineFrames > 0) {
+            float zoom = m_displayZoom > 0.0f ? m_displayZoom : 1.0f;
+            size_t vis = (size_t)((double)m_timelineFrames / (double)zoom);
+            if (vis < 100) vis = 100;
+            // Current viewStart derived from centre — same math the
+            // arrangement uses. If the marker is already visible, don't
+            // reposition; only snap when it's off-screen.
+            size_t curStart = 0;
+            if (m_viewCenterPosition > vis / 2)
+                curStart = m_viewCenterPosition - vis / 2;
+            if (curStart + vis > m_timelineFrames)
+                curStart = (m_timelineFrames > vis) ? m_timelineFrames - vis : 0;
+            size_t curEnd = curStart + vis;
+            bool onScreen = ((size_t)jumpFrame >= curStart &&
+                             (size_t)jumpFrame <  curEnd);
+            if (onScreen) {
+                dawLog("GUI jump: frame=%lld already on-screen (view=[%zu..%zu]) — no snap",
+                       (long long)jumpFrame, curStart, curEnd);
+            } else {
+                // Off-screen: reposition so marker sits 15% from left.
+                long long viewStart = (long long)jumpFrame
+                                    - (long long)((double)vis * 0.15);
+                if (viewStart < 0) viewStart = 0;
+                if ((size_t)viewStart + vis > m_timelineFrames)
+                    viewStart = (m_timelineFrames > vis)
+                              ? (long long)(m_timelineFrames - vis) : 0;
+                m_viewCenterPosition = (size_t)viewStart + vis / 2;
+                dawLog("GUI jump: frame=%lld off-screen → viewCenter=%zu (vis=%zu)",
+                       (long long)jumpFrame, m_viewCenterPosition, vis);
+            }
+        }
+    }
+
     // Handle SDL events
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -1047,6 +1105,12 @@ void GUIManager::processFrame() {
     if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput && io.KeyCtrl) {
         int idx = m_audioEngine->getSelectedTrack();
         if (idx >= 0 && idx < m_audioEngine->getTrackCount()) {
+            Track* t = m_audioEngine->getTrack(idx);
+            if (t && t->hasAudio()) {
+                // Snapshot + attach the pre-clear audio so undo restores it.
+                m_audioEngine->undoSnapshot();
+                m_audioEngine->undoStashTrackAudio(idx);
+            }
             m_audioEngine->clearTrackAudio(idx);
         }
     } else if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput && !io.KeyCtrl) {
@@ -1076,7 +1140,12 @@ void GUIManager::processFrame() {
                 idx = m_audioEngine->addTrack("");
                 m_audioEngine->setSelectedTrack(idx);
             }
+            // Snapshot + stash the pre-load audio so undo restores what
+            // was there before this load (including empty).
+            m_audioEngine->undoSnapshot();
+            m_audioEngine->undoStashTrackAudio(idx);
             m_audioEngine->loadTrackAudio(idx, filename);
+            retimeArrangement();
         }
 #endif
     }
@@ -1416,6 +1485,152 @@ void GUIManager::renderToolbar() {
         ImGui::SetTooltip("Hardware test page - shows all encoders and touchpads");
     }
 
+    // One-shot: push the persisted brightness values to the firmware on the
+    // first toolbar render after loadSettings, so the LEDs come up at the
+    // user's tuned levels without a slider drag.
+    if (m_ledBrightnessNeedsPush && m_serialController) {
+        for (int ch = 0; ch < 9; ch++) {
+            uint16_t pca = (uint16_t)((1.0f - m_ledBrightness[ch]) * 4095.0f);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "LEDBRT:%d:%d", ch, (int)pca);
+            m_serialController->sendMessage(buf);
+        }
+        m_ledBrightnessNeedsPush = false;
+    }
+
+    // LED brightness popup — one slider per channel + an "identify" button
+    // beside each so the user can locate which physical LED is which. The
+    // popup is anchored to the "LED" toolbar button; toggle it with a click.
+    ImGui::SameLine();
+    if (ImGui::Button("LED")) {
+        ImGui::OpenPopup("LEDPopup");
+    }
+    // All-ON / All-OFF mode belongs to the popup — kept out here so we
+    // can cancel it the moment the popup closes.
+    // 0 = none, 1 = all on, 2 = all off
+    static int sAllMode = 0;
+    auto pushAllForce = [this](const char* verb, int active) {
+        if (!m_serialController) return;
+        for (int ch = 0; ch < 9; ch++) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "LEDFORCE%s:%d:%d", verb, ch, active);
+            m_serialController->sendMessage(buf);
+        }
+    };
+
+    if (ImGui::BeginPopup("LEDPopup")) {
+        // "All ON" / "All OFF" — mutually-exclusive toggle buttons that
+        // hold every LED steady on / off for the physical wiring check.
+        // Click one to activate, click again to deactivate. Clicking the
+        // other flips the state and cancels the first.
+        {
+            auto pushBtnColor = [](ImVec4 c) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        c);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, c);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  c);
+            };
+
+            if (sAllMode == 1) pushBtnColor(ImVec4(0.00f, 0.60f, 0.25f, 1.0f));
+            if (ImGui::Button("All ON", ImVec2(90, 0))) {
+                if (sAllMode == 1) {
+                    // Deactivate.
+                    pushAllForce("ON", 0);
+                    sAllMode = 0;
+                } else {
+                    // Cancel other, activate this.
+                    if (sAllMode == 2) pushAllForce("OFF", 0);
+                    pushAllForce("ON", 1);
+                    sAllMode = 1;
+                }
+            }
+            if (sAllMode == 1) ImGui::PopStyleColor(3);
+
+            ImGui::SameLine();
+            if (sAllMode == 2) pushBtnColor(ImVec4(0.60f, 0.20f, 0.20f, 1.0f));
+            if (ImGui::Button("All OFF", ImVec2(90, 0))) {
+                if (sAllMode == 2) {
+                    pushAllForce("OFF", 0);
+                    sAllMode = 0;
+                } else {
+                    if (sAllMode == 1) pushAllForce("ON", 0);
+                    pushAllForce("OFF", 1);
+                    sAllMode = 2;
+                }
+            }
+            if (sAllMode == 2) ImGui::PopStyleColor(3);
+
+            ImGui::Separator();
+        }
+
+        const char* ledNames[9] = {
+            "0  mute",    "1  solo",     "2  arm",
+            "3  play",    "4  loop L",   "5  rec L",
+            "6  rec R",   "7  loop R",   "8  orange"
+        };
+        for (int ch = 0; ch < 9; ch++) {
+            ImGui::PushID(ch);
+            ImGui::TextUnformatted(ledNames[ch]);
+            ImGui::SameLine(90);
+            ImGui::SetNextItemWidth(320);   // roughly 2× the original width
+            if (ImGui::SliderFloat("##bright", &m_ledBrightness[ch], 0.0f, 1.0f, "%.2f")) {
+                uint16_t pca = (uint16_t)((1.0f - m_ledBrightness[ch]) * 4095.0f);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "LEDBRT:%d:%d", ch, (int)pca);
+                if (m_serialController) m_serialController->sendMessage(buf);
+            }
+            // Save whenever the drag ends so a graceful shutdown isn't
+            // required to persist the tune.
+            if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings();
+
+            ImGui::SameLine();
+            // Identify: while the button is held down, ask the firmware to
+            // flash this channel. Release ends identify and restores state.
+            ImGui::Button("id");
+            bool active = ImGui::IsItemActive();
+            if (active && m_ledIdentifyChannel != ch) {
+                // Turn off any previous identify first.
+                if (m_ledIdentifyChannel >= 0 && m_serialController) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "LEDID:%d:0", m_ledIdentifyChannel);
+                    m_serialController->sendMessage(buf);
+                }
+                m_ledIdentifyChannel = ch;
+                if (m_serialController) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "LEDID:%d:1", ch);
+                    m_serialController->sendMessage(buf);
+                }
+            } else if (!active && m_ledIdentifyChannel == ch) {
+                m_ledIdentifyChannel = -1;
+                if (m_serialController) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "LEDID:%d:0", ch);
+                    m_serialController->sendMessage(buf);
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    } else {
+        // Popup was closed — cancel any diagnostic overrides so the
+        // controller LEDs snap back to reflecting real application state.
+        if (m_ledIdentifyChannel >= 0) {
+            if (m_serialController) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "LEDID:%d:0", m_ledIdentifyChannel);
+                m_serialController->sendMessage(buf);
+            }
+            m_ledIdentifyChannel = -1;
+        }
+        if (sAllMode == 1) {
+            pushAllForce("ON", 0);
+            sAllMode = 0;
+        } else if (sAllMode == 2) {
+            pushAllForce("OFF", 0);
+            sAllMode = 0;
+        }
+    }
+
     // Fullscreen/Close buttons (right-aligned)
     ImGui::SameLine();
     float rightButtonsX = io.DisplaySize.x - 80;
@@ -1464,6 +1679,9 @@ void GUIManager::renderTrackPanel(float width, float height) {
         }
         ImGui::EndCombo();
     }
+    // 15 px gap so this separator lines up with the arrangement's
+    // top separator (which sits 15 px below its time-ruler baseline).
+    ImGui::Dummy(ImVec2(1.0f, 15.0f));
     ImGui::Separator();
 
     // -------- SCRUBBING view --------
@@ -1711,6 +1929,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 if (ImGui::InputText("##name", nameBuffer, sizeof(nameBuffer),
                                      ImGuiInputTextFlags_EnterReturnsTrue |
                                      ImGuiInputTextFlags_AutoSelectAll)) {
+                    m_audioEngine->undoSnapshot();
                     track->name = nameBuffer;
                     m_audioEngine->markSessionDirty();
                     editingTrackName = -1;
@@ -1792,6 +2011,14 @@ void GUIManager::renderTrackPanel(float width, float height) {
             ImGui::SetNextItemWidth(-1);
             if (ImGui::SliderFloat("##vol", &track->volume, 0.0f, 1.0f, "%.2f"))
                 m_audioEngine->markSessionDirty();
+            // Snapshot on drag start so a whole drag coalesces to one undo.
+            if (ImGui::IsItemActivated()) m_audioEngine->undoSnapshot();
+            // Double-click to reset to unity gain.
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                m_audioEngine->undoSnapshot();
+                track->volume = 1.0f;
+                m_audioEngine->markSessionDirty();
+            }
 
             // --- Pan slider ---
             ImGui::Text("Pan");
@@ -1799,6 +2026,13 @@ void GUIManager::renderTrackPanel(float width, float height) {
             ImGui::SetNextItemWidth(-1);
             if (ImGui::SliderFloat("##pan", &track->pan, -1.0f, 1.0f, "%.2f"))
                 m_audioEngine->markSessionDirty();
+            if (ImGui::IsItemActivated()) m_audioEngine->undoSnapshot();
+            // Double-click to recentre.
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                m_audioEngine->undoSnapshot();
+                track->pan = 0.0f;
+                m_audioEngine->markSessionDirty();
+            }
 
             // --- Mute / Solo / Record-arm buttons ---
             // Push all three button-state colours (Button + Hovered + Active)
@@ -1814,30 +2048,94 @@ void GUIManager::renderTrackPanel(float width, float height) {
             };
             // Mute — green when active (mirrors the controller's LED 0)
             if (track->muted) pushBtnColor(ImVec4(0.00f, 0.70f, 0.30f, 1.0f));
-            if (ImGui::Button("M", msrBtnSize)) { track->muted = !track->muted; m_audioEngine->markSessionDirty(); }
+            if (ImGui::Button("M", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->muted = !track->muted; m_audioEngine->markSessionDirty(); }
             if (track->muted) ImGui::PopStyleColor(3);
             ImGui::SameLine();
             // Solo — yellow when active (mirrors the controller's LED 1)
             if (track->solo) pushBtnColor(ImVec4(0.85f, 0.75f, 0.00f, 1.0f));
-            if (ImGui::Button("S", msrBtnSize)) { track->solo = !track->solo; m_audioEngine->markSessionDirty(); }
+            if (ImGui::Button("S", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->solo = !track->solo; m_audioEngine->markSessionDirty(); }
             if (track->solo) ImGui::PopStyleColor(3);
             ImGui::SameLine();
             // Record arm
             if (track->armed) pushBtnColor(ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
-            if (ImGui::Button("R", msrBtnSize)) { track->armed = !track->armed; m_audioEngine->markSessionDirty(); }
+            if (ImGui::Button("R", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->armed = !track->armed; m_audioEngine->markSessionDirty(); }
             if (track->armed) ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            // Input monitor — cyan/teal when active. Just a state toggle for
+            // now; audio path wiring can come later.
+            if (track->inputMonitor) pushBtnColor(ImVec4(0.10f, 0.65f, 0.85f, 1.0f));
+            if (ImGui::Button("I", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->inputMonitor = !track->inputMonitor; m_audioEngine->markSessionDirty(); }
+            if (track->inputMonitor) ImGui::PopStyleColor(3);
 
-            // --- Output pair dropdown ---
+            // --- Input & output pair dropdowns, side by side ---
+            //   Display format: "i = 1&2"   "o = 1&2"
+            // Input pair count comes from the device's advertised input
+            // channels (may be 0 for output-only devices; dropdown just
+            // hides in that case).
+            int numInputPairs = m_audioEngine->getNumInputStereoPairs();
+            float halfW = ImGui::GetContentRegionAvail().x * 0.5f - 4.0f;
+
+            if (numInputPairs > 0) {
+                // Stereo takes the pair index (e.g. "I = 1-2"); mono takes
+                // an absolute channel index (e.g. "I = 1"). Whichever is
+                // active drives the combo preview.
+                char inLabel[32];
+                if (track->inputMono) {
+                    sprintf(inLabel, "I = %d", track->inputMonoChan + 1);
+                } else {
+                    sprintf(inLabel, "I = %d-%d", (track->inputPair * 2) + 1,
+                                                  (track->inputPair * 2) + 2);
+                }
+                ImGui::SetNextItemWidth(halfW);
+                if (ImGui::BeginCombo("##in", inLabel, ImGuiComboFlags_NoArrowButton)) {
+                    // Stereo pairs first.
+                    for (int p = 0; p < numInputPairs; p++) {
+                        bool sel = (!track->inputMono && track->inputPair == p);
+                        char item[32];
+                        sprintf(item, "I = %d-%d", (p * 2) + 1, (p * 2) + 2);
+                        if (ImGui::Selectable(item, sel)) {
+                            m_audioEngine->undoSnapshot();
+                            track->inputMono = false;
+                            track->inputPair = p;
+                            m_audioEngine->markSessionDirty();
+                        }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    // Then mono channels, separated so it's clear these are
+                    // single-channel takes.
+                    int numMono = m_audioEngine->getNumInputStereoPairs() * 2;
+                    if (numMono > 0) {
+                        ImGui::Separator();
+                        for (int c = 0; c < numMono; c++) {
+                            bool sel = (track->inputMono && track->inputMonoChan == c);
+                            char item[32];
+                            sprintf(item, "I = %d", c + 1);
+                            if (ImGui::Selectable(item, sel)) {
+                                m_audioEngine->undoSnapshot();
+                                track->inputMono     = true;
+                                track->inputMonoChan = c;
+                                m_audioEngine->markSessionDirty();
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+            }
+
             if (numPairs > 0) {
-                char pairLabel[32];
-                sprintf(pairLabel, "Ch %d-%d", (track->outputPair * 2) + 1, (track->outputPair * 2) + 2);
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::BeginCombo("##out", pairLabel)) {
+                char outLabel[32];
+                sprintf(outLabel, "O = %d-%d", (track->outputPair * 2) + 1, (track->outputPair * 2) + 2);
+                // If there's no input dropdown occupying the left half,
+                // let the output combo take the full row.
+                ImGui::SetNextItemWidth(numInputPairs > 0 ? halfW : -1.0f);
+                if (ImGui::BeginCombo("##out", outLabel, ImGuiComboFlags_NoArrowButton)) {
                     for (int p = 0; p < numPairs; p++) {
                         bool sel = (track->outputPair == p);
-                        char label[32];
-                        sprintf(label, "Ch %d-%d", (p * 2) + 1, (p * 2) + 2);
-                        if (ImGui::Selectable(label, sel)) { track->outputPair = p; m_audioEngine->markSessionDirty(); }
+                        char item[32];
+                        sprintf(item, "O = %d-%d", (p * 2) + 1, (p * 2) + 2);
+                        if (ImGui::Selectable(item, sel)) { m_audioEngine->undoSnapshot(); track->outputPair = p; m_audioEngine->markSessionDirty(); }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
                     ImGui::EndCombo();
@@ -1908,10 +2206,256 @@ void GUIManager::renderWaveform(float height) {
 #ifdef IMGUI_FOUND
     ImGui::BeginChild("MainArea", ImVec2(0, height), true);
 
-    // Match the left panel's combo-widget frame height so the separator
-    // below TIMELINE aligns with the separator below the TRACKS dropdown.
-    ImGui::AlignTextToFramePadding();
-    ImGui::Text("TIMELINE");
+    // ---- View-state pre-pass ----
+    // Run scroll-delta consume + zoom-pin math ONCE at the start of the
+    // frame, so both the ruler ABOVE and the per-track loop BELOW read
+    // the same viewStart / visibleFrames. Without this pre-pass the
+    // ruler would use LAST frame's m_viewCenterPosition (per-track
+    // updated it AFTER the ruler drew), which during a zoom gesture
+    // sends the marker triangle out of sync with the marker's
+    // full-height line in the arrangement overlay.
+    if (m_audioEngine && m_timelineFrames > 0) {
+        double totalFramesD = (double)m_timelineFrames;
+        float  zoom          = m_displayZoom > 0.0f ? m_displayZoom : 1.0f;
+        double visD          = totalFramesD / (double)zoom;
+        if (visD < 100.0) visD = 100.0;
+        size_t playPos       = m_audioEngine->getPlaybackPosition();
+
+        // E3 + modifier scroll — same handling per-track used to do.
+        long scrollDelta = m_audioEngine->consumeViewScrollDelta();
+        if (scrollDelta != 0) {
+            long newCenter = (long)m_viewCenterPosition + scrollDelta;
+            if (newCenter < 0) newCenter = 0;
+            if (newCenter > (long)m_timelineFrames) newCenter = (long)m_timelineFrames;
+            m_viewCenterPosition = (size_t)newCenter;
+        }
+
+        // Zoom-change detection + stable-fraction pin math (double).
+        bool zoomChanged = (zoom != m_lastZoom);
+        if (zoomChanged) {
+            double oldVisD = totalFramesD / (double)m_lastZoom;
+            if (oldVisD < 100.0) oldVisD = 100.0;
+            double oldViewStartD = (double)m_viewCenterPosition - oldVisD / 2.0;
+            if (oldViewStartD < 0.0) oldViewStartD = 0.0;
+            if (oldViewStartD + oldVisD > totalFramesD)
+                oldViewStartD = totalFramesD - oldVisD;
+            if (oldViewStartD < 0.0) oldViewStartD = 0.0;
+
+            int currentDir = (zoom > m_lastZoom) ? +1 : -1;
+            bool directionChanged = (m_lastZoomDirection != 0 &&
+                                     currentDir != m_lastZoomDirection);
+            if (m_lastZoomDirection == 0 || directionChanged) {
+                bool playheadVisible = ((double)playPos >= oldViewStartD) &&
+                                       ((double)playPos <  oldViewStartD + oldVisD);
+                m_zoomAnchorPinPlayhead = playheadVisible;
+                if (playheadVisible && oldVisD > 0.0) {
+                    double f = ((double)playPos - oldViewStartD) / oldVisD;
+                    if (f < 0.0) f = 0.0;
+                    if (f > 1.0) f = 1.0;
+                    m_zoomPinScreenFraction = f;
+                }
+            }
+            if (m_zoomAnchorPinPlayhead) {
+                double newVs = (double)playPos - m_zoomPinScreenFraction * visD;
+                if (newVs < 0.0) newVs = 0.0;
+                if (newVs + visD > totalFramesD) newVs = totalFramesD - visD;
+                if (newVs < 0.0) newVs = 0.0;
+                m_viewStartD         = newVs;
+                m_viewCenterPosition = (size_t)(newVs + visD / 2.0);
+            } else {
+                m_viewStartD = (double)m_viewCenterPosition - visD / 2.0;
+                if (m_viewStartD < 0.0) m_viewStartD = 0.0;
+                if (m_viewStartD + visD > totalFramesD)
+                    m_viewStartD = totalFramesD - visD;
+                if (m_viewStartD < 0.0) m_viewStartD = 0.0;
+            }
+            m_lastZoomDirection = currentDir;
+            m_lastZoom          = zoom;
+        } else {
+            m_viewStartD = (double)m_viewCenterPosition - visD / 2.0;
+            if (m_viewStartD < 0.0) m_viewStartD = 0.0;
+            if (m_viewStartD + visD > totalFramesD)
+                m_viewStartD = totalFramesD - visD;
+            if (m_viewStartD < 0.0) m_viewStartD = 0.0;
+        }
+        m_visibleFramesD = visD;
+
+        // Publish the viewport to the reader thread so encoder marker
+        // moves and enableMarkerAtDefault (loop/rec pair press) can
+        // compute frame positions from the CURRENT view, not from an
+        // outdated one — even when no track has any audio (the per-track
+        // publish path used to be skipped in that case).
+        m_audioEngine->setViewportRange((size_t)m_viewStartD,
+                                        (size_t)m_visibleFramesD);
+    }
+
+    // ---- Time ruler ----
+    // Same left/width as the arrangement child below, so tick x-positions
+    // line up with the waveform frames underneath. Tick interval scales
+    // with zoom — at 1 second per pixel we show 1-min marks with minor
+    // 10-sec ticks; zooming in walks that down to 1-second increments.
+    {
+        // View state was already computed by the pre-pass above, so we
+        // just read the shared m_viewStartD / m_visibleFramesD values.
+        // Both the ruler AND the per-track loop / marker overlay work
+        // off these, so the marker triangle, playhead line, and
+        // full-height marker line all stay in exact sync during zoom.
+        double sampleRate = m_audioEngine ? m_audioEngine->getSampleRate() : 44100.0;
+        if (sampleRate < 1.0) sampleRate = 44100.0;
+        double viewStartD    = m_viewStartD;
+        double visD          = m_visibleFramesD;
+        size_t visibleFrames = (size_t)visD;
+        if (visibleFrames < 100) visibleFrames = 100;
+        size_t viewStart = (size_t)viewStartD;
+        size_t viewEnd   = viewStart + visibleFrames;
+
+        // Ruler layout — major ticks span the full ruler height, labels
+        // sit vertically centred right next to their tick. The reserved
+        // vertical space matches ImGui::GetFrameHeight() so the trailing
+        // Separator ends up at the SAME Y as the left panel's Separator
+        // (which sits directly under its "TRACKS / SCRUBBING / WAVEFORM"
+        // combo — same frame height).
+        const float rulerH        = ImGui::GetFrameHeight();
+        const float labelH        = ImGui::GetTextLineHeight();
+        const float labelY        = (rulerH - labelH) * 0.5f;     // centred
+        const float tickTop       = 0.0f;
+        const float tickBottom    = rulerH;
+        const float minorTickTop  = tickBottom - 5.0f;
+        ImVec2 origin = ImGui::GetCursorScreenPos();
+        float width   = ImGui::GetContentRegionAvail().x;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        // Advance the layout cursor past the ruler so the arrangement
+        // child below starts where the tracks used to start.
+        ImGui::Dummy(ImVec2(width, rulerH));
+        // 15 px gap between the ruler baseline and the blue separator
+        // line below. The left panel adds the same gap after its combo
+        // so the two separators line up horizontally.
+        ImGui::Dummy(ImVec2(1.0f, 15.0f));
+
+        // Feed the tick / bookmark X math the full-precision viewStart
+        // and visibleFrames — using the truncated size_t versions would
+        // re-introduce the same 1-frame jitter we just eliminated.
+        double startSec = viewStartD / sampleRate;
+        double endSec   = (viewStartD + visD) / sampleRate;
+        double spanSec  = endSec - startSec;
+        if (spanSec > 0.0 && width > 1.0f) {
+            double pxPerSec = (double)width / spanSec;
+            // Pick the smallest interval from the ladder below that gives
+            // at least ~70 px between major ticks — labels stay readable.
+            const double ladder[] = { 0.1, 0.5, 1, 5, 10, 30, 60, 300, 600, 1800, 3600 };
+            const int nLadder = sizeof(ladder) / sizeof(ladder[0]);
+            double major = ladder[nLadder - 1];
+            for (int i = 0; i < nLadder; i++) {
+                if (ladder[i] * pxPerSec >= 70.0) { major = ladder[i]; break; }
+            }
+            // Minor ticks: 5 subdivisions of the major (unless major<1).
+            double minor = major / 5.0;
+            if (minor < 0.1) minor = major;   // don't overdraw at sub-second majors
+
+            ImU32 majorCol = IM_COL32(200, 200, 200, 220);
+            ImU32 minorCol = IM_COL32(120, 120, 120, 160);
+            ImU32 labelCol = IM_COL32(220, 220, 220, 255);
+
+            // Baseline of the ruler.
+            dl->AddLine(ImVec2(origin.x,         origin.y + tickBottom),
+                        ImVec2(origin.x + width, origin.y + tickBottom),
+                        majorCol, 1.0f);
+
+            // Minor ticks first (shorter, dimmer), then majors + labels.
+            double firstMinor = std::floor(startSec / minor) * minor;
+            for (double t = firstMinor; t <= endSec + 1e-6; t += minor) {
+                if (t < startSec - 1e-6) continue;
+                float x = origin.x + (float)((t - startSec) * pxPerSec);
+                if (x < origin.x || x > origin.x + width) continue;
+                double frac = t / major;
+                bool isMajor = std::abs(frac - std::round(frac)) < 1e-4;
+                if (isMajor) continue;
+                dl->AddLine(ImVec2(x, origin.y + minorTickTop),
+                            ImVec2(x, origin.y + tickBottom),
+                            minorCol, 1.0f);
+            }
+            double firstMajor = std::floor(startSec / major) * major;
+            for (double t = firstMajor; t <= endSec + 1e-6; t += major) {
+                if (t < startSec - 1e-6) continue;
+                float x = origin.x + (float)((t - startSec) * pxPerSec);
+                if (x < origin.x || x > origin.x + width) continue;
+                dl->AddLine(ImVec2(x, origin.y + tickTop),
+                            ImVec2(x, origin.y + tickBottom),
+                            majorCol, 1.0f);
+                char buf[16];
+                int totalDeci = (int)std::round(t * 10.0);
+                int mins  = totalDeci / 600;
+                int secs  = (totalDeci / 10) % 60;
+                int deci  = totalDeci % 10;
+                if (major >= 1.0) snprintf(buf, sizeof(buf), "%d:%02d", mins, secs);
+                else              snprintf(buf, sizeof(buf), "%d:%02d.%d", mins, secs, deci);
+                dl->AddText(ImVec2(x + 3, origin.y + labelY), labelCol, buf);
+            }
+
+            // ---- Bookmarks (pad 13) ----
+            // Each pad-13 release appends a bookmark and opens the
+            // controller's TEXTIN naming flow. Draw a white downward
+            // triangle for each bookmark and, next to it, the name
+            // (or the live-typing preview + blinking cursor if the
+            // firmware is currently naming this specific bookmark).
+            auto bookmarks = m_audioEngine
+                ? m_audioEngine->getBookmarks()
+                : std::vector<AudioEngine::Bookmark>();
+            if (!bookmarks.empty()) {
+                float  itemSp    = ImGui::GetStyle().ItemSpacing.y;
+                float  blueLineY = origin.y + rulerH + 15.0f + itemSp;
+                float  topY      = origin.y + rulerH + 6.0f;
+                float  tipY      = blueLineY + 2.0f;
+                float  halfW     = 6.0f;
+                ImU32  white     = IM_COL32(255, 255, 255, 255);
+                int renamingBm   = m_audioEngine->getRenameBookmarkIndex();
+                std::string liveBuf;
+                int liveCursor = 0;
+                bool liveActive = m_audioEngine->getRenameBuffer(liveBuf, liveCursor);
+                float flashB = m_audioEngine->getLedFlashBrightness();
+                bool cursorOn = (flashB > 0.5f);
+                for (int i = 0; i < (int)bookmarks.size(); i++) {
+                    const auto& bm = bookmarks[i];
+                    if (bm.frame < viewStart || bm.frame >= viewEnd) continue;
+                    double bmSec = (double)bm.frame / sampleRate;
+                    float  bx    = origin.x + (float)((bmSec - startSec) * pxPerSec);
+                    dl->AddTriangleFilled(
+                        ImVec2(bx - halfW, topY),
+                        ImVec2(bx + halfW, topY),
+                        ImVec2(bx,         tipY),
+                        white);
+                    // Label to the right of the triangle. When this
+                    // bookmark is being renamed, show the live buffer
+                    // with a phase-synced blinking underscore cursor.
+                    std::string label = bm.name;
+                    if (i == renamingBm && liveActive) {
+                        label = liveBuf;
+                        int cp = liveCursor;
+                        if (cp < 0) cp = 0;
+                        if (cp > (int)label.size()) label.resize((size_t)cp, ' ');
+                        if (cursorOn) {
+                            if (cp < (int)label.size()) label[(size_t)cp] = '_';
+                            else                        label.push_back('_');
+                        } else if (cp >= (int)label.size()) {
+                            label.push_back(' ');
+                        }
+                    }
+                    if (!label.empty()) {
+                        // Right of the triangle's right vertex, inside
+                        // the gap between the ruler baseline and the
+                        // blue separator (not inside the ruler itself).
+                        // Offset 4 px lower for a bit more clearance
+                        // from the ruler line above.
+                        float bmLabelY = origin.y + rulerH +
+                                         (blueLineY - (origin.y + rulerH) - labelH) * 0.5f
+                                         + 4.0f;
+                        dl->AddText(ImVec2(bx + halfW + 3.0f, bmLabelY),
+                                    white, label.c_str());
+                    }
+                }
+            }
+        }
+    }
     ImGui::Separator();
 
     int selectedTrack = m_audioEngine->getSelectedTrack();
@@ -1960,7 +2504,30 @@ void GUIManager::renderWaveform(float height) {
 
             const std::vector<float>& audioData = track->audioData;
             int channels = track->channels;
-            size_t totalFrames = audioData.size() / channels;
+            // Defensive: never divide by zero. audioData being non-empty
+            // with channels==0 would be a bug in loadAudio / recording
+            // setup — treat it as "no audio" for this frame so the render
+            // doesn't crash, and log the inconsistency exactly once.
+            if (channels <= 0) {
+                static bool sLoggedOnce = false;
+                if (!sLoggedOnce) {
+                    fprintf(stderr, "!! render: track %d has channels=%d audioSize=%zu\n",
+                            i, channels, audioData.size());
+                    sLoggedOnce = true;
+                }
+                ImGui::InvisibleButton(("track_" + std::to_string(i)).c_str(),
+                                       ImVec2(ImGui::GetContentRegionAvail().x,
+                                              perTrackWaveformHeight));
+                ImGui::Separator();
+                continue;
+            }
+            // trackFrames = this track's own audio length (used for texture
+            // uv mapping and clip). totalFrames = the shared arrangement
+            // timeline used for view / zoom / scroll math — independent of
+            // any single track so recording never resizes the view.
+            size_t trackFrames = audioData.size() / channels;
+            size_t totalFrames = (m_timelineFrames > 0) ? m_timelineFrames : trackFrames;
+            if (totalFrames == 0) totalFrames = 1;   // avoid div by 0
             size_t playbackPos = m_audioEngine->getPlaybackPosition();
 
             float availableWidth = ImGui::GetContentRegionAvail().x;
@@ -2019,17 +2586,15 @@ void GUIManager::renderWaveform(float height) {
                 viewEnd = viewStart + visibleFrames;
                 if (viewEnd > totalFrames) viewEnd = totalFrames;
             } else {
-                // Apply encoder scroll delta (modifier + E3)
-                long scrollDelta = m_audioEngine->consumeViewScrollDelta();
-                if (scrollDelta != 0) {
-                    long newCenter = (long)m_viewCenterPosition + scrollDelta;
-                    if (newCenter < 0) newCenter = 0;
-                    if (newCenter > (long)totalFrames) newCenter = totalFrames;
-                    m_viewCenterPosition = (size_t)newCenter;
-                }
-
-                bool zoomChanged = (zoom != m_lastZoom);
-                if (zoomChanged) {
+                // Scroll-delta + zoom-pin math has already run in the
+                // pre-pass at the top of renderWaveform, so
+                // m_viewCenterPosition / m_viewStartD / m_visibleFramesD
+                // are already up-to-date. The duplicated per-track
+                // pin logic used to run here — kept as a false branch
+                // just to preserve the structure below without divergence.
+                long   scrollDelta = 0;
+                bool   zoomChanged = false;
+                if (false) {
                     // Compute where the view was BEFORE the zoom.
                     size_t oldVisibleFrames = (size_t)(totalFrames / m_lastZoom);
                     if (oldVisibleFrames < 100) oldVisibleFrames = 100;
@@ -2053,17 +2618,37 @@ void GUIManager::renderWaveform(float height) {
                         bool playheadVisible = (playbackPos >= oldViewStart) &&
                                                (playbackPos <  oldViewStart + oldVisibleFrames);
                         m_zoomAnchorPinPlayhead = playheadVisible;
+                        if (playheadVisible && oldVisibleFrames > 0) {
+                            // Capture the STABLE on-screen fraction where
+                            // the playhead currently sits (0 = left edge,
+                            // 1 = right edge). Reused each subsequent
+                            // zoom frame in the same direction, so the
+                            // pin math doesn't drift from truncated
+                            // feedback.
+                            double f = (double)((long long)playbackPos - (long long)oldViewStart)
+                                       / (double)oldVisibleFrames;
+                            if (f < 0.0) f = 0.0;
+                            if (f > 1.0) f = 1.0;
+                            m_zoomPinScreenFraction = f;
+                        }
                     }
 
                     if (m_zoomAnchorPinPlayhead) {
-                        // Pin the playhead: keep it at the same on-screen
-                        // position while the waveform expands/contracts.
-                        double fraction = (double)((long long)playbackPos - (long long)oldViewStart)
-                                          / (double)oldVisibleFrames;
-                        long long newViewStart = (long long)playbackPos
-                                                  - (long long)(fraction * (double)visibleFrames);
-                        if (newViewStart < 0) newViewStart = 0;
-                        m_viewCenterPosition = (size_t)newViewStart + visibleFrames / 2;
+                        // Pin the playhead using the captured stable
+                        // fraction — no accumulated truncation error.
+                        // Compute visibleFrames as DOUBLE (not the
+                        // truncated size_t) so the pin math stays
+                        // sub-frame accurate. Store the double result
+                        // for the ruler / marker overlay to consume
+                        // directly and avoid re-truncation jitter.
+                        double visD = (double)totalFrames / (double)zoom;
+                        if (visD < 100.0) visD = 100.0;
+                        double newViewStartD = (double)playbackPos
+                                             - m_zoomPinScreenFraction * visD;
+                        if (newViewStartD < 0.0) newViewStartD = 0.0;
+                        m_viewStartD         = newViewStartD;
+                        m_visibleFramesD     = visD;
+                        m_viewCenterPosition = (size_t)(newViewStartD + visD / 2.0);
                     }
                     // Otherwise: leave m_viewCenterPosition alone so the zoom
                     // happens around the middle of the current view.
@@ -2140,6 +2725,12 @@ void GUIManager::renderWaveform(float height) {
                     float sumSquares = 0.0f;
                     size_t sampleCount = 0;
                     for (size_t frame = barFrameStart; frame < barFrameEnd; frame++) {
+                        // Belt-and-braces bound check — trackFrames is
+                        // audioData.size()/channels so frame*channels+ch
+                        // should always fit, but guard anyway to survive
+                        // any concurrent audioData replacement.
+                        size_t lastIdx = frame * (size_t)channels + (size_t)(channels - 1);
+                        if (lastIdx >= audioData.size()) break;
                         float sample = 0.0f;
                         for (int ch = 0; ch < channels; ch++) {
                             sample += audioData[frame * channels + ch];
@@ -2187,7 +2778,16 @@ void GUIManager::renderWaveform(float height) {
                              tMut->waveformTexVersion != tMut->audioVersion)) {
                     uploadWaveformTexture(tMut);
                 }
-                if (tMut && tMut->waveformTex && totalFrames > 0) {
+                if (tMut && tMut->waveformTex && trackFrames > 0) {
+                    // Track's audio occupies world frames [0, trackFrames].
+                    // Draw only the portion that overlaps the shared view
+                    // [viewStart, viewEnd] — a track shorter than the
+                    // timeline (e.g. a fresh recording mid-take) occupies
+                    // just its left portion, not the whole row width.
+                    size_t drawStartFrame = viewStart;
+                    size_t drawEndFrame   = (viewEnd < trackFrames) ? viewEnd : trackFrames;
+                    if (drawEndFrame > drawStartFrame) {
+
                     // Framing / vertical zoom (same for both LODs).
                     float halfH  = waveformSize.y * 0.5f * m_waveformVerticalZoom;
                     float top    = centerY - halfH;
@@ -2195,14 +2795,19 @@ void GUIManager::renderWaveform(float height) {
                     if (top    < cursorPos.y)                  top    = cursorPos.y;
                     if (bottom > cursorPos.y + waveformSize.y) bottom = cursorPos.y + waveformSize.y;
 
-                    // Decide overview vs detail. Overview texel covers
-                    // totalFrames / W samples; if that's more than one
-                    // screen pixel, the overview is undersampling — kick in
-                    // the detail texture instead.
-                    size_t overviewFPT = totalFrames / (size_t)tMut->waveformTexW;
+                    // Pixel bounds for the visible portion of the track's
+                    // audio — mapped through the SHARED timeline view.
+                    float pxLeft  = cursorPos.x + (float)((double)(drawStartFrame - viewStart) / (double)visibleFrames) * waveformSize.x;
+                    float pxRight = cursorPos.x + (float)((double)(drawEndFrame   - viewStart) / (double)visibleFrames) * waveformSize.x;
+
+                    // Decide overview vs detail based on the VISIBLE
+                    // portion of the track: how many track frames per
+                    // screen pixel across the drawn area.
+                    size_t overviewFPT = trackFrames / (size_t)tMut->waveformTexW;
                     if (overviewFPT < 1) overviewFPT = 1;
-                    size_t viewRange = viewEnd - viewStart;
-                    size_t viewFPP   = viewRange / (size_t)waveformSize.x;
+                    size_t drawFrames = drawEndFrame - drawStartFrame;
+                    size_t drawPixels = (size_t)std::max(1.0f, pxRight - pxLeft);
+                    size_t viewFPP    = drawFrames / drawPixels;
                     if (viewFPP < 1) viewFPP = 1;
                     bool useDetail = (viewFPP < overviewFPT);
 
@@ -2231,48 +2836,92 @@ void GUIManager::renderWaveform(float height) {
                         size_t detailW = 8192;
                         size_t coveredRange = detailW * fpbUse;
                         bool inRange = (tMut->waveformDetailTex != 0) &&
-                                       (viewStart >= tMut->waveformDetailStart) &&
-                                       (viewEnd   <= tMut->waveformDetailEnd)   &&
+                                       (drawStartFrame >= tMut->waveformDetailStart) &&
+                                       (drawEndFrame   <= tMut->waveformDetailEnd)   &&
                                        (tMut->waveformDetailFPB == fpbUse) &&
                                        (tMut->waveformDetailVersion == tMut->audioVersion);
                         if (!inRange) {
-                            // Centre the window on the view so pan margin
-                            // is available in both directions.
-                            size_t centreFrame = (viewStart + viewEnd) / 2;
+                            // Centre the window on the drawn range so pan
+                            // margin is available in both directions.
+                            size_t centreFrame = (drawStartFrame + drawEndFrame) / 2;
                             size_t half        = coveredRange / 2;
                             size_t dStart      = (centreFrame > half) ? centreFrame - half : 0;
-                            if (dStart + coveredRange > totalFrames)
-                                dStart = (totalFrames > coveredRange) ? totalFrames - coveredRange : 0;
+                            if (dStart + coveredRange > trackFrames)
+                                dStart = (trackFrames > coveredRange) ? trackFrames - coveredRange : 0;
                             uploadWaveformDetailTexture(tMut, dStart, fpbUse);
                         }
                         if (tMut->waveformDetailTex) {
                             texId = tMut->waveformDetailTex;
                             uint64_t dRange = (uint64_t)(tMut->waveformDetailEnd - tMut->waveformDetailStart);
                             if (dRange > 0) {
-                                u1 = (float)((double)((int64_t)viewStart - (int64_t)tMut->waveformDetailStart) / (double)dRange);
-                                u2 = (float)((double)((int64_t)viewEnd   - (int64_t)tMut->waveformDetailStart) / (double)dRange);
+                                u1 = (float)((double)((int64_t)drawStartFrame - (int64_t)tMut->waveformDetailStart) / (double)dRange);
+                                u2 = (float)((double)((int64_t)drawEndFrame   - (int64_t)tMut->waveformDetailStart) / (double)dRange);
                             }
                         }
                     } else {
-                        u1 = (float)((double)viewStart / (double)totalFrames);
-                        u2 = (float)((double)viewEnd   / (double)totalFrames);
+                        u1 = (float)((double)drawStartFrame / (double)trackFrames);
+                        u2 = (float)((double)drawEndFrame   / (double)trackFrames);
                     }
 
                     drawList->AddImage(
                         (ImTextureID)(uintptr_t)texId,
-                        ImVec2(cursorPos.x,                  top),
-                        ImVec2(cursorPos.x + waveformSize.x, bottom),
+                        ImVec2(pxLeft,  top),
+                        ImVec2(pxRight, bottom),
                         ImVec2(u1, 0.0f), ImVec2(u2, 1.0f),
                         waveColor);
                     // Bloom layer 3 bounding rect.
                     WaveformDrawCmd cmd;
-                    cmd.x1     = cursorPos.x;
+                    cmd.x1     = pxLeft;
                     cmd.y1     = top;
                     cmd.isRect = true;
-                    cmd.rectX2 = cursorPos.x + waveformSize.x;
+                    cmd.rectX2 = pxRight;
                     cmd.rectY2 = bottom;
                     cmd.color  = waveColor;
                     m_waveformDrawCmds.push_back(cmd);
+
+                    // Fresh-take overlay — paint the frame range covered
+                    // by the most recent recording in orange, on top of
+                    // the standard blue/white waveform. Uses the same
+                    // texture (uv clipped to the take range) so the shape
+                    // stays perfectly aligned with what's underneath.
+                    // The uv basis depends on which texture we picked
+                    // above: OVERVIEW covers [0, trackFrames), DETAIL
+                    // covers [waveformDetailStart, waveformDetailEnd).
+                    size_t fstart = track->freshTakeStart;
+                    size_t fend   = track->freshTakeEnd;
+                    if (fend > fstart && fstart < drawEndFrame && fend > drawStartFrame) {
+                        size_t fs = (fstart > drawStartFrame) ? fstart : drawStartFrame;
+                        size_t fe = (fend   < drawEndFrame)   ? fend   : drawEndFrame;
+                        if (fe > fs) {
+                            float fx1 = cursorPos.x + (float)((double)(fs - viewStart) / (double)visibleFrames) * waveformSize.x;
+                            float fx2 = cursorPos.x + (float)((double)(fe - viewStart) / (double)visibleFrames) * waveformSize.x;
+                            float fu1, fu2;
+                            if (useDetail && tMut->waveformDetailTex) {
+                                uint64_t dRange = (uint64_t)(tMut->waveformDetailEnd - tMut->waveformDetailStart);
+                                if (dRange == 0) { fu1 = 0.0f; fu2 = 0.0f; }
+                                else {
+                                    fu1 = (float)((double)((int64_t)fs - (int64_t)tMut->waveformDetailStart) / (double)dRange);
+                                    fu2 = (float)((double)((int64_t)fe - (int64_t)tMut->waveformDetailStart) / (double)dRange);
+                                }
+                            } else {
+                                fu1 = (float)((double)fs / (double)trackFrames);
+                                fu2 = (float)((double)fe / (double)trackFrames);
+                            }
+                            ImU32 freshColor = IM_COL32(255, 140, 20, 255);
+                            drawList->AddImage(
+                                (ImTextureID)(uintptr_t)texId,
+                                ImVec2(fx1, top), ImVec2(fx2, bottom),
+                                ImVec2(fu1, 0.0f), ImVec2(fu2, 1.0f),
+                                freshColor);
+                            WaveformDrawCmd fresh;
+                            fresh.x1 = fx1; fresh.y1 = top;
+                            fresh.isRect = true;
+                            fresh.rectX2 = fx2; fresh.rectY2 = bottom;
+                            fresh.color = freshColor;
+                            m_waveformDrawCmds.push_back(fresh);
+                        }
+                    }
+                    }
                 }
             }
 
@@ -2332,12 +2981,38 @@ void GUIManager::renderWaveform(float height) {
             drawList->AddLine(ImVec2(cursorPos.x, centerY),
                               ImVec2(cursorPos.x + waveformSize.x, centerY),
                               IM_COL32(80, 80, 80, 255));
-            const char* emptyText = "(no audio loaded)";
+            const char* emptyText = "(no audio)";
             ImVec2 textSize = ImGui::CalcTextSize(emptyText);
             drawList->AddText(ImVec2(cursorPos.x + (waveformSize.x - textSize.x) * 0.5f,
                                      centerY - textSize.y * 0.5f - 12),
                               IM_COL32(120, 120, 120, 255), emptyText);
             ImGui::Separator();
+
+            // Register this empty slot for the shared timeline overlay
+            // so the playhead / markers still draw over it (matching the
+            // behaviour of a loaded track). Uses the same shared timeline
+            // math as the drawn-audio branch above.
+            if (isFirstArrangementTrack) {
+                size_t tlFrames = (m_timelineFrames > 0) ? m_timelineFrames : 1;
+                float  zoomL    = m_displayZoom;
+                size_t visFrames = (size_t)((double)tlFrames / (double)zoomL);
+                if (visFrames < 100) visFrames = 100;
+                size_t viewStartL = 0;
+                if (m_viewCenterPosition > visFrames / 2)
+                    viewStartL = m_viewCenterPosition - visFrames / 2;
+                if (viewStartL + visFrames > tlFrames)
+                    viewStartL = (tlFrames > visFrames) ? tlFrames - visFrames : 0;
+                size_t viewEndL = viewStartL + visFrames;
+                if (viewEndL > tlFrames) viewEndL = tlFrames;
+
+                arrHasDrawnTrack     = true;
+                arrLastCursorX       = cursorPos.x;
+                arrLastWaveW         = waveformSize.x;
+                arrLastViewStart     = viewStartL;
+                arrLastViewEnd       = viewEndL;
+                arrLastVisibleFrames = visFrames;
+            }
+            isFirstArrangementTrack = false;
         }
     }
 
@@ -2428,6 +3103,25 @@ void GUIManager::renderWaveform(float height) {
             storeLineCmd(playbackX, overlayTop, playbackX, overlayBottom, playheadColor, 2.0f);
         }
 
+        // Marker-scroll mode: a full-height white line marks the
+        // currently-selected bookmark so its position (and any E3
+        // edits) are easy to track across every track.
+        if (m_audioEngine->isBookmarkScrollMode()) {
+            int selIdx = m_audioEngine->getSelectedBookmarkIndex();
+            auto allBms = m_audioEngine->getBookmarks();
+            if (selIdx >= 0 && selIdx < (int)allBms.size()) {
+                size_t selFrame = allBms[selIdx].frame;
+                if (selFrame >= arrLastViewStart && selFrame < arrLastViewEnd) {
+                    float sx = frameToX(selFrame);
+                    ImU32 white = IM_COL32(255, 255, 255, 255);
+                    drawList->AddLine(ImVec2(sx, overlayTop),
+                                      ImVec2(sx, overlayBottom),
+                                      white, 2.0f);
+                    storeLineCmd(sx, overlayTop, sx, overlayBottom, white, 2.0f);
+                }
+            }
+        }
+
         // Loop/rec horizontal bars — pinned to the bottom edge of the
         // arrangement child window (does not scroll away). When BOTH
         // markers of a pair are defined but the pair is currently OFF
@@ -2445,15 +3139,12 @@ void GUIManager::renderWaveform(float height) {
                 x = xe + gapLen;
             }
         };
-        auto drawBar = [&](int mA, int mB, ImU32 color) {
-            bool bothOn  = m_audioEngine->isMarkerEnabled(mA) &&
-                           m_audioEngine->isMarkerEnabled(mB);
-            bool bothSet = m_audioEngine->markerEverSet(mA) &&
-                           m_audioEngine->markerEverSet(mB);
-            if (!bothOn && !bothSet) return;
-
-            size_t posA = m_audioEngine->getMarkerPosition(mA);
-            size_t posB = m_audioEngine->getMarkerPosition(mB);
+        // Draws the bottom bar segment between two markers, either solid
+        // (segment is "on") or dashed (segment is "defined but off").
+        // Whether it draws at all is left to the caller (loop/record
+        // states are independent — the yellow segments follow the loop
+        // pair, the red middle follows the record pair).
+        auto drawSegment = [&](size_t posA, size_t posB, ImU32 color, bool solid) {
             size_t drawStart = (posA < arrLastViewStart) ? arrLastViewStart : posA;
             size_t drawEnd   = (posB > arrLastViewEnd)   ? arrLastViewEnd   : posB;
             if (drawStart >= drawEnd)             return;
@@ -2461,16 +3152,43 @@ void GUIManager::renderWaveform(float height) {
             if (drawStart >= arrLastViewEnd)      return;
             float x1 = frameToX(drawStart);
             float x2 = frameToX(drawEnd);
-            if (bothOn) {
+            if (solid) {
                 drawList->AddLine(ImVec2(x1, overlayBottom), ImVec2(x2, overlayBottom), color, 3.0f);
                 storeLineCmd(x1, overlayBottom, x2, overlayBottom, color, 3.0f);
             } else {
                 drawDashed(x1, x2, overlayBottom, color, 3.0f);
             }
         };
-        drawBar(0, 1, yellowColor);   // loop-left  → rec-left
-        drawBar(1, 2, redColor);      // rec-left   → rec-right
-        drawBar(2, 3, yellowColor);   // rec-right  → loop-right
+
+        bool loopDef = m_audioEngine->markerEverSet(0) &&
+                       m_audioEngine->markerEverSet(3);
+        bool loopOn  = m_audioEngine->isMarkerEnabled(0) &&
+                       m_audioEngine->isMarkerEnabled(3);
+        bool recDef  = m_audioEngine->markerEverSet(1) &&
+                       m_audioEngine->markerEverSet(2);
+        bool recOn   = m_audioEngine->isMarkerEnabled(1) &&
+                       m_audioEngine->isMarkerEnabled(2);
+
+        // Yellow — loop pair. Split around the record region when it
+        // exists, otherwise draw one continuous line loop-left → loop-right.
+        if (loopDef) {
+            size_t p0 = m_audioEngine->getMarkerPosition(0);
+            size_t p3 = m_audioEngine->getMarkerPosition(3);
+            if (recDef) {
+                size_t p1 = m_audioEngine->getMarkerPosition(1);
+                size_t p2 = m_audioEngine->getMarkerPosition(2);
+                drawSegment(p0, p1, yellowColor, loopOn);
+                drawSegment(p2, p3, yellowColor, loopOn);
+            } else {
+                drawSegment(p0, p3, yellowColor, loopOn);
+            }
+        }
+        // Red — record pair, whatever the loop is doing.
+        if (recDef) {
+            size_t p1 = m_audioEngine->getMarkerPosition(1);
+            size_t p2 = m_audioEngine->getMarkerPosition(2);
+            drawSegment(p1, p2, redColor, recOn);
+        }
     }
 
     // Capture the wheel-scroll for next frame so the left panel and
@@ -3059,6 +3777,16 @@ void GUIManager::saveSettings() {
     file << "  },\n";
     file << "\n";
 
+    // Per-channel PCA9685 LED brightness (0.0 dark .. 1.0 max), pushed to
+    // the controller as inverted 0-4095 PCA values on startup and on drag.
+    file << "  \"ledBrightness\": [";
+    for (int i = 0; i < 9; i++) {
+        file << m_ledBrightness[i];
+        if (i < 8) file << ", ";
+    }
+    file << "],\n";
+    file << "\n";
+
     // Save velocity curve settings
     if (m_serialController) {
         const VelocityCurve& curve = m_serialController->getVelocityCurve();
@@ -3183,15 +3911,46 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
         file << "      \"muted\":      " << (t->muted ? "true" : "false") << ",\n";
         file << "      \"solo\":       " << (t->solo  ? "true" : "false") << ",\n";
         file << "      \"armed\":      " << (t->armed ? "true" : "false") << ",\n";
-        file << "      \"outputPair\": " << t->outputPair  << "\n";
+        file << "      \"outputPair\":    " << t->outputPair << ",\n";
+        file << "      \"inputPair\":     " << t->inputPair  << ",\n";
+        file << "      \"inputMono\":     " << (t->inputMono ? "true" : "false") << ",\n";
+        file << "      \"inputMonoChan\": " << t->inputMonoChan << ",\n";
+        file << "      \"inputMonitor\":  " << (t->inputMonitor ? "true" : "false") << "\n";
         file << "    }" << (i + 1 < trackCount ? "," : "") << "\n";
+    }
+    file << "  ],\n";
+
+    // Bookmarks — timeline markers dropped via pad 13. Each entry has
+    // a frame position + a user-typed name. Read back on session load.
+    auto escape = [](const std::string& s) {
+        std::string out;
+        for (char c : s) {
+            if (c == '"' || c == '\\') { out += '\\'; out += c; }
+            else if (c == '\n')         out += "\\n";
+            else                        out += c;
+        }
+        return out;
+    };
+    auto bookmarks = m_audioEngine->getBookmarks();
+    file << "  \"bookmarks\": [\n";
+    for (size_t bi = 0; bi < bookmarks.size(); bi++) {
+        file << "    { \"frame\": " << bookmarks[bi].frame
+             << ", \"name\": \"" << escape(bookmarks[bi].name) << "\" }"
+             << (bi + 1 < bookmarks.size() ? "," : "") << "\n";
     }
     file << "  ]\n";
     file << "}\n";
     file.close();
     std::cout << "Session saved to " << filename << std::endl;
     m_currentSessionPath = filename;   // enables Revert
-    if (m_audioEngine) m_audioEngine->clearSessionDirty();
+    if (m_audioEngine) {
+        m_audioEngine->clearSessionDirty();
+        // Tell the engine where to write recorded takes.
+        std::string sdir = filename;
+        size_t slash = sdir.find_last_of("/\\");
+        if (slash != std::string::npos) sdir.resize(slash);
+        m_audioEngine->setSessionDir(sdir);
+    }
 #endif
 }
 
@@ -3290,17 +4049,25 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         bool solo            = keyIn("solo")       != std::string::npos ? readBool(keyIn("solo"))         : false;
         bool armed           = keyIn("armed")      != std::string::npos ? readBool(keyIn("armed"))        : false;
         int outputPair       = keyIn("outputPair") != std::string::npos ? (int)readNumber(keyIn("outputPair")) : 0;
+        int inputPair        = keyIn("inputPair")  != std::string::npos ? (int)readNumber(keyIn("inputPair"))  : 0;
+        bool inputMono       = keyIn("inputMono")  != std::string::npos ? readBool(keyIn("inputMono"))         : false;
+        int inputMonoChan    = keyIn("inputMonoChan") != std::string::npos ? (int)readNumber(keyIn("inputMonoChan")) : 0;
+        bool inputMonitor    = keyIn("inputMonitor") != std::string::npos ? readBool(keyIn("inputMonitor"))    : false;
 
         int newIdx = m_audioEngine->addTrack(name);
         Track* t = m_audioEngine->getTrack(newIdx);
         if (t) {
-            t->name       = name;   // preserve exactly (addTrack may have munged)
-            t->volume     = (float)vol;
-            t->pan        = (float)pan;
-            t->muted      = muted;
-            t->solo       = solo;
-            t->armed      = armed;
-            t->outputPair = outputPair;
+            t->name          = name;   // preserve exactly (addTrack may have munged)
+            t->volume        = (float)vol;
+            t->pan           = (float)pan;
+            t->muted         = muted;
+            t->solo          = solo;
+            t->armed         = armed;
+            t->outputPair    = outputPair;
+            t->inputPair     = inputPair;
+            t->inputMono     = inputMono;
+            t->inputMonoChan = inputMonoChan;
+            t->inputMonitor  = inputMonitor;
         }
         if (!filePath.empty()) {
             m_audioEngine->loadTrackAudio(newIdx, filePath);
@@ -3366,6 +4133,48 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         }
     }
 
+    // Bookmarks array — clear then repopulate.
+    m_audioEngine->clearBookmarks();
+    size_t bookmarksKey = json.find("\"bookmarks\"");
+    if (bookmarksKey != std::string::npos) {
+        size_t arrOpen  = json.find('[', bookmarksKey);
+        size_t arrClose = (arrOpen == std::string::npos)
+                        ? std::string::npos : json.find(']', arrOpen);
+        size_t cur = (arrOpen == std::string::npos) ? std::string::npos : arrOpen;
+        while (cur != std::string::npos && cur < arrClose) {
+            size_t objStart = json.find('{', cur);
+            if (objStart == std::string::npos || objStart >= arrClose) break;
+            size_t objEnd = json.find('}', objStart);
+            if (objEnd == std::string::npos) break;
+            auto bKeyIn = [&](const std::string& key) -> size_t {
+                size_t p = findKeyAfter(key, objStart);
+                return (p != std::string::npos && p < objEnd) ? p : std::string::npos;
+            };
+            size_t frame = 0;
+            std::string name;
+            if (bKeyIn("frame") != std::string::npos) {
+                frame = (size_t)readNumber(bKeyIn("frame"));
+            }
+            size_t namePos = bKeyIn("name");
+            if (namePos != std::string::npos) {
+                // Walk to the value string and read until the closing quote.
+                size_t q1 = json.find('"', json.find(':', namePos));
+                if (q1 != std::string::npos) {
+                    q1++;
+                    size_t q2 = q1;
+                    while (q2 < objEnd) {
+                        if (json[q2] == '\\' && q2 + 1 < objEnd) { q2 += 2; continue; }
+                        if (json[q2] == '"') break;
+                        q2++;
+                    }
+                    name = json.substr(q1, q2 - q1);
+                }
+            }
+            m_audioEngine->addBookmark(frame, name);
+            cur = objEnd + 1;
+        }
+    }
+
     // Selected track last so it wins over anything the loader did.
     size_t selKey = json.find("\"selectedTrack\"");
     if (selKey != std::string::npos) {
@@ -3377,7 +4186,15 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
 
     std::cout << "Session loaded from " << filename << std::endl;
     m_currentSessionPath = filename;   // enables Revert
-    if (m_audioEngine) m_audioEngine->clearSessionDirty();
+    if (m_audioEngine) {
+        m_audioEngine->clearSessionDirty();
+        // Tell the engine where to write recorded takes.
+        std::string sdir = filename;
+        size_t slash = sdir.find_last_of("/\\");
+        if (slash != std::string::npos) sdir.resize(slash);
+        m_audioEngine->setSessionDir(sdir);
+    }
+    retimeArrangement();
 #endif
 }
 
@@ -3397,11 +4214,28 @@ void GUIManager::closeSession() {
         m_audioEngine->deleteTrack(i);
     }
     for (int m = 0; m < 4; m++) m_audioEngine->resetMarker(m);
+    m_audioEngine->clearBookmarks();
     m_audioEngine->setLoopEnabled(false);
     m_audioEngine->setRecordEnabled(false);
     m_audioEngine->setPlaybackPosition(0);
     m_currentSessionPath.clear();
     m_audioEngine->clearSessionDirty();
+    retimeArrangement();
+}
+
+void GUIManager::retimeArrangement() {
+    if (!m_audioEngine) return;
+    size_t maxFrames = m_audioEngine->getTotalFrames();
+    // Fresh sessions default to a 2-minute wide arrangement so the
+    // playhead / markers have room to move around before any audio
+    // exists. Larger sessions extend to fit their longest track.
+    size_t minExtent = (size_t)(m_audioEngine->getSampleRate() * 120.0);
+    if (minExtent < 44100 * 120) minExtent = 44100 * 120;   // fallback pre-audio
+    m_timelineFrames = (maxFrames > minExtent) ? maxFrames : minExtent;
+    // Mirror to the engine so encoder scrub / pan / zoom (which run on
+    // the reader thread, unaware of GUI state) can operate on the same
+    // extent even when no track has audio.
+    m_audioEngine->setTimelineFrames(m_timelineFrames);
 }
 
 void GUIManager::uploadWaveformTexture(Track* t) {
@@ -3640,6 +4474,10 @@ void GUIManager::loadSettings() {
     m_waveformVerticalZoom = getFloat("waveformVerticalZoom", 1.0f);
     m_trackHeight = getFloat("trackHeight", 80.0f);
     m_controllerMode = getInt("controllerMode", 1);  // Default to Custom Mackie
+    // Per-channel LED brightness. Missing key → defaults stay at 1.0 (max).
+    getFloatArray("ledBrightness", m_ledBrightness, 9);
+    // Mark for one-shot push to firmware after the serial controller is up.
+    m_ledBrightnessNeedsPush = true;
 
     // Load audio settings (will be applied after audio engine is ready)
     if (m_audioEngine) {

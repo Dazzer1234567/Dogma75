@@ -279,6 +279,24 @@ void SerialController::sendMessage(const std::string& message) {
     // safe to lose (firmware just uses their arrival time). Any other
     // message is kept.
     std::unique_lock<std::mutex> lock(m_queueMutex);
+
+    // Coalesce brightness updates: a fast slider drag can enqueue dozens
+    // of LEDBRT:<ch>:… messages per second, which then serialise out over
+    // the USB CDC pipe and make the LED lag the pointer by ~1-2 s. Drop
+    // any already-queued LEDBRT for the same channel before enqueueing
+    // the new one — only the newest value matters.
+    if (message.compare(0, 7, "LEDBRT:") == 0) {
+        // Extract "LEDBRT:<ch>:" prefix (channel-scoped).
+        size_t colon = message.find(':', 7);
+        if (colon != std::string::npos) {
+            std::string prefix = message.substr(0, colon + 1);   // "LEDBRT:5:"
+            for (auto it = m_sendQueue.begin(); it != m_sendQueue.end(); ) {
+                if (it->compare(0, prefix.size(), prefix) == 0) it = m_sendQueue.erase(it);
+                else                                            ++it;
+            }
+        }
+    }
+
     if (m_sendQueue.size() >= MAX_QUEUE_SIZE) {
         for (auto it = m_sendQueue.begin(); it != m_sendQueue.end(); ++it) {
             if (*it == "HB") { m_sendQueue.erase(it); break; }

@@ -20,6 +20,8 @@ set(SOURCES
     src/controller/serial_controller.h
     src/gui/gui_manager.cpp
     src/gui/gui_manager.h
+    src/util/daw_log.cpp
+    src/util/daw_log.h
 )
 
 add_executable(MinimalDAW ${SOURCES})

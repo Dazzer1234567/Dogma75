@@ -111,6 +111,32 @@ private:
     // more tracks than fit on screen.
     float m_trackScrollY = 0.0f;
 
+    // Arrangement timeline extent (in frames). Independent of any track's
+    // length — the view stays stable while a take is being recorded, and
+    // stays stable after stop too. Explicitly retimed on session load /
+    // track add / startup via retimeArrangement().
+    size_t m_timelineFrames = 0;
+    // Recomputes m_timelineFrames from the current max track length,
+    // clamped to at least a 30-second minimum so an empty arrangement
+    // doesn't collapse. Call this whenever the "arrangement content"
+    // legitimately changes (session load, track load, initial setup) —
+    // NOT on record stop, so recording never resizes the view.
+    void retimeArrangement();
+
+    // Per-channel PCA9685 LED brightness, 0.0 (dark) .. 1.0 (max). Nine
+    // channels: 0=mute 1=solo 2=arm 3=play 4=loop-L 5=rec-L 6=rec-R
+    // 7=loop-R 8=orange. The LED popup slider writes this and pushes
+    // LEDBRT:ch:value to the firmware (converted / inverted at send time).
+    // Persisted to user_settings.json so restarts preserve the tune.
+    float m_ledBrightness[9] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    // Which channel (if any) is currently in LEDID identify — used only by
+    // the popup so the button knows to end identify on release.
+    int   m_ledIdentifyChannel = -1;
+    // Force a one-shot brightness push on the first render tick after
+    // loadSettings so the firmware picks up the persisted values without
+    // waiting for a slider drag.
+    bool  m_ledBrightnessNeedsPush = true;
+
     // Zoom smoothing toggle
     bool m_zoomSmoothing;
 
@@ -128,6 +154,21 @@ private:
     // user reverses direction.
     int  m_lastZoomDirection = 0;      // +1 zoom-in, -1 zoom-out, 0 = fresh
     bool m_zoomAnchorPinPlayhead = true;
+    // Where on-screen the playhead should stay while zoom is being pinned
+    // to it — captured ONCE at the start of a zoom gesture (or on
+    // direction reversal), then applied each frame from a STABLE value
+    // so we don't feed truncated m_viewCenterPosition back into the pin
+    // math (that feedback loop was causing sub-pixel drift → visible
+    // jitter on ruler ticks / markers close to the playhead).
+    double m_zoomPinScreenFraction = 0.5;
+    // Full-precision view window derived from the same pin math but kept
+    // in doubles. The ruler / bookmark triangles use these directly (via
+    // pixels-per-frame) so a 1-frame truncation of m_viewCenterPosition
+    // can't show up as visible marker jitter when zoomed in tightly.
+    // Only used when non-zero; 0 means "no double view yet, fall back to
+    // integer m_viewCenterPosition".
+    double m_viewStartD       = 0.0;
+    double m_visibleFramesD   = 0.0;
 
 
     // Waveform vertical zoom (amplitude scaling) and track height

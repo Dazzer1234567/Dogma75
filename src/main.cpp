@@ -5,6 +5,22 @@
 #include "audio/audio_engine.h"
 #include "controller/serial_controller.h"
 #include "gui/gui_manager.h"
+#include "util/daw_log.h"
+#ifdef _MSC_VER
+#include <windows.h>
+
+// Helper split out of main() so __try/__except can wrap the render call
+// without confusing the C++ object-unwinding requirements of main.
+static void safeProcessFrame(GUIManager& gui) {
+    __try {
+        gui.processFrame();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        dawLog("!! SEH CRASH in processFrame code=0x%08lx",
+               (unsigned long)GetExceptionCode());
+        dawLogFlush();
+    }
+}
+#endif
 
 int main(int argc, char** argv) {
     std::cout << "==================================" << std::endl;
@@ -126,7 +142,11 @@ int main(int argc, char** argv) {
         auto t2 = std::chrono::steady_clock::now();
         audioEngine.updateController();
         auto t3 = std::chrono::steady_clock::now();
+#ifdef _MSC_VER
+        safeProcessFrame(guiManager);
+#else
         guiManager.processFrame();
+#endif
         auto t4 = std::chrono::steady_clock::now();
 
         auto ms = [](auto a, auto b) {
