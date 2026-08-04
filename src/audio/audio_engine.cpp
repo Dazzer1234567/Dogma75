@@ -1436,8 +1436,11 @@ void AudioEngine::handleResync() {
     m_clearMode.store(false);
     m_scrubResumePending.store(false);
 
-    // Firmware wiped its own MUTEIND state on boot too — push the current
-    // shadow flag so the OLED bar comes back if it was on.
+    // Firmware just booted (RESYNC = fresh controller). Policy: any
+    // DAW-controller reconnect defaults mute OFF, regardless of what the
+    // shadow flag held — that flag only survives an explicit user
+    // session-open. Force flag off + push MUTEIND:0 / OSC unmute.
+    m_totalMixInputPairMuted.store(false);
     syncTotalMixMuteToHardware();
 }
 
@@ -2394,6 +2397,9 @@ void AudioEngine::updateController() {
         m_serialController->sendMessage("SETMODE:DESC");
         pushPlaybackStateToOled();
         syncSoloMuteLedsNow();   // paint the selected track's flags on 0/1
+        // TEMP: light LED 9 to confirm the newly-wired channel works.
+        // Remove once we assign a real meaning to it.
+        m_serialController->sendMessage("LED:9:ON");
     }
 
     // Cheap tick: the DAW's own S/M buttons (or session load) can flip

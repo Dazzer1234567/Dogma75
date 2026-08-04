@@ -307,11 +307,15 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     loadSessionFromFile("c:\\0_CODE\\Dogma75\\Workspace\\can delete\\record test.json");
     retimeArrangement();
 
-    // Belt-and-suspenders sync in case the default session file was missing
-    // (loadSessionFromFile returns early on file-open failure without
-    // running its own sync). Cheap no-op if the file loaded fine and
-    // already synced.
-    if (m_audioEngine) m_audioEngine->syncTotalMixMuteToHardware();
+    // Startup always lands unmuted, regardless of what the auto-loaded
+    // session says. Force the shadow flag off and push MUTEIND:0 + OSC
+    // unmute so both TotalMix and the OLED indicator match. User has to
+    // explicitly open a session (openSession / revertSession) to restore
+    // a saved mute state.
+    if (m_audioEngine) {
+        m_audioEngine->setTotalMixInputPairMuted(false);
+        m_audioEngine->syncTotalMixMuteToHardware();
+    }
 
     m_running = true;
     std::cout << "GUI initialized successfully with OpenGL " << glGetString(GL_VERSION) << std::endl;
@@ -1371,6 +1375,24 @@ void GUIManager::renderToolbar() {
         ImGui::EndPopup();
     }
     ImGui::SameLine();
+
+    // Current session name — filename only, no path or .json extension.
+    // "*" suffix when there are unsaved edits since the last save/load.
+    // "(no session)" when nothing has been opened this run.
+    {
+        std::string label = "(no session)";
+        if (!m_currentSessionPath.empty()) {
+            size_t slash = m_currentSessionPath.find_last_of("/\\");
+            label = (slash == std::string::npos)
+                  ? m_currentSessionPath
+                  : m_currentSessionPath.substr(slash + 1);
+            size_t dot = label.find_last_of('.');
+            if (dot != std::string::npos) label.resize(dot);
+        }
+        if (m_audioEngine && m_audioEngine->isSessionDirty()) label += " *";
+        ImGui::TextUnformatted(label.c_str());
+        ImGui::SameLine();
+    }
 
     // ASIO Device dropdown
     ImGui::Text("ASIO:");
@@ -3986,6 +4008,11 @@ void GUIManager::openSession() {
         saveSettings();
     }
     loadSessionFromFile(filename);
+    // User-triggered open — the loaded mute state IS authoritative here.
+    // Push it to TotalMix + the OLED indicator (loadSessionFromFile
+    // deliberately leaves this to the caller so startup auto-load can
+    // opt out).
+    if (m_audioEngine) m_audioEngine->syncTotalMixMuteToHardware();
 #endif
 }
 
@@ -4222,8 +4249,11 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         size_t slash = sdir.find_last_of("/\\");
         if (slash != std::string::npos) sdir.resize(slash);
         m_audioEngine->setSessionDir(sdir);
-        // Force TotalMix + controller OLED to match the loaded mute state.
-        m_audioEngine->syncTotalMixMuteToHardware();
+        // Mute-to-hardware sync is intentionally NOT called here. Startup
+        // auto-load must always land unmuted regardless of what the file
+        // has — only user-triggered opens (openSession / revertSession)
+        // are allowed to activate mute. Those paths call sync explicitly
+        // right after this returns.
     }
     retimeArrangement();
 #endif
@@ -4235,6 +4265,9 @@ void GUIManager::revertSession() {
     // opened this DAW run.
     if (m_currentSessionPath.empty()) return;
     loadSessionFromFile(m_currentSessionPath);
+    // Same as openSession — user-triggered load pushes the reloaded mute
+    // state to hardware.
+    if (m_audioEngine) m_audioEngine->syncTotalMixMuteToHardware();
 }
 
 void GUIManager::closeSession() {
