@@ -213,6 +213,15 @@ public:
     int64_t consumeRequestedJumpFrame() {
         return m_requestedJumpFrame.exchange(-1);
     }
+    // Companion to consumeRequestedJumpFrame: when >= 0, the GUI should
+    // pan the view so the target frame appears at the same screen X as
+    // this anchor frame WAS before the jump (i.e. shift by target -
+    // anchor). Only used by the loop/punch double-tap path; regular
+    // bookmark nav leaves this at -1 and gets the default "15% from
+    // left" reposition.
+    int64_t consumeRequestedJumpAnchorFrame() {
+        return m_requestedJumpAnchorFrame.exchange(-1);
+    }
     // GUI pushes the arrangement's timeline extent so encoder scrub /
     // pan / zoom can work even when no track has any audio yet (fresh
     // session). Falls back to getTotalFrames() when nothing has been
@@ -555,6 +564,18 @@ private:
     // Set by encoder-driven bookmark nav; GUI consumes and repositions
     // its view so this frame sits 15% from the left of the arrangement.
     std::atomic<int64_t>   m_requestedJumpFrame{-1};
+    // Optional companion — see consumeRequestedJumpAnchorFrame() docs.
+    std::atomic<int64_t>   m_requestedJumpAnchorFrame{-1};
+    // Double-tap detection state for the loop/punch pair pads (20-23).
+    // Same pad tapped twice within 400 ms → recenter the view on the
+    // marker, not just jump the playhead.
+    // m_lastPairPadAnchor: playhead position BEFORE the last tap moved
+    // it. On a double-tap the anchor is what we need — the position at
+    // tap 1, since tap 1's playhead-move has already run by the time
+    // we're in tap 2 and current playhead == marker.
+    int                    m_lastPairPadIdx    = -1;
+    double                 m_lastPairPadTapSec = 0.0;
+    size_t                 m_lastPairPadAnchor = 0;
     // True from stop() until finaliseRecording completes. Callback keeps
     // skipping armed tracks during this window so a concurrent WAV read
     // or a late snapshot tick can't race with playback of the same buffer.

@@ -16,6 +16,7 @@ static void dawLogTrackState(const char* tag, const std::vector<Track>& tracks);
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <set>
 #include <thread>
 
 #ifdef _WIN32
@@ -1770,6 +1771,11 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             if (newPlayPos > (long)totalFrames) newPlayPos = totalFrames;
 
             setPlaybackPosition((size_t)newPlayPos);
+            // Keep the "return-on-stop" anchor in sync with the scrubbed
+            // position. Without this, the stop() we issued to pause for
+            // the scrub would fire a return-jump at fade-out end and
+            // clobber the scrub back to wherever we originally hit play.
+            m_playStartPosition.store((size_t)newPlayPos);
         }
     }
     else if (encoder == 2) {
@@ -2149,10 +2155,14 @@ void AudioEngine::touchHandlePairInClearMode(int pad) {
 }
 
 void AudioEngine::touchHandlePairPad(int markerIdx) {
-    // Pad 20/21/22/23 in normal mode. Three-state:
+    // Pad 20/21/22/23 in normal mode. Four-state:
     //   not defined      -> create pair at defaults + enable, NO jump
     //   defined disabled -> re-enable at preserved positions, NO jump
     //   defined enabled  -> jump playhead to that marker
+    //   defined enabled + double-tap same pad within 400 ms
+    //                    -> also recenter the arrangement view on the
+    //                       marker (via m_requestedJumpFrame — same
+    //                       mechanism bookmark nav uses)
     bool loopSide = (markerIdx == 0 || markerIdx == 3);
     int a = loopSide ? 0 : 1;
     int b = loopSide ? 3 : 2;
@@ -2190,7 +2200,29 @@ void AudioEngine::touchHandlePairPad(int markerIdx) {
         leftEnabled.store(true);
         rightEnabled.store(true);
     } else if (isMarkerEnabled(markerIdx)) {
-        setPlaybackPosition(getMarkerPosition(markerIdx));
+        size_t markerPos = getMarkerPosition(markerIdx);
+        // Position BEFORE this tap's playhead move. Stored for the NEXT
+        // tap so that if a double-tap sequence lands within 400 ms, we
+        // can still recover the "pre-first-tap" playhead position to
+        // use as the view-pan anchor.
+        size_t prevPos = getPlaybackPosition();
+        double nowSec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        bool isDoubleTap = (markerIdx == m_lastPairPadIdx &&
+                            (nowSec - m_lastPairPadTapSec) < 0.4);
+        setPlaybackPosition(markerPos);
+        // Double-tap: pan the arrangement view so the marker sits under
+        // wherever the play line was BEFORE the first of the two taps
+        // moved it (m_lastPairPadAnchor was captured then). Zoom
+        // unchanged. Anchor==target on a first-tap is what we want on a
+        // fresh single tap — no view shift there.
+        if (isDoubleTap) {
+            m_requestedJumpAnchorFrame.store((int64_t)m_lastPairPadAnchor);
+            m_requestedJumpFrame.store((int64_t)markerPos);
+        }
+        m_lastPairPadIdx    = markerIdx;
+        m_lastPairPadTapSec = nowSec;
+        m_lastPairPadAnchor = prevPos;
     }
     if (loopSide) syncLoopPairLedsNow();
     else          syncRecordPairLedsNow();
@@ -2249,17 +2281,45 @@ static int trackOutputChannels(const Track& t, int (&out)[2]) {
     return 2;
 }
 
+// Aggregate the desired mute state for a mixer channel across ALL
+// tracks that route audio to it. Rule: if ANY track with a monitor
+// button ON routes to this channel we UNMUTE it; only when every
+// track routing to it has monitor OFF do we mute. Otherwise two
+// tracks sharing a channel would fight — the later one's write would
+// silently override the earlier one's, which was the fingerprint of
+// the startup-sync bug.
+static bool channelShouldBeMuted(const std::vector<Track>& tracks, int channelId1Based) {
+    bool anyRoutedHere = false;
+    for (const auto& t : tracks) {
+        int chans[2];
+        int nc = trackOutputChannels(t, chans);
+        for (int i = 0; i < nc; i++) {
+            if (chans[i] != channelId1Based) continue;
+            anyRoutedHere = true;
+            if (t.inputMonitor) return false;  // ANY unmuted wins
+        }
+    }
+    // If no track routes to this channel we don't touch it. Caller
+    // shouldn't call us in that case, but be safe: default to "muted"
+    // (a no-op relative to whatever the interface has for that ch).
+    return anyRoutedHere ? true : true;
+}
+
 void AudioEngine::setTrackInputMonitor(int trackIndex, bool on) {
     Track* t = getTrack(trackIndex);
     if (!t) return;
     t->inputMonitor = on;
     markSessionDirty();
-    // Push to the Antelope mixer: monitor OFF = mute, monitor ON = unmute.
+    // Push to the Antelope mixer, re-aggregating across ALL tracks so
+    // shared channels don't get stomped by whichever track we handled
+    // last. Only touches the channels this track routes to — other
+    // channels stay at whatever state the previous sync left them.
     if (m_antelope) {
         int chans[2];
         int nc = trackOutputChannels(*t, chans);
         for (int i = 0; i < nc; i++) {
-            m_antelope->setChannelMute(chans[i], /*muted=*/ !on);
+            bool mute = channelShouldBeMuted(m_tracks, chans[i]);
+            m_antelope->setChannelMute(chans[i], mute);
         }
     }
     // Refresh LED 9 immediately so the pad-side feedback matches state.
@@ -2267,14 +2327,29 @@ void AudioEngine::setTrackInputMonitor(int trackIndex, bool on) {
 }
 
 void AudioEngine::syncAllInputMonitorsToAntelope() {
-    if (!m_antelope) return;
+    if (!m_antelope) {
+        dawLog("syncAllInputMonitorsToAntelope: skipped (Antelope client not initialised)");
+        return;
+    }
+    // Build the unique set of channels that any track routes to, then
+    // send ONE mute command per channel — aggregating monitor states
+    // across all tracks routed to it. Otherwise two tracks sharing a
+    // channel race and the second one's write always wins, which was
+    // the startup-sync bug.
+    std::set<int> uniqueChans;
     for (const auto& t : m_tracks) {
         int chans[2];
         int nc = trackOutputChannels(t, chans);
-        for (int i = 0; i < nc; i++) {
-            m_antelope->setChannelMute(chans[i], /*muted=*/ !t.inputMonitor);
-        }
+        for (int i = 0; i < nc; i++) uniqueChans.insert(chans[i]);
     }
+    int nMuted = 0, nUnmuted = 0;
+    for (int ch : uniqueChans) {
+        bool mute = channelShouldBeMuted(m_tracks, ch);
+        m_antelope->setChannelMute(ch, mute);
+        if (mute) nMuted++; else nUnmuted++;
+    }
+    dawLog("syncAllInputMonitorsToAntelope: %zu tracks → %d channels muted, %d unmuted (unique chans=%zu)",
+           m_tracks.size(), nMuted, nUnmuted, uniqueChans.size());
 }
 
 // -------------- Top-level touch dispatcher --------------

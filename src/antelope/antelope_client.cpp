@@ -186,10 +186,14 @@ void AntelopeClient::sendSetMixerCfg(int mixerId, int channelId,
     // (which re-does the initialize_format handshake) and retry once.
     if (!trySendLocked(hdr, 4, body, n)) {
         if (connectLocked()) {
-            trySendLocked(hdr, 4, body, n);
+            if (trySendLocked(hdr, 4, body, n)) {
+                dawLog("AntelopeClient: sent (after reconnect) %s", body);
+            }
         } else {
             dawLog("AntelopeClient: reconnect failed, message dropped");
         }
+    } else {
+        dawLog("AntelopeClient: sent %s", body);
     }
 }
 
@@ -203,6 +207,9 @@ AntelopeClient::ChState AntelopeClient::stateFor(int mixerId, int channelId) con
 void AntelopeClient::setChannelMute(int channelId1Based, bool muted) {
     if (channelId1Based <= 0) return;
     ChState s = stateFor(/*mixerId*/ 0, channelId1Based);
+    dawLog("AntelopeClient: setChannelMute ch=%d mute=%d (cached L=%d P=%d S=%d Snd=%d valid=%d)",
+           channelId1Based, muted ? 1 : 0,
+           s.level, s.pan, s.solo, s.send, s.valid ? 1 : 0);
     sendSetMixerCfg(/*mixerId*/ 0,
                     channelId1Based,
                     s.level, s.pan,
@@ -350,8 +357,12 @@ void AntelopeClient::readerLoop() {
                     ChState st{
                         vals[2], vals[3], vals[4], vals[5], vals[6], true,
                     };
-                    std::lock_guard<std::mutex> lock(m_stateMutex);
-                    m_state[stateKey(vals[0], vals[1])] = st;
+                    {
+                        std::lock_guard<std::mutex> lock(m_stateMutex);
+                        m_state[stateKey(vals[0], vals[1])] = st;
+                    }
+                    dawLog("AntelopeClient: rx set_mixer_cfg mix=%d ch=%d L=%d P=%d M=%d S=%d Snd=%d",
+                           vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6]);
                 }
 
                 buf.erase(buf.begin(), buf.begin() + frameLen);

@@ -1009,40 +1009,61 @@ private:
 void GUIManager::processFrame() {
 #ifdef SDL2_FOUND
 #ifdef IMGUI_FOUND
-    // Pad-13 + E1 posts a jump-to-bookmark request via AudioEngine; when
-    // one is waiting, recentre the arrangement view so the target frame
-    // sits 15% in from the left edge. Zoom is unchanged.
+    // Two paths post a jump request via AudioEngine:
+    //   * Pad-13 + E1 bookmark nav → anchor is -1 → "recentre so the
+    //     target frame sits 15% from the left" (only if off-screen).
+    //   * Loop/punch double-tap → anchor is the OLD playhead frame →
+    //     pan the view by (target - anchor) so the marker lands under
+    //     wherever the play line was drawn. Zoom unchanged in both.
     if (m_audioEngine) {
-        int64_t jumpFrame = m_audioEngine->consumeRequestedJumpFrame();
+        int64_t anchorFrame = m_audioEngine->consumeRequestedJumpAnchorFrame();
+        int64_t jumpFrame   = m_audioEngine->consumeRequestedJumpFrame();
         if (jumpFrame >= 0 && m_timelineFrames > 0) {
             float zoom = m_displayZoom > 0.0f ? m_displayZoom : 1.0f;
             size_t vis = (size_t)((double)m_timelineFrames / (double)zoom);
             if (vis < 100) vis = 100;
-            // Current viewStart derived from centre — same math the
-            // arrangement uses. If the marker is already visible, don't
-            // reposition; only snap when it's off-screen.
-            size_t curStart = 0;
-            if (m_viewCenterPosition > vis / 2)
-                curStart = m_viewCenterPosition - vis / 2;
-            if (curStart + vis > m_timelineFrames)
-                curStart = (m_timelineFrames > vis) ? m_timelineFrames - vis : 0;
-            size_t curEnd = curStart + vis;
-            bool onScreen = ((size_t)jumpFrame >= curStart &&
-                             (size_t)jumpFrame <  curEnd);
-            if (onScreen) {
-                dawLog("GUI jump: frame=%lld already on-screen (view=[%zu..%zu]) — no snap",
-                       (long long)jumpFrame, curStart, curEnd);
+
+            if (anchorFrame >= 0) {
+                // Anchor-pin path: shift viewCenter by exactly the
+                // playhead delta so the play line stays at the same
+                // screen X while the underlying frame changes.
+                long long delta = jumpFrame - anchorFrame;
+                long long newCenter = (long long)m_viewCenterPosition + delta;
+                // Clamp so we don't overshoot the ends of the timeline.
+                long long minCenter = (long long)(vis / 2);
+                long long maxCenter = (long long)m_timelineFrames - (long long)(vis / 2);
+                if (maxCenter < minCenter) maxCenter = minCenter;
+                if (newCenter < minCenter) newCenter = minCenter;
+                if (newCenter > maxCenter) newCenter = maxCenter;
+                m_viewCenterPosition = (size_t)newCenter;
+                dawLog("GUI jump: anchor=%lld target=%lld delta=%+lld → viewCenter=%zu",
+                       (long long)anchorFrame, (long long)jumpFrame,
+                       delta, m_viewCenterPosition);
             } else {
-                // Off-screen: reposition so marker sits 15% from left.
-                long long viewStart = (long long)jumpFrame
-                                    - (long long)((double)vis * 0.15);
-                if (viewStart < 0) viewStart = 0;
-                if ((size_t)viewStart + vis > m_timelineFrames)
-                    viewStart = (m_timelineFrames > vis)
-                              ? (long long)(m_timelineFrames - vis) : 0;
-                m_viewCenterPosition = (size_t)viewStart + vis / 2;
-                dawLog("GUI jump: frame=%lld off-screen → viewCenter=%zu (vis=%zu)",
-                       (long long)jumpFrame, m_viewCenterPosition, vis);
+                // Bookmark-nav path: 15%-from-left if the target is
+                // currently off-screen; otherwise leave the view alone.
+                size_t curStart = 0;
+                if (m_viewCenterPosition > vis / 2)
+                    curStart = m_viewCenterPosition - vis / 2;
+                if (curStart + vis > m_timelineFrames)
+                    curStart = (m_timelineFrames > vis) ? m_timelineFrames - vis : 0;
+                size_t curEnd = curStart + vis;
+                bool onScreen = ((size_t)jumpFrame >= curStart &&
+                                 (size_t)jumpFrame <  curEnd);
+                if (onScreen) {
+                    dawLog("GUI jump: frame=%lld already on-screen (view=[%zu..%zu]) — no snap",
+                           (long long)jumpFrame, curStart, curEnd);
+                } else {
+                    long long viewStart = (long long)jumpFrame
+                                        - (long long)((double)vis * 0.15);
+                    if (viewStart < 0) viewStart = 0;
+                    if ((size_t)viewStart + vis > m_timelineFrames)
+                        viewStart = (m_timelineFrames > vis)
+                                  ? (long long)(m_timelineFrames - vis) : 0;
+                    m_viewCenterPosition = (size_t)viewStart + vis / 2;
+                    dawLog("GUI jump: frame=%lld off-screen → viewCenter=%zu (vis=%zu)",
+                           (long long)jumpFrame, m_viewCenterPosition, vis);
+                }
             }
         }
     }
@@ -3212,13 +3233,48 @@ void GUIManager::renderWaveform(float height) {
             m_lineDrawCmds.push_back(textCmd);
         }
 
-        // Playhead — same fixed vertical span as the markers.
+        // Playhead — same fixed vertical span as the markers. If it
+        // lands on top of an enabled loop/punch marker (within a couple
+        // of pixels — screen-space, not frame-space, since one pixel
+        // covers many frames when zoomed out), switch to dashed so the
+        // marker's yellow/red bar shows through the gaps and you can
+        // tell they're stacked instead of losing the marker under the
+        // solid green line.
         if (playbackPos >= arrLastViewStart && playbackPos < arrLastViewEnd) {
             float playbackX = frameToX(playbackPos);
-            drawList->AddLine(ImVec2(playbackX, overlayTop),
-                              ImVec2(playbackX, overlayBottom),
-                              playheadColor, 2.0f);
-            storeLineCmd(playbackX, overlayTop, playbackX, overlayBottom, playheadColor, 2.0f);
+            bool overMarker = false;
+            for (int m = 0; m < 4; m++) {
+                if (!m_audioEngine->isMarkerEnabled(m)) continue;
+                size_t mp = m_audioEngine->getMarkerPosition(m);
+                if (mp < arrLastViewStart || mp >= arrLastViewEnd) continue;
+                if (std::fabs(frameToX(mp) - playbackX) < 3.0f) {
+                    overMarker = true;
+                    break;
+                }
+            }
+            if (overMarker) {
+                // Dashed pattern: 6 px dash, 4 px gap. Same colour and
+                // thickness as the solid playhead. Each segment fed to
+                // both the ImGui drawList (visible immediately) and the
+                // stored line list (for the bloom pass).
+                const float dashLen = 18.0f;
+                const float gapLen  = 12.0f;
+                float y = overlayTop;
+                while (y < overlayBottom) {
+                    float y2 = y + dashLen;
+                    if (y2 > overlayBottom) y2 = overlayBottom;
+                    drawList->AddLine(ImVec2(playbackX, y),
+                                      ImVec2(playbackX, y2),
+                                      playheadColor, 2.0f);
+                    storeLineCmd(playbackX, y, playbackX, y2, playheadColor, 2.0f);
+                    y = y2 + gapLen;
+                }
+            } else {
+                drawList->AddLine(ImVec2(playbackX, overlayTop),
+                                  ImVec2(playbackX, overlayBottom),
+                                  playheadColor, 2.0f);
+                storeLineCmd(playbackX, overlayTop, playbackX, overlayBottom, playheadColor, 2.0f);
+            }
         }
 
         // Marker-scroll mode: a full-height white line marks the
