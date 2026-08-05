@@ -24,6 +24,8 @@ set(SOURCES
     src/util/daw_log.h
     src/osc/osc_sender.cpp
     src/osc/osc_sender.h
+    src/antelope/antelope_client.cpp
+    src/antelope/antelope_client.h
 )
 
 add_executable(MinimalDAW ${SOURCES})

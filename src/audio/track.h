@@ -19,7 +19,9 @@ struct Track {
     float pan = 0.0f;       // -1.0 = left, 0.0 = center, 1.0 = right
     bool muted = false;
     bool solo = false;
-    int outputPair = 0;     // Which stereo pair to output to
+    int outputPair = 0;     // Which stereo pair to output to (used when outputMono is false)
+    int outputMonoChan = 0; // Mono output channel index (0 = channel 1, 1 = channel 2, ...)
+    bool outputMono = false;// false = play into outputPair (stereo), true = play into outputMonoChan
     int inputPair = 0;      // Stereo pair index (0 = channels 1-2, 1 = 3-4, ...)
     int inputMonoChan = 0;  // Mono channel index (0 = channel 1, 1 = channel 2, ...)
     bool inputMono = false; // false = record from inputPair (stereo), true = from inputMonoChan

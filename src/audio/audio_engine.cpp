@@ -1,6 +1,7 @@
 #include "audio_engine.h"
 #include "../util/daw_log.h"
 #include "../osc/osc_sender.h"
+#include "../antelope/antelope_client.h"
 #include <iostream>
 
 // Forward-declared logging helper defined further down (uses Track from
@@ -138,6 +139,14 @@ bool AudioEngine::initialize() {
         dawLog("OSC: sending to 127.0.0.1:7001");
     }
 
+    // Antelope AudioServer TCP client. Used to control mute on the
+    // interface's mixer when track input monitors toggle. Failure is
+    // non-fatal (the Antelope may not be up yet).
+    m_antelope = std::make_unique<AntelopeClient>();
+    if (!m_antelope->init("127.0.0.1", 2021)) {
+        dawLog("Antelope: init to 127.0.0.1:2021 failed (will retry never)");
+    }
+
     return true;
 }
 
@@ -151,6 +160,11 @@ void AudioEngine::shutdown() {
     if (m_osc) {
         m_osc->shutdown();
         m_osc.reset();
+    }
+
+    if (m_antelope) {
+        m_antelope->shutdown();
+        m_antelope.reset();
     }
 
 #ifdef PORTAUDIO_FOUND
@@ -332,6 +346,9 @@ void AudioEngine::ensureRecordSlots() {
     while (m_recordSlots.size() < m_tracks.size()) {
         m_recordSlots.emplace_back(std::make_unique<RecordSlot>());
     }
+    while (m_trackMeters.size() < m_tracks.size()) {
+        m_trackMeters.emplace_back(std::make_unique<std::atomic<float>>(0.0f));
+    }
 }
 
 void AudioEngine::setSessionDir(const std::string& dir) {
@@ -366,6 +383,8 @@ void AudioEngine::undoSnapshot() {
         s.armed         = t.armed;
         s.inputMonitor  = t.inputMonitor;
         s.outputPair    = t.outputPair;
+        s.outputMonoChan= t.outputMonoChan;
+        s.outputMono    = t.outputMono;
         s.inputPair     = t.inputPair;
         s.inputMonoChan = t.inputMonoChan;
         s.inputMono     = t.inputMono;
@@ -595,6 +614,8 @@ bool AudioEngine::undoPop() {
         t.armed         = s.armed;
         t.inputMonitor  = s.inputMonitor;
         t.outputPair    = s.outputPair;
+        t.outputMonoChan= s.outputMonoChan;
+        t.outputMono    = s.outputMono;
         t.inputPair     = s.inputPair;
         t.inputMonoChan = s.inputMonoChan;
         t.inputMono     = s.inputMono;
@@ -2213,6 +2234,49 @@ void AudioEngine::syncTotalMixMuteToHardware() {
            m_serialController ? "on" : "off");
 }
 
+// -------------- Antelope input-monitor plumbing --------------
+
+// Return the 1-based mixer channel id(s) that a track's output routes
+// to. `out[0]` and `out[1]` are filled; return value is how many were
+// populated (1 for mono, 2 for stereo).
+static int trackOutputChannels(const Track& t, int (&out)[2]) {
+    if (t.outputMono) {
+        out[0] = t.outputMonoChan + 1;
+        return 1;
+    }
+    out[0] = t.outputPair * 2 + 1;
+    out[1] = t.outputPair * 2 + 2;
+    return 2;
+}
+
+void AudioEngine::setTrackInputMonitor(int trackIndex, bool on) {
+    Track* t = getTrack(trackIndex);
+    if (!t) return;
+    t->inputMonitor = on;
+    markSessionDirty();
+    // Push to the Antelope mixer: monitor OFF = mute, monitor ON = unmute.
+    if (m_antelope) {
+        int chans[2];
+        int nc = trackOutputChannels(*t, chans);
+        for (int i = 0; i < nc; i++) {
+            m_antelope->setChannelMute(chans[i], /*muted=*/ !on);
+        }
+    }
+    // Refresh LED 9 immediately so the pad-side feedback matches state.
+    syncInputMonitorLedNow();
+}
+
+void AudioEngine::syncAllInputMonitorsToAntelope() {
+    if (!m_antelope) return;
+    for (const auto& t : m_tracks) {
+        int chans[2];
+        int nc = trackOutputChannels(t, chans);
+        for (int i = 0; i < nc; i++) {
+            m_antelope->setChannelMute(chans[i], /*muted=*/ !t.inputMonitor);
+        }
+    }
+}
+
 // -------------- Top-level touch dispatcher --------------
 
 void AudioEngine::handleTouch(int pad, bool pressed) {
@@ -2264,16 +2328,15 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     if (pad == 3)  { m_pad3Held.store(pressed);        return; }
     if (pad == 14) { m_pad14Held.store(pressed);       return; }
 
-    // Pad 35 — toggle input monitor on the selected track. LED 9 mirrors
-    // the state (see syncInputMonitorLedNow), and undoSnapshot at the top
-    // of handleTouch already captured the pre-press state so undo works.
+    // Pad 35 — toggle input monitor on the selected track. Delegates to
+    // setTrackInputMonitor so the Antelope mixer mute stays in sync,
+    // LED 9 mirrors the state, and undoSnapshot at the top of handleTouch
+    // already captured the pre-press state so undo works.
     if (pad == 35 && pressed) {
         int sel = getSelectedTrack();
         Track* t = getTrack(sel);
         if (t) {
-            t->inputMonitor = !t->inputMonitor;
-            markSessionDirty();
-            syncInputMonitorLedNow();
+            setTrackInputMonitor(sel, !t->inputMonitor);
         }
         return;
     }
@@ -2871,6 +2934,11 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
     float* out = static_cast<float*>(outputBuffer);
     const float* in = static_cast<const float*>(inputBuffer);   // may be null if no input
 
+    // Playback position at the START of this buffer, captured before any
+    // branch advances it. Used by the per-track meter pass at the end so
+    // the meter reflects the samples actually rendered THIS callback.
+    const size_t bufStartPlayPos = m_playbackPosition.load();
+
     // ---- Record capture ----
     // While m_recordActive, for each armed track with a valid input
     // channel/pair on this device, append input samples to the track's
@@ -2938,52 +3006,17 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
     bool   recGated     = (recGateEnd > recGateStart);
 
     // ---- Input monitor ----
-    // For every track with inputMonitor == true, mix that track's input
-    // channel(s) into its output pair using the same volume + pan
-    // convention as regular playback. Mono input → duplicated to L and R
-    // of the output pair (with pan attenuating either side). Runs before
-    // the output buffer is cleared below, so we clear it first.
+    // Historically the DAW itself performed input monitoring by mixing
+    // each armed input straight to its track's output. That path is
+    // retired: monitoring now happens on the Antelope interface (via
+    // its own mixer), and the track's `inputMonitor` flag just controls
+    // the corresponding mixer-channel mute on the Antelope through
+    // setTrackInputMonitor(). We still zero the output buffer here so
+    // subsequent playback paths can mix with += the way they did before.
     if (in != nullptr && m_maxInputChannels > 0) {
-        s_audioCallbackRegion.store(2);   // input-monitor
-        // Zero the output buffer here rather than in the loop below so
-        // the monitor's writes survive the clear pass. The playback
-        // paths further down use += (mix), same as us.
+        s_audioCallbackRegion.store(2);   // (kept slot number for parity)
         for (int i = 0; i < (int)(framesPerBuffer * m_maxOutputChannels); i++) {
             out[i] = 0.0f;
-        }
-
-        for (const auto& track : m_tracks) {
-            if (!track.inputMonitor) continue;
-            int outL = track.outputPair * 2;
-            int outR = outL + 1;
-            if (outL < 0 || outL >= m_maxOutputChannels) continue;
-
-            float panLeft  = (track.pan <= 0) ? 1.0f : (1.0f - track.pan);
-            float panRight = (track.pan >= 0) ? 1.0f : (1.0f + track.pan);
-            float gL = track.volume * panLeft;
-            float gR = track.volume * panRight;
-
-            if (track.inputMono) {
-                int ch = track.inputMonoChan;
-                if (ch < 0 || ch >= m_maxInputChannels) continue;
-                for (unsigned long f = 0; f < framesPerBuffer; f++) {
-                    float s = in[f * m_maxInputChannels + ch];
-                    out[f * m_maxOutputChannels + outL] += s * gL;
-                    if (outR < m_maxOutputChannels)
-                        out[f * m_maxOutputChannels + outR] += s * gR;
-                }
-            } else {
-                int chL = track.inputPair * 2;
-                int chR = chL + 1;
-                if (chL < 0 || chR >= m_maxInputChannels) continue;
-                for (unsigned long f = 0; f < framesPerBuffer; f++) {
-                    float sL = in[f * m_maxInputChannels + chL];
-                    float sR = in[f * m_maxInputChannels + chR];
-                    out[f * m_maxOutputChannels + outL] += sL * gL;
-                    if (outR < m_maxOutputChannels)
-                        out[f * m_maxOutputChannels + outR] += sR * gR;
-                }
-            }
         }
     }
     // Detect the play->stop transition and queue a return-to-start jump
@@ -3083,13 +3116,18 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     leftSample *= panLeft;
                     rightSample *= panRight;
 
-                    int trackLeftChan = track.outputPair * 2;
-                    int trackRightChan = track.outputPair * 2 + 1;
-
-                    if (trackLeftChan < m_maxOutputChannels)
-                        out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
-                    if (trackRightChan < m_maxOutputChannels)
-                        out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                    if (track.outputMono) {
+                        int c = track.outputMonoChan;
+                        if (c >= 0 && c < m_maxOutputChannels)
+                            out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
+                    } else {
+                        int trackLeftChan  = track.outputPair * 2;
+                        int trackRightChan = trackLeftChan + 1;
+                        if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
+                            out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
+                        if (trackRightChan < m_maxOutputChannels)
+                            out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                    }
                 }
 
                 pos += scrubRate;
@@ -3214,13 +3252,18 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     leftSample  *= panLeft  * m_playFadeGain;
                     rightSample *= panRight * m_playFadeGain;
 
-                    int trackLeftChan = track.outputPair * 2;
-                    int trackRightChan = track.outputPair * 2 + 1;
-
-                    if (trackLeftChan < m_maxOutputChannels)
-                        out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
-                    if (trackRightChan < m_maxOutputChannels)
-                        out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                    if (track.outputMono) {
+                        int c = track.outputMonoChan;
+                        if (c >= 0 && c < m_maxOutputChannels)
+                            out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
+                    } else {
+                        int trackLeftChan  = track.outputPair * 2;
+                        int trackRightChan = trackLeftChan + 1;
+                        if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
+                            out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
+                        if (trackRightChan < m_maxOutputChannels)
+                            out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                    }
                 }
 
                 // Advance playhead whether we're actively playing OR just
@@ -3274,6 +3317,67 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
         }
         // Overwrite (peak-hold decay handled on the GUI side).
         m_lastPeak.store(peak);
+    }
+
+    // Per-track meters: one entry per track, atomic so the GUI thread
+    // can read without a lock. Meters whatever the track is set to hear:
+    //   inputMonitor on → the raw ASIO input for the track's input pair
+    //                    / mono channel (unaffected by mute/solo — it's
+    //                    what the Antelope is monitoring on that channel)
+    //   inputMonitor off → the track's playback samples at the current
+    //                     playhead, gated by mute/solo like the mixer.
+    // Both include the track's volume so the meter tracks audible level.
+    {
+        bool anySolo = false;
+        for (const auto& track : m_tracks) {
+            if (track.solo) { anySolo = true; break; }
+        }
+        bool playbackActive = playing || m_playFadeGain > 0.0f;
+
+        for (size_t ti = 0; ti < m_tracks.size() && ti < m_trackMeters.size(); ti++) {
+            const Track& t = m_tracks[ti];
+            float peak = 0.0f;
+
+            if (t.inputMonitor && in != nullptr && m_maxInputChannels > 0) {
+                if (t.inputMono) {
+                    int ch = t.inputMonoChan;
+                    if (ch >= 0 && ch < m_maxInputChannels) {
+                        for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                            float a = std::fabs(in[f * m_maxInputChannels + ch]);
+                            if (a > peak) peak = a;
+                        }
+                    }
+                } else {
+                    int chL = t.inputPair * 2;
+                    int chR = chL + 1;
+                    if (chL >= 0 && chR < m_maxInputChannels) {
+                        for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                            float aL = std::fabs(in[f * m_maxInputChannels + chL]);
+                            float aR = std::fabs(in[f * m_maxInputChannels + chR]);
+                            if (aL > peak) peak = aL;
+                            if (aR > peak) peak = aR;
+                        }
+                    }
+                }
+            } else if (t.hasAudio() && playbackActive && !t.muted &&
+                       !(anySolo && !t.solo)) {
+                // Match the playback branch's mute/solo gating so a
+                // silenced track meters silent — otherwise a soloed-out
+                // track would still show its source signal level.
+                size_t trackFrames = t.getTotalFrames();
+                for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                    size_t p = bufStartPlayPos + f;
+                    if (p >= trackFrames) break;
+                    float aL = std::fabs(t.getSample(p, 0)) * t.volume;
+                    if (aL > peak) peak = aL;
+                    if (t.channels > 1) {
+                        float aR = std::fabs(t.getSample(p, 1)) * t.volume;
+                        if (aR > peak) peak = aR;
+                    }
+                }
+            }
+            m_trackMeters[ti]->store(peak);
+        }
     }
 
     return 0;
@@ -3447,6 +3551,9 @@ void AudioEngine::deleteTrack(int trackIndex) {
     if (trackIndex < (int)m_recordSlots.size()) {
         m_recordSlots.erase(m_recordSlots.begin() + trackIndex);
     }
+    if (trackIndex < (int)m_trackMeters.size()) {
+        m_trackMeters.erase(m_trackMeters.begin() + trackIndex);
+    }
 
     if (m_tracks.empty()) {
         m_selectedTrack = -1;
@@ -3464,6 +3571,12 @@ Track* AudioEngine::getTrack(int trackIndex) {
 const Track* AudioEngine::getTrack(int trackIndex) const {
     if (trackIndex < 0 || trackIndex >= static_cast<int>(m_tracks.size())) return nullptr;
     return &m_tracks[trackIndex];
+}
+
+float AudioEngine::getTrackMeter(int trackIndex) const {
+    if (trackIndex < 0 || trackIndex >= static_cast<int>(m_trackMeters.size())) return 0.0f;
+    const auto& m = m_trackMeters[trackIndex];
+    return m ? m->load() : 0.0f;
 }
 
 bool AudioEngine::loadTrackAudio(int trackIndex, const std::string& filepath) {

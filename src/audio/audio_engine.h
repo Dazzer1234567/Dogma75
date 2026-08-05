@@ -11,6 +11,7 @@
 #include "../controller/serial_controller.h"
 
 class OscSender;
+class AntelopeClient;
 
 // ---- Undo history ----
 // One entry captures the "user-visible session state" before an action ran.
@@ -27,6 +28,8 @@ struct UndoTrackState {
     bool        armed;
     bool        inputMonitor;
     int         outputPair;
+    int         outputMonoChan;
+    bool        outputMono;
     int         inputPair;
     int         inputMonoChan;
     bool        inputMono;
@@ -156,6 +159,11 @@ public:
     int getTrackCount() const { return static_cast<int>(m_tracks.size()); }
     Track* getTrack(int trackIndex);
     const Track* getTrack(int trackIndex) const;
+    // Current instantaneous peak (0..1) for a track's channel-strip
+    // meter. Meters whatever the track is set to hear: input signal if
+    // inputMonitor is on, playback output otherwise. Callers apply
+    // their own decay/smoothing when displaying.
+    float getTrackMeter(int trackIndex) const;
     int getSelectedTrack() const { return m_selectedTrack; }
     void setSelectedTrack(int trackIndex) { m_selectedTrack = trackIndex; }
     bool loadTrackAudio(int trackIndex, const std::string& filepath);
@@ -504,6 +512,14 @@ private:
         int                channels = 0;   // 1 (mono) or 2 (stereo) this take
     };
     std::vector<std::unique_ptr<RecordSlot>> m_recordSlots;
+
+    // Per-track peak meter, parallel to m_tracks. Written by the audio
+    // thread (peak-detect over each callback's samples — input signal
+    // when the track's monitor is on, playback when off) and read by
+    // the GUI. Stored via unique_ptr because atomic<float> is neither
+    // copyable nor movable, so a bare vector wouldn't support push_back.
+    std::vector<std::unique_ptr<std::atomic<float>>> m_trackMeters;
+
     std::atomic<bool>  m_recordActive{false};   // callback captures while true
     // If the record pair (markers 1 & 2) is enabled when a take begins,
     // capture is gated to the frame range [recLeft, recRight) — the
@@ -697,6 +713,21 @@ private:
     // OSC sender to TotalMix FX (default 127.0.0.1:7001). Held as
     // unique_ptr so audio_engine.h stays free of Winsock includes.
     std::unique_ptr<OscSender> m_osc;
+    // TCP client to the Antelope AudioServer (127.0.0.1:2021). Used to
+    // mute/unmute Antelope mixer channels when a track's input-monitor
+    // flag flips — the actual monitoring happens on the interface, not
+    // in the DAW.
+    std::unique_ptr<AntelopeClient> m_antelope;
+public:
+    // Toggle a track's inputMonitor flag AND push the resulting mute
+    // state to the Antelope mixer for the channel(s) that track routes
+    // to. Sync sites (pad 35, GUI "I" button, session load) all funnel
+    // through this so the CP and our LED stay consistent.
+    void setTrackInputMonitor(int trackIndex, bool on);
+    // Re-push every track's monitor→mute mapping to Antelope. Call after
+    // AntelopeClient connects or a session loads.
+    void syncAllInputMonitorsToAntelope();
+private:
     // Toggle one TotalMix strip mute via /1/mute/1/<stripIndex>. TotalMix
     // strips are already stereo-linked in the mixer, so one message mutes
     // the whole pair. Strip index maps to the current bank layout — with

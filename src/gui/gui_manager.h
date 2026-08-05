@@ -111,6 +111,13 @@ private:
     // more tracks than fit on screen.
     float m_trackScrollY = 0.0f;
 
+    // Smoothed per-track meter values, parallel-ish to AudioEngine's
+    // track list. Each frame we pull the audio thread's atomic peak,
+    // clamp it, then apply an attack-fast / decay-slow envelope so the
+    // display doesn't strobe. Resized on the fly to match track count
+    // — on delete the tail entries just get dropped.
+    std::vector<float> m_trackMeterDecay;
+
     // Arrangement timeline extent (in frames). Independent of any track's
     // length — the view stays stable while a take is being recorded, and
     // stays stable after stop too. Explicitly retimed on session load /

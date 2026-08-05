@@ -315,6 +315,9 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     if (m_audioEngine) {
         m_audioEngine->setTotalMixInputPairMuted(false);
         m_audioEngine->syncTotalMixMuteToHardware();
+        // Push each track's monitor->mute mapping to the Antelope mixer
+        // so its state matches whatever the default session loaded.
+        m_audioEngine->syncAllInputMonitorsToAntelope();
     }
 
     m_running = true;
@@ -2092,7 +2095,12 @@ void GUIManager::renderTrackPanel(float width, float height) {
             // Input monitor — cyan/teal when active. Just a state toggle for
             // now; audio path wiring can come later.
             if (track->inputMonitor) pushBtnColor(ImVec4(0.10f, 0.65f, 0.85f, 1.0f));
-            if (ImGui::Button("I", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->inputMonitor = !track->inputMonitor; m_audioEngine->markSessionDirty(); }
+            if (ImGui::Button("I", msrBtnSize)) {
+                m_audioEngine->undoSnapshot();
+                // setTrackInputMonitor pushes the mute state to the
+                // Antelope mixer and updates LED 9 in one step.
+                m_audioEngine->setTrackInputMonitor(i, !track->inputMonitor);
+            }
             if (track->inputMonitor) ImGui::PopStyleColor(3);
 
             // --- Input & output pair dropdowns, side by side ---
@@ -2153,21 +2161,103 @@ void GUIManager::renderTrackPanel(float width, float height) {
             }
 
             if (numPairs > 0) {
+                // Mono routes to a single output channel; stereo routes to
+                // a stereo pair. Preview label mirrors whichever is active.
                 char outLabel[32];
-                sprintf(outLabel, "O = %d-%d", (track->outputPair * 2) + 1, (track->outputPair * 2) + 2);
-                // If there's no input dropdown occupying the left half,
-                // let the output combo take the full row.
+                if (track->outputMono) {
+                    sprintf(outLabel, "O = %d", track->outputMonoChan + 1);
+                } else {
+                    sprintf(outLabel, "O = %d-%d",
+                            (track->outputPair * 2) + 1,
+                            (track->outputPair * 2) + 2);
+                }
                 ImGui::SetNextItemWidth(numInputPairs > 0 ? halfW : -1.0f);
                 if (ImGui::BeginCombo("##out", outLabel, ImGuiComboFlags_NoArrowButton)) {
+                    // Stereo pairs first.
                     for (int p = 0; p < numPairs; p++) {
-                        bool sel = (track->outputPair == p);
+                        bool sel = (!track->outputMono && track->outputPair == p);
                         char item[32];
                         sprintf(item, "O = %d-%d", (p * 2) + 1, (p * 2) + 2);
-                        if (ImGui::Selectable(item, sel)) { m_audioEngine->undoSnapshot(); track->outputPair = p; m_audioEngine->markSessionDirty(); }
+                        if (ImGui::Selectable(item, sel)) {
+                            m_audioEngine->undoSnapshot();
+                            track->outputMono = false;
+                            track->outputPair = p;
+                            m_audioEngine->markSessionDirty();
+                        }
                         if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    // Then mono channels — a single output channel is
+                    // useful for routing to a single hardware output that
+                    // the audio interface's mixer will then handle.
+                    int numMonoOut = numPairs * 2;
+                    if (numMonoOut > 0) {
+                        ImGui::Separator();
+                        for (int c = 0; c < numMonoOut; c++) {
+                            bool sel = (track->outputMono && track->outputMonoChan == c);
+                            char item[32];
+                            sprintf(item, "O = %d", c + 1);
+                            if (ImGui::Selectable(item, sel)) {
+                                m_audioEngine->undoSnapshot();
+                                track->outputMono     = true;
+                                track->outputMonoChan = c;
+                                m_audioEngine->markSessionDirty();
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
                     }
                     ImGui::EndCombo();
                 }
+            }
+
+            // --- Per-track level meter ---
+            // Sits directly below the I/O row. Reads the audio thread's
+            // peak (input signal when the "I" monitor is on, playback
+            // when off) and applies attack-fast / decay-slow smoothing.
+            // Colour bands mirror a standard channel-strip meter:
+            //   0.0 .. -18 dB  → green
+            //   -18 .. -6 dB   → yellow
+            //   -6  .. 0  dB   → red (clip zone)
+            {
+                if ((int)m_trackMeterDecay.size() <= (int)i) m_trackMeterDecay.resize(i + 1, 0.0f);
+                float raw = m_audioEngine->getTrackMeter((int)i);
+                if (raw > 1.0f) raw = 1.0f;
+                float prev = m_trackMeterDecay[i];
+                // Attack: snap up. Decay: exponential toward 0 (~600 ms
+                // to fall by e), independent of frame rate via dt.
+                float v = (raw > prev) ? raw
+                                       : prev + (raw - prev) * std::min(1.0f,
+                                                    ImGui::GetIO().DeltaTime * 4.0f);
+                m_trackMeterDecay[i] = v;
+
+                // Log-ish mapping so the bar reflects perceived level
+                // instead of linear amplitude: -60 dB → 0 %, 0 dB → 100 %.
+                float bar = 0.0f;
+                if (v > 1e-4f) {
+                    float db = 20.0f * std::log10(v);
+                    bar = 1.0f + db / 60.0f;   // -60 → 0, 0 → 1
+                    if (bar < 0.0f) bar = 0.0f;
+                    if (bar > 1.0f) bar = 1.0f;
+                }
+
+                float avail = ImGui::GetContentRegionAvail().x;
+                float meterH = 8.0f;
+                ImVec2 p0 = ImGui::GetCursorScreenPos();
+                ImVec2 p1(p0.x + avail, p0.y + meterH);
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(p0, p1, IM_COL32(20, 20, 20, 255), 2.0f);
+
+                // Fill up to `bar`, coloured by which dB band the tip is in.
+                float fillW = avail * bar;
+                ImU32 col;
+                if (bar >= 1.0f - 6.0f/60.0f)       col = IM_COL32(220,  60,  40, 255); // -6..0
+                else if (bar >= 1.0f - 18.0f/60.0f) col = IM_COL32(210, 180,  40, 255); // -18..-6
+                else                                col = IM_COL32( 40, 180,  70, 255); // below -18
+                if (fillW > 1.0f) {
+                    dl->AddRectFilled(p0, ImVec2(p0.x + fillW, p1.y), col, 2.0f);
+                }
+                dl->AddRect(p0, p1, IM_COL32(60, 60, 60, 255), 2.0f);
+
+                ImGui::Dummy(ImVec2(avail, meterH));
             }
 
             ImGui::EndChild();
@@ -3941,6 +4031,8 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
         file << "      \"solo\":       " << (t->solo  ? "true" : "false") << ",\n";
         file << "      \"armed\":      " << (t->armed ? "true" : "false") << ",\n";
         file << "      \"outputPair\":    " << t->outputPair << ",\n";
+        file << "      \"outputMono\":    " << (t->outputMono ? "true" : "false") << ",\n";
+        file << "      \"outputMonoChan\":" << t->outputMonoChan << ",\n";
         file << "      \"inputPair\":     " << t->inputPair  << ",\n";
         file << "      \"inputMono\":     " << (t->inputMono ? "true" : "false") << ",\n";
         file << "      \"inputMonoChan\": " << t->inputMonoChan << ",\n";
@@ -4012,7 +4104,10 @@ void GUIManager::openSession() {
     // Push it to TotalMix + the OLED indicator (loadSessionFromFile
     // deliberately leaves this to the caller so startup auto-load can
     // opt out).
-    if (m_audioEngine) m_audioEngine->syncTotalMixMuteToHardware();
+    if (m_audioEngine) {
+        m_audioEngine->syncTotalMixMuteToHardware();
+        m_audioEngine->syncAllInputMonitorsToAntelope();
+    }
 #endif
 }
 
@@ -4086,6 +4181,8 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         bool solo            = keyIn("solo")       != std::string::npos ? readBool(keyIn("solo"))         : false;
         bool armed           = keyIn("armed")      != std::string::npos ? readBool(keyIn("armed"))        : false;
         int outputPair       = keyIn("outputPair") != std::string::npos ? (int)readNumber(keyIn("outputPair")) : 0;
+        bool outputMono      = keyIn("outputMono") != std::string::npos ? readBool(keyIn("outputMono"))         : false;
+        int outputMonoChan   = keyIn("outputMonoChan") != std::string::npos ? (int)readNumber(keyIn("outputMonoChan")) : 0;
         int inputPair        = keyIn("inputPair")  != std::string::npos ? (int)readNumber(keyIn("inputPair"))  : 0;
         bool inputMono       = keyIn("inputMono")  != std::string::npos ? readBool(keyIn("inputMono"))         : false;
         int inputMonoChan    = keyIn("inputMonoChan") != std::string::npos ? (int)readNumber(keyIn("inputMonoChan")) : 0;
@@ -4101,6 +4198,8 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
             t->solo          = solo;
             t->armed         = armed;
             t->outputPair    = outputPair;
+            t->outputMono    = outputMono;
+            t->outputMonoChan= outputMonoChan;
             t->inputPair     = inputPair;
             t->inputMono     = inputMono;
             t->inputMonoChan = inputMonoChan;
@@ -4267,7 +4366,10 @@ void GUIManager::revertSession() {
     loadSessionFromFile(m_currentSessionPath);
     // Same as openSession — user-triggered load pushes the reloaded mute
     // state to hardware.
-    if (m_audioEngine) m_audioEngine->syncTotalMixMuteToHardware();
+    if (m_audioEngine) {
+        m_audioEngine->syncTotalMixMuteToHardware();
+        m_audioEngine->syncAllInputMonitorsToAntelope();
+    }
 }
 
 void GUIManager::closeSession() {
