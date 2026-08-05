@@ -59,6 +59,13 @@ const uint8_t MPR121_ADDR[NUM_MPR121] = {0x5A, 0x5B, 0x5C};
 uint16_t lastTouchState[NUM_MPR121] = {0, 0, 0};
 bool mpr121Found[NUM_MPR121] = {false, false, false};
 int mpr121Count = 0;
+// Auto-recovery bookkeeping. Set to true by a failing read; the touch
+// scan loop then tries mpr121Init() on that chip once every ~500 ms
+// until it comes back. Prevents needing a USB replug after live wire
+// changes brief the I2C bus.
+bool         mpr121NeedsReinit[NUM_MPR121]    = {false, false, false};
+uint32_t     mpr121LastReinitMs[NUM_MPR121]   = {0, 0, 0};
+bool         lastMpr121ReadOk                 = true;
 
 void mpr121WriteRegister(uint8_t addr, uint8_t reg, uint8_t value) {
     Wire.beginTransmission(addr);
@@ -70,8 +77,9 @@ void mpr121WriteRegister(uint8_t addr, uint8_t reg, uint8_t value) {
 uint8_t mpr121ReadRegister(uint8_t addr, uint8_t reg) {
     Wire.beginTransmission(addr);
     Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return 0;
-    if (Wire.requestFrom(addr, (uint8_t)1) != 1) return 0;
+    if (Wire.endTransmission(false) != 0) { lastMpr121ReadOk = false; return 0; }
+    if (Wire.requestFrom(addr, (uint8_t)1) != 1) { lastMpr121ReadOk = false; return 0; }
+    lastMpr121ReadOk = true;
     return Wire.read();
 }
 
@@ -2136,8 +2144,34 @@ void loop() {
 
     // --- Touch sensors (all MPR121 chips) ---
     for (int chip = 0; chip < NUM_MPR121; chip++) {
-        if (!mpr121Found[chip]) continue;
+        // Recovery path: a previous read failed → try to re-init the
+        // chip once every 500 ms. Live electrode wire changes and ESD
+        // events sometimes hang the MPR121 or its I2C ACK; without
+        // this, only a USB replug would bring it back.
+        if (!mpr121Found[chip]) {
+            if (mpr121NeedsReinit[chip] &&
+                (uint32_t)(millis() - mpr121LastReinitMs[chip]) > 500) {
+                mpr121LastReinitMs[chip] = millis();
+                if (mpr121Init(MPR121_ADDR[chip])) {
+                    mpr121Found[chip]        = true;
+                    mpr121NeedsReinit[chip]  = false;
+                    lastTouchState[chip]     = 0;
+                    Serial.print("MPR121 #"); Serial.print(chip);
+                    Serial.println(" recovered");
+                }
+            }
+            continue;
+        }
         uint16_t touchState = mpr121ReadTouch(MPR121_ADDR[chip]);
+        if (!lastMpr121ReadOk) {
+            // Chip stopped ACKing — take it offline and schedule reinit.
+            mpr121Found[chip]        = false;
+            mpr121NeedsReinit[chip]  = true;
+            mpr121LastReinitMs[chip] = millis();
+            Serial.print("MPR121 #"); Serial.print(chip);
+            Serial.println(" hung; will retry");
+            continue;
+        }
         if (touchState != lastTouchState[chip]) {
             for (int i = 0; i < 12; i++) {
                 bool now = touchState & (1 << i);

@@ -1382,6 +1382,16 @@ void AudioEngine::syncSoloMuteLedsNow() {
     }
 }
 
+void AudioEngine::syncInputMonitorLedNow() {
+    if (!m_serialController) return;
+    if (m_bookmarkScrollMode.load()) return;   // all LEDs off during scroll mode
+    const Track* t = getTrack(getSelectedTrack());
+    int want = (t && t->inputMonitor) ? 1 : 0;
+    if (want == m_lastInputMonitorLedState) return;
+    m_lastInputMonitorLedState = want;
+    m_serialController->sendMessage(want ? "LED:9:ON" : "LED:9:OFF");
+}
+
 void AudioEngine::syncMuteFlashNow() {
     if (!m_serialController) return;
     int want = m_bookmarkScrollMode.load() ? 1 : 0;
@@ -1393,7 +1403,7 @@ void AudioEngine::syncMuteFlashNow() {
         // thing lit is the flashing mute LED. Reset "last sent" caches
         // to 0 so on exit, the per-LED sync functions detect divergence
         // vs the true DAW state and repaint the LEDs back to normal.
-        for (int ch = 1; ch <= 8; ch++) {
+        for (int ch = 1; ch <= 9; ch++) {
             char buf[16];
             snprintf(buf, sizeof(buf), "LED:%d:OFF", ch);
             m_serialController->sendMessage(buf);
@@ -1405,6 +1415,7 @@ void AudioEngine::syncMuteFlashNow() {
         m_lastLoopRightLedState   = 0;
         m_lastRecordLeftLedState  = 0;
         m_lastRecordRightLedState = 0;
+        m_lastInputMonitorLedState = 0;
     }
 }
 
@@ -1423,6 +1434,7 @@ void AudioEngine::handleResync() {
     m_lastMuteLedState          = -1;
     m_lastArmLedState           = -1;
     m_lastMuteFlashState        = -1;
+    m_lastInputMonitorLedState  = -1;
     m_lastHeartbeatSendMs       = 0;   // force an immediate HB
     m_startupOledPushed         = false; // force SETMODE:DESC + playback push
     // Held-state flags that live on the DAW side but mirror physical pads
@@ -2252,13 +2264,25 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     if (pad == 3)  { m_pad3Held.store(pressed);        return; }
     if (pad == 14) { m_pad14Held.store(pressed);       return; }
 
-    // Pad 8 — OSC mute toggle for MADI 1-2 (strip 2 in TotalMix).
-    // Press-only, no chord, no undo entanglement.
-    if (pad == 8 && pressed) {
-        toggleTotalMixStripMute(2, "MADI 1-2");
+    // Pad 35 — toggle input monitor on the selected track. LED 9 mirrors
+    // the state (see syncInputMonitorLedNow), and undoSnapshot at the top
+    // of handleTouch already captured the pre-press state so undo works.
+    if (pad == 35 && pressed) {
+        int sel = getSelectedTrack();
+        Track* t = getTrack(sel);
+        if (t) {
+            t->inputMonitor = !t->inputMonitor;
+            markSessionDirty();
+            syncInputMonitorLedNow();
+        }
         return;
     }
-    if (pad == 8) return;  // swallow release
+    if (pad == 35) return;  // swallow release
+
+    // (Pad 8 OSC-mute hotkey retired — the OSC / MUTEIND plumbing stays
+    // wired so we can hook it up to a different pad later without another
+    // refactor. toggleTotalMixStripMute + syncTotalMixMuteToHardware are
+    // still called from the session-load path.)
 
     // Loop-edit toggle — press-only.
     if (pad == 15) {
@@ -2397,15 +2421,14 @@ void AudioEngine::updateController() {
         m_serialController->sendMessage("SETMODE:DESC");
         pushPlaybackStateToOled();
         syncSoloMuteLedsNow();   // paint the selected track's flags on 0/1
-        // TEMP: light LED 9 to confirm the newly-wired channel works.
-        // Remove once we assign a real meaning to it.
-        m_serialController->sendMessage("LED:9:ON");
+        syncInputMonitorLedNow();
     }
 
     // Cheap tick: the DAW's own S/M buttons (or session load) can flip
     // solo/mute without going through pad 17/18, so poll for divergence
     // once per updateController tick and sync when it happens.
     syncSoloMuteLedsNow();
+    syncInputMonitorLedNow();
     // Same story for the mute-LED marker-scroll flash — reflects the
     // AudioEngine-side m_bookmarkScrollMode state to the firmware.
     syncMuteFlashNow();

@@ -393,6 +393,10 @@ public:
     // / 2. Called on toggle and on track-change so the physical LEDs
     // always mirror the DAW's per-track flags.
     void syncSoloMuteLedsNow();
+    // Push LED 9 to match the selected track's inputMonitor flag. Called
+    // on pad 25 press, track select, and every updateController tick so
+    // GUI "I" button toggles and track switches stay reflected.
+    void syncInputMonitorLedNow();
     // Push MUTEFLASH:1 / :0 to the firmware whenever marker-scroll
     // mode transitions, so LED 0 flashes while nav is active.
     void syncMuteFlashNow();
@@ -665,6 +669,7 @@ private:
     int m_lastSoloLedState = -1;
     int m_lastMuteLedState = -1;
     int m_lastArmLedState  = -1;
+    int m_lastInputMonitorLedState = -1;   // LED 9 shadow (see syncInputMonitorLedNow)
     // Cached last MUTEFLASH state — cheap tick in updateController
     // re-syncs when scroll mode transitions.
     int m_lastMuteFlashState = -1;
