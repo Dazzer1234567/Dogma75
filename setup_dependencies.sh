@@ -36,6 +36,14 @@ else
     echo "Dear ImGui already exists, skipping..."
 fi
 
+echo ""
+echo "Cloning SDL2 (release-2.30.x — the default branch is SDL3 which won't build)..."
+if [ ! -d "sdl2" ]; then
+    git clone --branch release-2.30.x https://github.com/libsdl-org/SDL.git sdl2
+else
+    echo "SDL2 already exists, skipping..."
+fi
+
 cd ..
 
 echo ""

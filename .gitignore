@@ -55,8 +55,11 @@ DerivedData/
 *.swp
 *.swo
 
-# Vendored third-party sources (fetched by setup_dependencies.sh)
-external/
+# Vendored third-party sources (fetched by setup_dependencies.sh).
+# Ignore the contents, but keep our own CMake glue tracked — nothing can
+# regenerate it, and without it a fresh clone cannot configure at all.
+external/*
+!external/CMakeLists.txt
 
 # PlatformIO firmware build outputs
 **/.pio/

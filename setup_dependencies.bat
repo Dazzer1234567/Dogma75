@@ -35,6 +35,14 @@ if not exist imgui (
     echo Dear ImGui already exists, skipping...
 )
 
+echo.
+echo Cloning SDL2 (release-2.30.x — the default branch is SDL3 which won't build)...
+if not exist sdl2 (
+    git clone --branch release-2.30.x https://github.com/libsdl-org/SDL.git sdl2
+) else (
+    echo SDL2 already exists, skipping...
+)
+
 cd ..
 
 echo.
