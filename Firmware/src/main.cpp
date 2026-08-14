@@ -56,6 +56,11 @@ void (*encoderISRs[NUM_ENCODERS])() = {
 // --- MPR121 Touch Sensors (up to 3 chips) ---
 const int NUM_MPR121 = 3;
 const uint8_t MPR121_ADDR[NUM_MPR121] = {0x5A, 0x5B, 0x5C};
+// Thresholds for pads 20-23 only, which sit next to the big CAP1188 sensor
+// strip. Raise these if phantom touches persist; lower them toward the
+// normal 6/3 if those four pads start feeling unresponsive to a light touch.
+const uint8_t MPR121_TOUCH_TH_NEAR_STRIP   = 12;
+const uint8_t MPR121_RELEASE_TH_NEAR_STRIP = 6;
 uint16_t lastTouchState[NUM_MPR121] = {0, 0, 0};
 bool mpr121Found[NUM_MPR121] = {false, false, false};
 int mpr121Count = 0;
@@ -91,14 +96,27 @@ bool mpr121Init(uint8_t addr) {
     mpr121WriteRegister(addr, 0x80, 0x63);
     delay(10);
 
-    // Set touch/release thresholds for all 12 electrodes. Lowered from 12/6
-    // so that marginal side-touches still register when the modifier pad is
-    // being held (holding another pad shifts the whole-chip baseline and cuts
-    // the effective delta at other pads). If this causes false triggers, back
-    // off toward 8/4.
+    // Set touch/release thresholds per electrode. The normal pads run at 6/3,
+    // lowered from 12/6 so that marginal side-touches still register when the
+    // modifier pad is being held (holding another pad shifts the whole-chip
+    // baseline and cuts the effective delta at other pads).
+    //
+    // Pads 20-23 are the exception. They sit beside the 30x3 cm CAP1188
+    // sensor strip, which couples into them hard enough to cross a 6/3
+    // threshold with nobody touching anything — measured at ~16 phantom
+    // touches on pad 23 in 9 seconds, vanishing the moment the strip's C1
+    // wire is unplugged. Those four get extra noise margin instead.
     for (uint8_t i = 0; i < 12; i++) {
-        mpr121WriteRegister(addr, 0x41 + i * 2, 6);   // Touch threshold
-        mpr121WriteRegister(addr, 0x42 + i * 2, 3);   // Release threshold
+        int chip = 0;
+        for (int c = 0; c < NUM_MPR121; c++) {
+            if (MPR121_ADDR[c] == addr) { chip = c; break; }
+        }
+        const int pad = chip * 12 + i;
+        const bool nearStrip = (pad >= 20 && pad <= 23);
+        mpr121WriteRegister(addr, 0x41 + i * 2,
+                            nearStrip ? MPR121_TOUCH_TH_NEAR_STRIP   : 6);
+        mpr121WriteRegister(addr, 0x42 + i * 2,
+                            nearStrip ? MPR121_RELEASE_TH_NEAR_STRIP : 3);
     }
 
     // MHD, NHD, NCL, FDL - filtering
@@ -132,6 +150,138 @@ uint16_t mpr121ReadTouch(uint8_t addr) {
     uint8_t lsb = mpr121ReadRegister(addr, 0x00);
     uint8_t msb = mpr121ReadRegister(addr, 0x01);
     return (msb << 8) | lsb;
+}
+
+// --- CAP1188 capacitive controller (Wire, one big 30x3 cm pad on C1) ---
+//
+// Only C1 is wired. C2-C8 are left floating, so their status bits are
+// ignored in software rather than disabled in hardware — the sensor-enable
+// register isn't documented in the sources used to write this, and masking
+// achieves the same result with no risk of writing a wrong register.
+const uint8_t CAP1188_ADDR = 0x29;   // default with the AD pin left floating
+
+// Register map (verified against Adafruit's CAP1188 libraries)
+const uint8_t CAP1188_REG_MAIN        = 0x00;  // bit0 = INT, cleared to ack
+const uint8_t CAP1188_REG_STATUS      = 0x03;  // one bit per sensor input
+const uint8_t CAP1188_REG_SENSITIVITY = 0x1F;  // bits[6:4] = gain index
+const uint8_t CAP1188_REG_CAL_ACTIVATE= 0x26;  // bit per channel, self-clears
+const uint8_t CAP1188_REG_MULTI_TOUCH = 0x2A;  // 0x00 = allow simultaneous
+const uint8_t CAP1188_REG_THRESHOLD_1 = 0x30;  // C1 threshold, 0-127
+const uint8_t CAP1188_REG_STANDBY_CFG = 0x41;
+const uint8_t CAP1188_REG_LED_LINK    = 0x72;  // 0x00 = DAW owns the LEDs
+const uint8_t CAP1188_REG_PRODID      = 0xFD;  // expect 0x50
+const uint8_t CAP1188_REG_MANUID      = 0xFE;  // expect 0x5D
+
+// Gain index into (128,64,32,16,8,4,2,1)x — index 0 is the MOST sensitive.
+// Index 7 (1x) is the lowest, and it is what this pad wants: 30x3 cm of
+// copper produces an enormous signal, and anything more sensitive saturates
+// the delta at +/-127 and latches the button on.
+//
+// Measured on the finished hardware (pad via a 30 pF series capacitor):
+// resting delta ~0, peak on touch ~42-61. A threshold of 20 gave 16 clean
+// press/release pairs out of 16 taps. Lower it toward 15 if light taps ever
+// get missed; raise it if the pad ever self-triggers.
+//
+// NOTE the series capacitor is not optional. Wired directly, the strip's raw
+// capacitance exceeds what the chip can null during calibration and the delta
+// reads exactly 0 at EVERY gain setting — the button simply never responds.
+uint8_t cap1188GainIndex = 7;                  // = 1x, least sensitive
+uint8_t cap1188Threshold = 20;                 // C1 touch threshold, 0-127
+
+const uint8_t CAP1188_REG_DELTA_1 = 0x10;      // signed 8-bit delta, C1
+
+// Pad number reported to the DAW. 0-35 belong to the three MPR121s.
+const int CAP1188_PAD_NUMBER = 36;
+
+bool    cap1188Found     = false;
+uint8_t cap1188LastState = 0;
+
+// Defined much further down, next to the MPR121 touch handling.
+void handleTouchPressed(int touchNum);
+void handleTouchReleased(int touchNum);
+
+void cap1188WriteRegister(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(CAP1188_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    Wire.endTransmission();
+}
+
+bool cap1188ReadOk = true;
+uint8_t cap1188ReadRegister(uint8_t reg) {
+    Wire.beginTransmission(CAP1188_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) { cap1188ReadOk = false; return 0; }
+    if (Wire.requestFrom(CAP1188_ADDR, (uint8_t)1) != 1) { cap1188ReadOk = false; return 0; }
+    cap1188ReadOk = true;
+    return Wire.read();
+}
+
+bool cap1188Init() {
+    Wire.beginTransmission(CAP1188_ADDR);
+    if (Wire.endTransmission() != 0) return false;
+
+    // Identify before configuring, so a different chip at 0x29 can't be
+    // silently misprogrammed.
+    if (cap1188ReadRegister(CAP1188_REG_PRODID) != 0x50) return false;
+    if (cap1188ReadRegister(CAP1188_REG_MANUID) != 0x5D) return false;
+
+    // Allow simultaneous touches. The default BLOCKS all but one, which
+    // would silently break every chorded gesture this controller relies on
+    // (26+19 loop edit, 19+14 return-on-stop, 24+E6 scrub, ...).
+    cap1188WriteRegister(CAP1188_REG_MULTI_TOUCH, 0x00);
+
+    // Low gain for a large pad. Low nibble is the base shift; 0x0F is the
+    // power-on default and is left alone.
+    cap1188WriteRegister(CAP1188_REG_SENSITIVITY,
+                         (uint8_t)((cap1188GainIndex << 4) | 0x0F));
+    cap1188WriteRegister(CAP1188_REG_THRESHOLD_1, cap1188Threshold);
+    cap1188WriteRegister(CAP1188_REG_STANDBY_CFG, 0x30);
+
+    // Don't let the chip drive its own LEDs from touch — the DAW is the
+    // source of truth for every LED on this controller.
+    cap1188WriteRegister(CAP1188_REG_LED_LINK, 0x00);
+
+    // Force a fresh baseline. Matters because the pad may have been plugged
+    // in after power-up, in which case the boot calibration captured the
+    // wrong reference and the pad would read as permanently pressed.
+    cap1188WriteRegister(CAP1188_REG_CAL_ACTIVATE, 0x01);
+    delay(50);
+
+    cap1188LastState = 0;
+    return true;
+}
+
+// Poll C1 and emit through the same handlers as the MPR121 pads, so the big
+// button behaves identically to every other pad (diagnostic display,
+// modifier combos, DAW protocol).
+// The CAP1188 samples on its own ~35 ms cycle. Polling far faster than that
+// starves it — measured: 5408 reads in 15 s produced ZERO status hits, while
+// reading the same register every 100 ms saw touches reliably. 25 ms keeps
+// the button feeling instant while leaving the chip time to convert.
+const uint32_t CAP1188_POLL_INTERVAL_MS = 25;
+uint32_t cap1188LastPollMs = 0;
+
+void cap1188Scan() {
+    if (!cap1188Found) return;
+    uint32_t nowMs = millis();
+    if ((uint32_t)(nowMs - cap1188LastPollMs) < CAP1188_POLL_INTERVAL_MS) return;
+    cap1188LastPollMs = nowMs;
+    uint8_t status = cap1188ReadRegister(CAP1188_REG_STATUS);
+    if (!cap1188ReadOk) return;
+
+    if (status) {
+        // Ack the interrupt latch, else status never clears on release.
+        uint8_t main = cap1188ReadRegister(CAP1188_REG_MAIN);
+        cap1188WriteRegister(CAP1188_REG_MAIN, main & ~0x01);
+    }
+
+    uint8_t now = status & 0x01;          // C1 only; ignore floating C2-C8
+    if (now != cap1188LastState) {
+        if (now) handleTouchPressed(CAP1188_PAD_NUMBER);
+        else     handleTouchReleased(CAP1188_PAD_NUMBER);
+        cap1188LastState = now;
+    }
 }
 
 // --- SSD1362 OLED Display (Wire2, 256x64, 4-bit grayscale) ---
@@ -1262,6 +1412,17 @@ void setup() {
         }
     }
 
+    // CAP1188 init (one large pad on C1, reported as pad 36)
+    if (cap1188Init()) {
+        cap1188Found = true;
+        Serial.print("CAP1188 (0x");
+        Serial.print(CAP1188_ADDR, HEX);
+        Serial.print(") found! big pad = pad ");
+        Serial.println(CAP1188_PAD_NUMBER);
+    } else {
+        Serial.println("CAP1188 NOT found");
+    }
+
     // PCA9685 init
     if (pca9685Init()) {
         pca9685Found = true;
@@ -1341,6 +1502,46 @@ void processSerialCommands() {
                     }
                 }
                 Serial.println("I2C scan done");
+            }
+            // --- CAP1188 tuning, so gain/threshold can be found without a
+            // reflash for every trial. CAPDBG streams the raw signed delta
+            // on C1; press the pad while it runs and the numbers show how
+            // much headroom the current threshold actually has.
+            else if (serialInputBuffer == "CAPDBG") {
+                if (!cap1188Found) {
+                    Serial.println("CAPDBG: CAP1188 not present");
+                } else {
+                    Serial.print("CAPDBG gain=");   Serial.print(cap1188GainIndex);
+                    Serial.print(" thresh=");       Serial.println(cap1188Threshold);
+                    for (int i = 0; i < 60; i++) {
+                        int16_t d = (int8_t)cap1188ReadRegister(CAP1188_REG_DELTA_1);
+                        uint8_t s = cap1188ReadRegister(CAP1188_REG_STATUS);
+                        Serial.print("CAPDELTA "); Serial.print(d);
+                        Serial.print(" status=");  Serial.println(s & 0x01);
+                        delay(100);
+                    }
+                    Serial.println("CAPDBG done");
+                }
+            }
+            else if (serialInputBuffer.startsWith("CAPGAIN:")) {
+                int g = serialInputBuffer.substring(8).toInt();
+                if (g < 0) g = 0; if (g > 7) g = 7;
+                cap1188GainIndex = (uint8_t)g;
+                cap1188WriteRegister(CAP1188_REG_SENSITIVITY,
+                                     (uint8_t)((cap1188GainIndex << 4) | 0x0F));
+                cap1188WriteRegister(CAP1188_REG_CAL_ACTIVATE, 0x01);
+                Serial.print("CAPGAIN set to index "); Serial.println(cap1188GainIndex);
+            }
+            else if (serialInputBuffer.startsWith("CAPTH:")) {
+                int t = serialInputBuffer.substring(6).toInt();
+                if (t < 1)   t = 1; if (t > 127) t = 127;
+                cap1188Threshold = (uint8_t)t;
+                cap1188WriteRegister(CAP1188_REG_THRESHOLD_1, cap1188Threshold);
+                Serial.print("CAPTH set to "); Serial.println(cap1188Threshold);
+            }
+            else if (serialInputBuffer == "CAPCAL") {
+                cap1188WriteRegister(CAP1188_REG_CAL_ACTIVATE, 0x01);
+                Serial.println("CAPCAL: recalibrated C1");
             }
             // OLED test commands
             else if (serialInputBuffer == "OLED") {
@@ -2188,6 +2389,9 @@ void loop() {
         }
     }
 
+    // Big CAP1188 pad, polled on the same cadence as the MPR121 pads.
+    cap1188Scan();
+
     // --- OLED: emit at most one I2C chunk per loop iteration ---
     // Each call is ~1.6 ms max of I2C wire time, so the loop stays responsive
     // to serial and touch/encoder events even while a line is being redrawn.
@@ -2252,3 +2456,6 @@ void loop() {
 
     delayMicroseconds(100);
 }
+
+
+
