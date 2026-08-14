@@ -4001,9 +4001,43 @@ void GUIManager::saveSession() {
     saveSessionToPath(m_currentSessionPath);
 }
 
+// Standard home for sessions. A brand-new session (nothing opened or
+// saved yet, so m_currentSessionPath is empty) always offers to save
+// here; once a session lives somewhere else, that becomes its home and
+// Save As reopens there instead.
+static const char kDefaultSessionDir[] =
+    "c:\\0_CODE\\Dogma75\\Workspace\\SESSIONS";
+
+#ifdef _WIN32
+// Folder the session dialogs should open in.
+static std::string sessionDialogDir(const std::string& currentSessionPath) {
+    if (!currentSessionPath.empty()) {
+        size_t slash = currentSessionPath.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            std::string dir = currentSessionPath.substr(0, slash);
+            DWORD attrs = GetFileAttributesA(dir.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                return dir;
+            }
+            // Fall through if the session's folder has since been moved
+            // or deleted — better the default than a dead path.
+        }
+    }
+    // Create on demand: the common-dialog silently IGNORES an
+    // lpstrInitialDir that doesn't exist and drops the user next to the
+    // .exe instead, which is what used to happen with the stale paths
+    // carried over in user_settings.json.
+    CreateDirectoryA("c:\\0_CODE\\Dogma75\\Workspace", nullptr);
+    CreateDirectoryA(kDefaultSessionDir, nullptr);
+    return kDefaultSessionDir;
+}
+#endif
+
 void GUIManager::saveSessionAs() {
 #ifdef _WIN32
     DialogFullscreenGuard fsGuard(m_window);
+    const std::string initialDir = sessionDialogDir(m_currentSessionPath);
     char filename[MAX_PATH] = "session.json";
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -4013,8 +4047,7 @@ void GUIManager::saveSessionAs() {
     ofn.nMaxFile    = sizeof(filename);
     ofn.lpstrTitle  = "Save DAW Session As";
     ofn.lpstrDefExt = "json";
-    ofn.lpstrInitialDir = m_lastSessionDir.empty() ? nullptr
-                                                   : m_lastSessionDir.c_str();
+    ofn.lpstrInitialDir = initialDir.c_str();
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetSaveFileNameA(&ofn)) return;
     {
