@@ -105,6 +105,13 @@ private:
     // load or save-as). Empty when nothing has been opened this session,
     // in which case Revert is disabled.
     std::string m_currentSessionPath;
+    // Most-recently-used session paths, newest first, for the File >
+    // Recent Projects submenu. Persisted to user_settings.json.
+    std::vector<std::string>     m_recentSessions;
+    static constexpr size_t      MAX_RECENT_SESSIONS = 10;
+    // Push a path to the front of the MRU list (de-duplicating) and
+    // persist. Called whenever a session is successfully loaded or saved.
+    void addRecentSession(const std::string& path);
     // Shared vertical scroll offset for the track list — the left panel
     // (track headers/controls) and the arrangement view (waveforms) both
     // apply and read this so they stay in lock-step when the user has

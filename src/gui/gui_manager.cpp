@@ -979,6 +979,16 @@ static HWND sdlWindowHwnd(SDL_Window* window) {
     return wmInfo.info.win.window;
 }
 
+// True if the path exists and is a regular file. Used to grey out Recent
+// Projects entries whose session has been moved or deleted, rather than
+// dropping them from the list.
+static bool fileExists(const std::string& path) {
+    if (path.empty()) return false;
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 // Scope guard: while a common-dialog is open, drop the SDL window out
 // of fullscreen (Windows misbehaves badly when a modal dialog stacks
 // over a fullscreen-desktop window — the app can end up hidden). On
@@ -1346,8 +1356,47 @@ void GUIManager::renderToolbar() {
     if (ImGui::Button("File")) {
         ImGui::OpenPopup("FileMenu");
     }
+    static std::string sPendingRecentOpen;   // loaded after the popup closes
     if (ImGui::BeginPopup("FileMenu")) {
         if (ImGui::MenuItem("Open session")) openSession();
+        // Recent Projects — hover to pop the list out to the right.
+        // Disabled (rather than hidden) when empty, so the entry doesn't
+        // appear and disappear as the list fills up.
+        if (m_recentSessions.empty()) ImGui::BeginDisabled();
+        if (ImGui::BeginMenu("Recent Projects")) {
+            for (size_t i = 0; i < m_recentSessions.size(); i++) {
+                const std::string& full = m_recentSessions[i];
+                size_t slash = full.find_last_of("/\\");
+                std::string name = (slash == std::string::npos)
+                                 ? full : full.substr(slash + 1);
+                // Strip the .json extension — the folder path is in the
+                // tooltip, so the menu can show just the project name.
+                if (name.size() > 5 &&
+                    name.compare(name.size() - 5, 5, ".json") == 0) {
+                    name.resize(name.size() - 5);
+                }
+                // Number them so the keyboard/eye can land on one quickly,
+                // and make the label unique for ImGui even if two sessions
+                // in different folders share a filename.
+                std::string label = std::to_string(i + 1) + "  " + name +
+                                    "##recent" + std::to_string(i);
+
+                bool missing = !fileExists(full);
+                if (missing) ImGui::BeginDisabled();
+                if (ImGui::MenuItem(label.c_str())) {
+                    sPendingRecentOpen = full;
+                }
+                if (missing) ImGui::EndDisabled();
+                // Full path on hover — the filename alone is ambiguous
+                // once the same project name exists in two folders.
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("%s%s", full.c_str(),
+                                      missing ? "\n(file not found)" : "");
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (m_recentSessions.empty()) ImGui::EndDisabled();
         if (ImGui::MenuItem("Save"))         saveSession();
         if (ImGui::MenuItem("Save As"))      saveSessionAs();
         // Revert enabled only when a session file is actually open.
@@ -1365,6 +1414,15 @@ void GUIManager::renderToolbar() {
             }
         }
         ImGui::EndPopup();
+    }
+    // Deferred like sPendingNewSession below: loading a session rebuilds
+    // tracks and view state, which is not safe to do from inside the popup
+    // that is still being drawn this frame.
+    if (!sPendingRecentOpen.empty()) {
+        std::string path = sPendingRecentOpen;
+        sPendingRecentOpen.clear();
+        loadSessionFromFile(path);
+        retimeArrangement();
     }
     // Popup must be opened *after* the menu popup has closed, otherwise
     // ImGui's popup stack refuses to nest a modal on top of a normal one.
@@ -3951,6 +4009,15 @@ void GUIManager::saveSettings() {
     file << "  },\n";
     file << "\n";
 
+    // Recently-opened sessions, newest first, for File > Recent Projects.
+    file << "  \"recentSessions\": [";
+    for (size_t i = 0; i < m_recentSessions.size(); i++) {
+        file << "\"" << jsonEscape(m_recentSessions[i]) << "\"";
+        if (i + 1 < m_recentSessions.size()) file << ", ";
+    }
+    file << "],\n";
+    file << "\n";
+
     // Per-channel PCA9685 LED brightness (0.0 dark .. 1.0 max), pushed to
     // the controller as inverted 0-4095 PCA values on startup and on drag.
     file << "  \"ledBrightness\": [";
@@ -4033,6 +4100,39 @@ static std::string sessionDialogDir(const std::string& currentSessionPath) {
     return kDefaultSessionDir;
 }
 #endif
+
+// Move `path` to the front of the recent list, dropping any earlier entry
+// for the same file so re-opening a session doesn't duplicate it. Paths are
+// compared case-insensitively because Windows treats them that way and the
+// same session can easily arrive with different casing from the dialog, the
+// hardcoded startup path, and a Save As.
+void GUIManager::addRecentSession(const std::string& path) {
+    if (path.empty()) return;
+
+    auto sameFile = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++) {
+            char ca = a[i], cb = b[i];
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            // Treat / and \ as equivalent separators.
+            if (ca == '/') ca = '\\';
+            if (cb == '/') cb = '\\';
+            if (ca != cb) return false;
+        }
+        return true;
+    };
+
+    m_recentSessions.erase(
+        std::remove_if(m_recentSessions.begin(), m_recentSessions.end(),
+                       [&](const std::string& e) { return sameFile(e, path); }),
+        m_recentSessions.end());
+    m_recentSessions.insert(m_recentSessions.begin(), path);
+    if (m_recentSessions.size() > MAX_RECENT_SESSIONS) {
+        m_recentSessions.resize(MAX_RECENT_SESSIONS);
+    }
+    saveSettings();
+}
 
 void GUIManager::saveSessionAs() {
 #ifdef _WIN32
@@ -4156,6 +4256,7 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
            filename,
            m_audioEngine->getTotalMixInputPairMuted() ? "true" : "false");
     m_currentSessionPath = filename;   // enables Revert
+    addRecentSession(m_currentSessionPath);
     if (m_audioEngine) {
         m_audioEngine->clearSessionDirty();
         // Tell the engine where to write recorded takes.
@@ -4430,6 +4531,7 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
            filename,
            m_audioEngine->getTotalMixInputPairMuted() ? "true" : "false");
     m_currentSessionPath = filename;   // enables Revert
+    addRecentSession(m_currentSessionPath);
     if (m_audioEngine) {
         m_audioEngine->clearSessionDirty();
         // Tell the engine where to write recorded takes.
@@ -4768,6 +4870,36 @@ void GUIManager::loadSettings() {
     };
     m_lastAudioDir   = unescape(getString("lastAudioDir"));
     m_lastSessionDir = unescape(getString("lastSessionDir"));
+
+    // Recent sessions array — walk the quoted strings between [ and ].
+    // Deliberately does NOT drop entries whose file is missing: a session
+    // on a disconnected drive should still be listed (greyed out) rather
+    // than silently disappearing from the menu.
+    m_recentSessions.clear();
+    {
+        size_t pos = json.find("\"recentSessions\"");
+        if (pos != std::string::npos) {
+            size_t open  = json.find('[', pos);
+            size_t close = json.find(']', open == std::string::npos ? pos : open);
+            if (open != std::string::npos && close != std::string::npos) {
+                size_t p = open + 1;
+                while (p < close && m_recentSessions.size() < MAX_RECENT_SESSIONS) {
+                    size_t q1 = json.find('"', p);
+                    if (q1 == std::string::npos || q1 > close) break;
+                    // Find the closing quote, skipping escaped ones.
+                    size_t q2 = q1 + 1;
+                    while (q2 < close && json[q2] != '"') {
+                        if (json[q2] == '\\') q2++;
+                        q2++;
+                    }
+                    if (q2 >= close) break;
+                    std::string entry = unescape(json.substr(q1 + 1, q2 - q1 - 1));
+                    if (!entry.empty()) m_recentSessions.push_back(entry);
+                    p = q2 + 1;
+                }
+            }
+        }
+    }
 
     std::string park1 = getString("park1");
     std::string park2 = getString("park2");
