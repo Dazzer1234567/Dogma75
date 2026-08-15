@@ -101,18 +101,32 @@ bool mpr121Init(uint8_t addr) {
     // modifier pad is being held (holding another pad shifts the whole-chip
     // baseline and cuts the effective delta at other pads).
     //
-    // Pads 20-23 are the exception. They sit beside the 30x3 cm CAP1188
-    // sensor strip, which couples into them hard enough to cross a 6/3
-    // threshold with nobody touching anything — measured at ~16 phantom
+    // The pads listed below are the exception. They sit near the 30x3 cm
+    // CAP1188 sensor strip, which couples into them hard enough to cross a
+    // 6/3 threshold with nobody touching anything — measured at ~16 phantom
     // touches on pad 23 in 9 seconds, vanishing the moment the strip's C1
-    // wire is unplugged. Those four get extra noise margin instead.
+    // wire is unplugged. They get extra noise margin instead.
+    //
+    // Pads 20-23 (loop/punch) were the first found. Pads 16 and 35 were
+    // added later: 35 is the input-monitor button, and its phantom touches
+    // were conspicuous because it is the only pad wired to something outside
+    // the DAW — each one audibly muted an Antelope channel. The others were
+    // firing too, just invisibly. Phantom presses are recognisable in the
+    // log by their duration: 60-90 ms, where a real tap is 100-300 ms.
+    //
+    // If a pad here starts feeling unresponsive to a light touch, drop it
+    // back; if a new pad starts chattering, add it. Everything else stays at
+    // the sensitive 6/3 needed for side-touches while a modifier is held.
+    auto nearStripPad = [](int pad) {
+        return (pad >= 20 && pad <= 23) || pad == 16 || pad == 35;
+    };
     for (uint8_t i = 0; i < 12; i++) {
         int chip = 0;
         for (int c = 0; c < NUM_MPR121; c++) {
             if (MPR121_ADDR[c] == addr) { chip = c; break; }
         }
         const int pad = chip * 12 + i;
-        const bool nearStrip = (pad >= 20 && pad <= 23);
+        const bool nearStrip = nearStripPad(pad);
         mpr121WriteRegister(addr, 0x41 + i * 2,
                             nearStrip ? MPR121_TOUCH_TH_NEAR_STRIP   : 6);
         mpr121WriteRegister(addr, 0x42 + i * 2,
