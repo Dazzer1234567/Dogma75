@@ -113,6 +113,17 @@ endif()
 
 target_link_libraries(MinimalDAW PRIVATE ${ALL_LIBS})
 
+# PortAudio is the only dependency that builds as a shared library; the rest
+# link statically. Without this, a fresh build produces an .exe that dies on
+# launch with "portaudio.dll was not found" and the DLL has to be copied by
+# hand from build/external/portaudio/<config>/ every time the tree is wiped.
+if(WIN32 AND TARGET portaudio)
+    add_custom_command(TARGET MinimalDAW POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:portaudio> $<TARGET_FILE_DIR:MinimalDAW>
+        COMMENT "Copying portaudio.dll next to MinimalDAW.exe")
+endif()
+
 # Print configuration summary
 message(STATUS "")
 message(STATUS "MinimalDAW Configuration Summary:")
