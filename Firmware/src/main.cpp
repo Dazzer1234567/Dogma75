@@ -200,7 +200,12 @@ const uint8_t CAP1188_REG_MANUID      = 0xFE;  // expect 0x5D
 // capacitance exceeds what the chip can null during calibration and the delta
 // reads exactly 0 at EVERY gain setting — the button simply never responds.
 uint8_t cap1188GainIndex = 7;                  // = 1x, least sensitive
-uint8_t cap1188Threshold = 20;                 // C1 touch threshold, 0-127
+// Was 20, which reliably caught firm taps (peaks 42-61) but dropped light
+// ones. 12 is still ~12x the measured resting floor of +/-1, so there is
+// plenty of margin left before phantom presses return. Prefer lowering
+// this over raising the gain: gain amplifies the noise floor too, and the
+// clean floor is what keeps this pad from chattering into its neighbours.
+uint8_t cap1188Threshold = 12;                 // C1 touch threshold, 0-127
 
 const uint8_t CAP1188_REG_DELTA_1 = 0x10;      // signed 8-bit delta, C1
 
@@ -1552,6 +1557,28 @@ void processSerialCommands() {
                 cap1188Threshold = (uint8_t)t;
                 cap1188WriteRegister(CAP1188_REG_THRESHOLD_1, cap1188Threshold);
                 Serial.print("CAPTH set to "); Serial.println(cap1188Threshold);
+            }
+            // Raw register access, for working out the chip's timing
+            // config empirically instead of trusting a datasheet we can't
+            // read cleanly. CAPRD:<hexreg> / CAPREG:<hexreg>:<hexval>.
+            else if (serialInputBuffer.startsWith("CAPRD:")) {
+                long r = strtol(serialInputBuffer.substring(6).c_str(), nullptr, 16);
+                uint8_t v = cap1188ReadRegister((uint8_t)r);
+                Serial.print("CAPRD 0x"); Serial.print((int)r, HEX);
+                Serial.print(" = 0x");    Serial.print(v, HEX);
+                Serial.print(" (");       Serial.print(v);      Serial.println(")");
+            }
+            else if (serialInputBuffer.startsWith("CAPREG:")) {
+                int colon = serialInputBuffer.indexOf(':', 7);
+                if (colon > 0) {
+                    long r = strtol(serialInputBuffer.substring(7, colon).c_str(), nullptr, 16);
+                    long v = strtol(serialInputBuffer.substring(colon + 1).c_str(), nullptr, 16);
+                    cap1188WriteRegister((uint8_t)r, (uint8_t)v);
+                    uint8_t rb = cap1188ReadRegister((uint8_t)r);
+                    Serial.print("CAPREG 0x"); Serial.print((int)r, HEX);
+                    Serial.print(" <- 0x");    Serial.print((int)v, HEX);
+                    Serial.print(" readback 0x"); Serial.println(rb, HEX);
+                }
             }
             else if (serialInputBuffer == "CAPCAL") {
                 cap1188WriteRegister(CAP1188_REG_CAL_ACTIVATE, 0x01);
