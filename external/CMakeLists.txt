@@ -2,6 +2,15 @@
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/portaudio/CMakeLists.txt)
     set(PA_BUILD_SHARED OFF CACHE BOOL "Build shared library")
     set(PA_BUILD_STATIC ON CACHE BOOL "Build static library")
+    # Disable the WDM-KS backend. Pa_Initialize() enumerates every enabled
+    # host API, and unlike MME/DirectSound/WASAPI (which query passively)
+    # WDM-KS OPENS each endpoint to interrogate its pin formats. That was
+    # breaking an unrelated dictation app holding the KLIM mic open through
+    # MME: launching the DAW killed its audio stream mid-flight, while
+    # launching the DAW first and the dictation app second worked fine.
+    # Nothing here uses WDM-KS — the DAW runs on the Orion's ASIO driver.
+    set(PA_USE_WDMKS      OFF CACHE BOOL "" FORCE)
+    set(PA_USE_WDMKS_DEVICE_INFO OFF CACHE BOOL "" FORCE)
     add_subdirectory(portaudio)
     set(PORTAUDIO_FOUND TRUE PARENT_SCOPE)
     set(PORTAUDIO_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/portaudio/include PARENT_SCOPE)
