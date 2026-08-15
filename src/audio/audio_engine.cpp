@@ -147,6 +147,15 @@ bool AudioEngine::initialize() {
     if (!m_antelope->init("127.0.0.1", 2021)) {
         dawLog("Antelope: init to 127.0.0.1:2021 failed (will retry never)");
     }
+    // Follow the mixer as well as drive it: a mute toggled by hand in the
+    // Antelope Control Panel now updates the matching track's monitor
+    // button. Fires on the client's READER thread, so it only queues —
+    // updateController() applies it on the main thread where touching
+    // m_tracks is safe.
+    m_antelope->setMuteChangeCallback([this](int channel, bool muted) {
+        std::lock_guard<std::mutex> lock(m_pendingAntelopeMuteMutex);
+        m_pendingAntelopeMutes.emplace_back(channel, muted);
+    });
 
     return true;
 }
@@ -2392,9 +2401,29 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     // don't need a snapshot on the modifier press itself. Also exclude
     // solo/mute/arm on release (pad 16/17/18) — for those we snapshot
     // on the press instead of the release so the sequence undoes cleanly.
+    // Pad 36 (the big CAP1188 strip) is also excluded: it IS the undo
+    // button, and snapshotting on its press would push a new entry onto
+    // the stack that the very next undo would then have to pop.
     if (pressed &&
-        pad != 26 && pad != 24 && pad != 3 && pad != 14) {
+        pad != 26 && pad != 24 && pad != 3 && pad != 14 && pad != 36) {
         undoSnapshot();
+    }
+
+    // Pad 36 — big undo pad. Fires on RELEASE, matching pad 26's tap-undo,
+    // so resting a hand on a 90 cm² strip doesn't repeat-fire.
+    if (pad == 36) {
+        if (!pressed) {
+            undoPop();
+            // Show UNDO briefly, then fall back to the playback state.
+            // undoPop() ends stopped and pushes its own OLED update, so
+            // this has to come after it or it would be overwritten.
+            oledShow("UNDO", " ");
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs + 1000);
+            dawLog("OLED: UNDO shown, revert scheduled +1000ms");
+        }
+        return;
     }
 
     // Simple modifier pads (both press and release update state):
@@ -2547,8 +2576,59 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     }
 }
 
+// Apply mute changes observed on the Antelope mixer to the matching track
+// monitor buttons. Runs on the main thread.
+//
+// The critical property is idempotence. Every mute WE send is broadcast
+// back to us, so this runs for our own writes too. When the desired state
+// already matches we must change nothing and — above all — send nothing
+// back, otherwise the DAW and the mixer ping-pong forever. Hence the
+// deliberate use of the raw t.inputMonitor field here rather than
+// setTrackInputMonitor(), which would push straight back to the Antelope.
+void AudioEngine::applyPendingAntelopeMutes() {
+    std::vector<std::pair<int, bool>> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingAntelopeMuteMutex);
+        if (m_pendingAntelopeMutes.empty()) return;
+        pending.swap(m_pendingAntelopeMutes);
+    }
+
+    bool changedAny = false;
+    for (const auto& pm : pending) {
+        const int  channel = pm.first;
+        const bool muted   = pm.second;
+        // Mixer channel muted  -> monitoring off for tracks routed there.
+        const bool wantMonitor = !muted;
+
+        for (Track& t : m_tracks) {
+            int chans[2];
+            int nc = trackOutputChannels(t, chans);
+            bool routedHere = false;
+            for (int i = 0; i < nc; i++) {
+                if (chans[i] == channel) { routedHere = true; break; }
+            }
+            if (!routedHere) continue;
+            if (t.inputMonitor == wantMonitor) continue;   // echo of our own write
+
+            t.inputMonitor = wantMonitor;
+            changedAny = true;
+            dawLog("Antelope -> DAW: ch=%d %s, track '%s' monitor %s",
+                   channel, muted ? "MUTED" : "UNMUTED",
+                   t.name.c_str(), wantMonitor ? "ON" : "OFF");
+        }
+    }
+
+    if (changedAny) {
+        markSessionDirty();
+        syncInputMonitorLedNow();   // keep pad 35's LED in step
+    }
+}
+
 void AudioEngine::updateController() {
     if (!m_serialController) return;
+
+    // Fold in anything the Antelope mixer changed under us.
+    applyPendingAntelopeMutes();
 
     // One-shot: on the first tick after DAW startup, force the controller
     // into descriptive mode (regardless of what it was doing before) and
@@ -2767,6 +2847,8 @@ void AudioEngine::updateController() {
         if (nowMs >= revertAt) {
             m_oledRevertAtMs.store(0);
             pushPlaybackStateToOled();
+            dawLog("OLED: revert fired (%lld ms late)",
+                   (long long)(nowMs - revertAt));
         }
     }
 

@@ -204,6 +204,11 @@ AntelopeClient::ChState AntelopeClient::stateFor(int mixerId, int channelId) con
     return ChState{kDefLevel, kDefPan, 0, kDefSolo, kDefSend, false};
 }
 
+void AntelopeClient::setMuteChangeCallback(MuteChangeCallback cb) {
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onMuteChanged = std::move(cb);
+}
+
 void AntelopeClient::setChannelMute(int channelId1Based, bool muted) {
     if (channelId1Based <= 0) return;
     ChState s = stateFor(/*mixerId*/ 0, channelId1Based);
@@ -357,12 +362,33 @@ void AntelopeClient::readerLoop() {
                     ChState st{
                         vals[2], vals[3], vals[4], vals[5], vals[6], true,
                     };
+                    // Was this a genuine mute change, or the first time we
+                    // have ever seen this channel? Compare BEFORE
+                    // overwriting the cache. Only mute transitions are
+                    // reported — level/pan/send churn from the CP would
+                    // otherwise fire the callback constantly.
+                    bool muteChanged = false;
                     {
                         std::lock_guard<std::mutex> lock(m_stateMutex);
-                        m_state[stateKey(vals[0], vals[1])] = st;
+                        uint32_t key = stateKey(vals[0], vals[1]);
+                        auto it = m_state.find(key);
+                        muteChanged = (it == m_state.end()) ||
+                                      (it->second.mute != st.mute);
+                        m_state[key] = st;
                     }
-                    dawLog("AntelopeClient: rx set_mixer_cfg mix=%d ch=%d L=%d P=%d M=%d S=%d Snd=%d",
-                           vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6]);
+                    dawLog("AntelopeClient: rx set_mixer_cfg mix=%d ch=%d L=%d P=%d M=%d S=%d Snd=%d%s",
+                           vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6],
+                           muteChanged ? " [mute changed]" : "");
+                    if (muteChanged) {
+                        MuteChangeCallback cb;
+                        {
+                            std::lock_guard<std::mutex> lock(m_callbackMutex);
+                            cb = m_onMuteChanged;
+                        }
+                        // Called on the reader thread — the handler must
+                        // not touch DAW state directly.
+                        if (cb) cb(vals[1], st.mute != 0);
+                    }
                 }
 
                 buf.erase(buf.begin(), buf.begin() + frameLen);

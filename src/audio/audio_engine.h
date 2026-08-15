@@ -749,6 +749,13 @@ public:
     // AntelopeClient connects or a session loads.
     void syncAllInputMonitorsToAntelope();
 private:
+    // Mute changes observed on the Antelope mixer, queued by the client's
+    // reader thread and drained on the main thread by updateController().
+    // Lets a mute toggled by hand in the Control Panel update the matching
+    // track's monitor button instead of silently drifting out of sync.
+    std::mutex                        m_pendingAntelopeMuteMutex;
+    std::vector<std::pair<int, bool>> m_pendingAntelopeMutes;  // channel, muted
+    void applyPendingAntelopeMutes();
     // Toggle one TotalMix strip mute via /1/mute/1/<stripIndex>. TotalMix
     // strips are already stereo-linked in the mixer, so one message mutes
     // the whole pair. Strip index maps to the current bank layout — with

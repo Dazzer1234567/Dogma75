@@ -6,6 +6,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <functional>
 
 // Minimal blocking-TCP client for the AntelopeAudioServer (127.0.0.1:2021).
 // Speaks the same "authoritative client" handshake the Control Panel uses:
@@ -40,6 +41,18 @@ public:
     // fields. If nothing is cached yet (we've never observed the channel
     // in a broadcast), we fall back to unity level / centre pan.
     void setChannelMute(int channelId1Based, bool muted);
+
+    // Fired from the READER THREAD whenever an observed channel's mute
+    // state changes — including changes made in the Antelope Control
+    // Panel by hand, which is the point: it lets the DAW follow the mixer
+    // instead of only driving it.
+    //
+    // Our own writes echo back here too (the server broadcasts every
+    // change to all clients). That is harmless as long as the handler is
+    // idempotent: applying a state that already matches must not send
+    // anything back, or the two ends will ping-pong forever.
+    using MuteChangeCallback = std::function<void(int channelId1Based, bool muted)>;
+    void setMuteChangeCallback(MuteChangeCallback cb);
 
 private:
     // Send one raw set_mixer_cfg request `[cmd, args, {}]` on our
@@ -88,4 +101,7 @@ private:
 
     mutable std::mutex                     m_stateMutex;
     std::unordered_map<uint32_t, ChState>  m_state;
+
+    mutable std::mutex m_callbackMutex;
+    MuteChangeCallback m_onMuteChanged;
 };
