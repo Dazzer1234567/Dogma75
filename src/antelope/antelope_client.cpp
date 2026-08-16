@@ -28,15 +28,44 @@ inline uint32_t stateKey(int mixerId, int channelId) {
 }
 
 // The CP's handshake body. `authorative` (their misspelling) MUST be
-// exact — the server matches the string. Minimum viable declaration:
-// empty cyclic_reports and requests are fine; the server doesn't gate
-// on which requests we've listed here, only on whether we sent
-// initialize_format at all.
+// exact — the server matches the string.
+//
+// cyclic_reports is deliberately EMPTY ({}), not a declaration of 0x73 and
+// 0x83 with empty channel lists as we sent originally. Cyclic reports are
+// the server's periodic telemetry streams — metering among them — and the
+// daemon appears to hold ONE global configuration rather than one per
+// client. Declaring those two reports with empty lists therefore switched
+// metering off for the Control Panel as well as us.
+//
+// Symptoms that traced back to this: launching the DAW killed every meter
+// in the CP while audio kept passing normally; closing the DAW did NOT
+// restore them (the daemon had already stored the empty config); and the
+// CP would then fail to repopulate on relaunch, showing only the device
+// power tile. Restarting Antelope-Manager-Service was the only recovery.
+//
+// We never needed those reports: our reader thread only listens for
+// set_mixer_cfg broadcasts, which arrive regardless.
+// EXPERIMENT (2026-08-16): authorative flipped to false.
+//
+// Hypothesis: the daemon hands authoritative ownership to whichever client
+// claims it and does NOT release it when that client disconnects. That
+// would explain why launching the DAW kills the CP's meters, why closing
+// the DAW does not restore them, and why the CP afterwards shows only the
+// device power tile — it can never reclaim ownership. Restarting
+// Antelope-Manager-Service is the only recovery, which is consistent with
+// ownership being daemon-resident state.
+//
+// Cost if this is the cause: setChannelMute may stop reaching the DSP,
+// since authoritative was originally found to be what made writes take
+// effect (see the RE notes). That is the trade-off being measured here —
+// if the CP survives but mutes stop working, we need a design that claims
+// ownership only momentarily around a write rather than holding it for the
+// lifetime of the app.
 constexpr const char kHandshakeBody[] =
     "[\"initialize_format\", [{"
-    "\"authorative\": true, "
+    "\"authorative\": false, "
     "\"version\": 1, "
-    "\"cyclic_reports\": {\"0x73\": [], \"0x83\": []}, "
+    "\"cyclic_reports\": {}, "
     "\"requests\": {}"
     "}], {}]";
 }  // namespace
