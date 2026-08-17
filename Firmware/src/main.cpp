@@ -208,6 +208,19 @@ uint8_t cap1188GainIndex = 7;                  // = 1x, least sensitive
 uint8_t cap1188Threshold = 12;                 // C1 touch threshold, 0-127
 
 const uint8_t CAP1188_REG_DELTA_1 = 0x10;      // signed 8-bit delta, C1
+const uint8_t CAP1188_REG_AVG_SAMP = 0x24;     // AVG[6:4] / SAMP_TIME / CYCLE
+
+// Averaging and Sampling Configuration. Power-on default is 0x39, which is
+// AVG=011 (average EIGHT consecutive samples before reporting), SAMP_TIME
+// 1.28 ms, CYCLE_TIME as-is. Eight samples is far too slow for a button:
+// a quick tap can begin and end before an averaged result is ever produced,
+// so the press is never seen at all.
+//
+// 0x09 keeps SAMP_TIME and CYCLE_TIME but sets AVG=000 — report on the
+// first sample. Undo is a button you hit fast, so responsiveness matters
+// more here than the noise rejection averaging buys, and the pad's signal
+// (peaks 42-61 against a floor of +/-1) has margin to spare.
+const uint8_t CAP1188_AVG_SAMP_FAST = 0x09;
 
 // Pad number reported to the DAW. 0-35 belong to the three MPR121s.
 const int CAP1188_PAD_NUMBER = 36;
@@ -255,6 +268,7 @@ bool cap1188Init() {
     cap1188WriteRegister(CAP1188_REG_SENSITIVITY,
                          (uint8_t)((cap1188GainIndex << 4) | 0x0F));
     cap1188WriteRegister(CAP1188_REG_THRESHOLD_1, cap1188Threshold);
+    cap1188WriteRegister(CAP1188_REG_AVG_SAMP,    CAP1188_AVG_SAMP_FAST);
     cap1188WriteRegister(CAP1188_REG_STANDBY_CFG, 0x30);
 
     // Don't let the chip drive its own LEDs from touch — the DAW is the
@@ -753,12 +767,33 @@ static int letterPadIndex(int pad) {
 // other's LED state.
 bool     textInputFlashActive   = false;
 uint32_t textInputFlashLastMs   = 0;
+// Phase reference for the pad-20/21 flash. Previously the phase came from
+// the free-running clock (millis() % FLASH_PERIOD_MS), so entering name-entry
+// picked up wherever that happened to be — and phase 0 is fully OFF, meaning
+// the LEDs could sit dark for up to a quarter-second before visibly starting
+// to pulse. That read as the controller being sluggish to respond.
+//
+// Anchored to the moment of entry instead, offset by half a period so entry
+// lands on the PEAK of the triangle: the LEDs come on at full brightness
+// immediately. The offset keeps the wave shape identical, so the DAW's
+// rename-preview (which reuses the same triangle formula from the phase we
+// broadcast in RENAMESYNC) stays in sync with no change on its side.
+uint32_t textInputFlashStartMs  = 0;
+// Loop-time stats, reported and reset by the LOOPSTAT serial command.
+uint32_t loopMaxUs   = 0;
+uint64_t loopSumUs   = 0;
+uint32_t loopCount   = 0;
 // Held-state trackers for the "on-stop behaviour" combos. Pad 14 + play sets
 // return-to-start-on-stop; pad 15 + play sets keep-position-on-stop. While
 // either is held, a pad 19 press does NOT toggle LED 3 — the press is
 // consumed by the DAW as a mode command.
 bool     pad14Held       = false;
 bool     pad15Held       = false;
+// Double-tap detection on pad 15 (toggles loop playback). Window chosen to
+// be comfortably longer than a deliberate double tap but short enough that
+// two separate loop-edit toggles are not mistaken for one.
+uint32_t pad15LastTapMs  = 0;
+const uint32_t PAD15_DOUBLE_TAP_MS = 400;
 // OLED write-lock. Two flavours:
 //   HARD (isSoft = false): mode-switch banner; blocks everything for its
 //                          duration regardless of user activity.
@@ -989,12 +1024,18 @@ void muteFlashStep() {
 // Flash LEDs 4 (pad 20) and 5 (pad 21) with the same triangle-wave used
 // by the clear-markers flashMode. Independent state so a name-entry
 // session doesn't collide with clear-markers mode.
+// Current flash phase, anchored to entry (see textInputFlashStartMs). Used
+// by both the LED step and the RENAMESYNC broadcasts so they cannot disagree.
+static inline uint32_t textInputFlashPhase() {
+    return (uint32_t)(millis() - textInputFlashStartMs) % FLASH_PERIOD_MS;
+}
+
 void textInputFlashStep() {
     if (!textInputFlashActive) return;
     uint32_t nowMs = millis();
     if (nowMs - textInputFlashLastMs < FLASH_TICK_MS) return;
     textInputFlashLastMs = nowMs;
-    uint32_t phase = nowMs % FLASH_PERIOD_MS;
+    uint32_t phase = textInputFlashPhase();
     uint32_t halfPeriod = FLASH_PERIOD_MS / 2;
     uint32_t brightness = (phase < halfPeriod)
         ? (phase * 4095UL) / halfPeriod
@@ -1014,7 +1055,14 @@ void textInputEnter() {
     textInputCursorPos   = (int8_t)strlen(textInputBuffer);
     textInputE1Accum     = 0;
     textInputFlashActive = true;
-    textInputFlashLastMs = 0;
+    textInputFlashLastMs = 0;   // 0 = let the next flashStep run immediately
+    // Anchor the flash to NOW, offset half a period so we start at the
+    // triangle's peak — LEDs light at full brightness the instant the mode
+    // is entered, instead of possibly starting from dark.
+    textInputFlashStartMs = millis() - (FLASH_PERIOD_MS / 2);
+    // Paint them immediately rather than waiting for the next 20 ms tick.
+    pca9685SetPWM(4, 0);   // wiring: 0 = fully on
+    pca9685SetPWM(5, 0);
     // Only pads 20 (LED 4) and 21 (LED 5) should visibly flash while the
     // user names a track. Force the other marker LEDs (6 = record-right,
     // 7 = loop-right) OFF here regardless of whether the DAW has them
@@ -1025,7 +1073,7 @@ void textInputEnter() {
     // the DAW so its rename-preview UI can pulse in perfect sync with the
     // physical pad LEDs. The DAW extrapolates from wall-clock time.
     Serial.print("RENAMESYNC:");
-    Serial.println(millis() % FLASH_PERIOD_MS);
+    Serial.println(textInputFlashPhase());
 }
 void textInputExit() {
     bool wasActive       = textInputMode;
@@ -1579,6 +1627,13 @@ void processSerialCommands() {
                     Serial.print(" <- 0x");    Serial.print((int)v, HEX);
                     Serial.print(" readback 0x"); Serial.println(rb, HEX);
                 }
+            }
+            else if (serialInputBuffer == "LOOPSTAT") {
+                Serial.print("LOOPSTAT count="); Serial.print(loopCount);
+                Serial.print(" meanUs=");
+                Serial.print(loopCount ? (uint32_t)(loopSumUs / loopCount) : 0);
+                Serial.print(" maxUs="); Serial.println(loopMaxUs);
+                loopMaxUs = 0; loopSumUs = 0; loopCount = 0;
             }
             else if (serialInputBuffer == "CAPCAL") {
                 cap1188WriteRegister(CAP1188_REG_CAL_ACTIVATE, 0x01);
@@ -2193,6 +2248,23 @@ void handleTouchReleased(int touchNum) {
             else           enterFlashMode();
             Serial.println("TOUCH:15");
             Serial.println("RELEASE:15");
+
+            // DOUBLE TAP = toggle loop playback on/off.
+            //
+            // This needs no delay on the single tap: the second tap toggles
+            // loop-edit straight back off again, so the two cancel and the
+            // mode ends where it started. We just emit an extra command
+            // alongside. LOOPPLAY is deliberately separate from the
+            // markers existing — it turns wrap-around playback on and off
+            // while leaving the loop points in place.
+            uint32_t nowMs = millis();
+            if (pad15LastTapMs != 0 &&
+                (uint32_t)(nowMs - pad15LastTapMs) <= PAD15_DOUBLE_TAP_MS) {
+                Serial.println("LOOPPLAY");
+                pad15LastTapMs = 0;      // don't let a third tap re-fire
+            } else {
+                pad15LastTapMs = nowMs;
+            }
         }
         pad15PressMs        = 0;
         pad15LongPressFired = false;
@@ -2256,6 +2328,21 @@ void loop() {
     static long pendingDelta[NUM_ENCODERS] = {0, 0, 0, 0, 0, 0};
     static unsigned long lastSendTime[NUM_ENCODERS] = {0, 0, 0, 0, 0, 0};
     static unsigned long lastHeartbeat = 0;
+
+    // Loop-time instrumentation. The DAW's writes to us were measured
+    // blocking for 600 ms on average and up to 5 s, which only happens if
+    // we are too slow to drain the USB RX endpoint. Report via LOOPSTAT.
+    {
+        static uint32_t loopLastUs = 0;
+        uint32_t nowUs = micros();
+        if (loopLastUs != 0) {
+            uint32_t d = nowUs - loopLastUs;
+            if (d > loopMaxUs) loopMaxUs = d;
+            loopSumUs += d;
+            loopCount++;
+        }
+        loopLastUs = nowUs;
+    }
 
     // --- Serial commands from DAW ---
     processSerialCommands();
@@ -2481,7 +2568,7 @@ void loop() {
     if (textInputMode && millis() - lastRenameSyncMs > 150) {
         lastRenameSyncMs = millis();
         Serial.print("RENAMESYNC:");
-        Serial.println(millis() % FLASH_PERIOD_MS);
+        Serial.println(textInputFlashPhase());
     }
 
     // --- Heartbeat ---
