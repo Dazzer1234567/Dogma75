@@ -1978,6 +1978,20 @@ bool AudioEngine::touchHandleDeletePairSentinel(int pad) {
     // Sentinel 202/203 = RETURNONSTOP:1/0 combo from firmware.
     if (pad == 202) { m_returnToStartOnStop.store(true);  return true; }
     if (pad == 203) { m_returnToStartOnStop.store(false); return true; }
+    // Sentinel 204 = double-tap on pad 15: toggle loop playback. Distinct
+    // from the loop markers existing — the markers stay exactly where they
+    // are and stay visible; only the wrap-around is switched off.
+    if (pad == 204) {
+        bool now = !m_loopPlaybackEnabled.load();
+        m_loopPlaybackEnabled.store(now);
+        markSessionDirty();
+        oledShow(now ? "LOOP PLAY: ON" : "LOOP PLAY: OFF", " ");
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_oledRevertAtMs.store(nowMs + 1500);
+        dawLog("Loop playback %s", now ? "ON" : "OFF");
+        return true;
+    }
     // Sentinel pads 200/201 arrive from SerialController when the
     // firmware sends DELETEPAIR:LOOP or DELETEPAIR:REC. Runs even in
     // diagnostic mode because it's a deliberate user gesture.
@@ -3342,7 +3356,8 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             // from loop-right back to loop-left every time it crosses the
             // end. Hoisted outside the inner loop so it's a single check
             // per buffer, not per sample.
-            bool loopActive = m_loopLeftEnabled.load() && m_loopRightEnabled.load()
+            bool loopActive = m_loopPlaybackEnabled.load()
+                              && m_loopLeftEnabled.load() && m_loopRightEnabled.load()
                               && isMarkerEnabled(0) && isMarkerEnabled(3);
             size_t loopStart = loopActive ? getMarkerPosition(0) : 0;
             size_t loopEnd   = loopActive ? getMarkerPosition(3) : 0;

@@ -197,7 +197,7 @@ GUIManager::GUIManager()
     , m_lineVBO(0)
     , m_windowWidth(800)
     , m_windowHeight(600)
-    , m_isFullscreen(true)
+    , m_isFullscreen(false)   // we now start maximised, not fullscreen
     , m_showVelocityCurveEditor(false)
     , m_showTestPage(false)
 {
@@ -212,6 +212,16 @@ GUIManager::GUIManager()
 
 GUIManager::~GUIManager() {
     shutdown();
+}
+
+// True if the path exists and is a regular file. Used both to pick the
+// startup session and to grey out Recent Projects entries whose session has
+// been moved or deleted, rather than dropping them from the list.
+static bool fileExists(const std::string& path) {
+    if (path.empty()) return false;
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialController) {
@@ -253,14 +263,16 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    // Start in true fullscreen (borderless fullscreen desktop)
+    // Start MAXIMISED, not fullscreen — an ordinary window filling the
+    // screen, keeping its title bar and the taskbar accessible. Fullscreen
+    // is still available at runtime via the existing toggle.
     m_window = SDL_CreateWindow(
         "Minimal DAW v0.1.0",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        800, 600,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_FULLSCREEN_DESKTOP
+        1600, 900,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_MAXIMIZED
     );
-    m_isFullscreen = true;
+    m_isFullscreen = false;
 
     if (!m_window) {
         std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
@@ -301,10 +313,17 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     // Load saved settings
     loadSettings();
 
-    // Auto-load default session on startup. If the file is missing (renamed
-    // or on a different machine), loadSessionFromFile logs and returns
-    // cleanly — the DAW just starts empty.
-    loadSessionFromFile("c:\\0_CODE\\Dogma75\\Workspace\\can delete\\record test.json");
+    // Auto-load the most recently used session, skipping any whose file has
+    // since been moved or deleted. Replaces a hardcoded path that pointed at
+    // one particular session on one particular machine — it did not exist on
+    // the second machine, so every launch started empty and logged a failure.
+    // Falls through to an empty session if the list is empty or nothing in it
+    // still exists.
+    for (const std::string& recent : m_recentSessions) {
+        if (!fileExists(recent)) continue;
+        loadSessionFromFile(recent);
+        break;
+    }
     retimeArrangement();
 
     // Startup always lands unmuted, regardless of what the auto-loaded
@@ -979,15 +998,6 @@ static HWND sdlWindowHwnd(SDL_Window* window) {
     return wmInfo.info.win.window;
 }
 
-// True if the path exists and is a regular file. Used to grey out Recent
-// Projects entries whose session has been moved or deleted, rather than
-// dropping them from the list.
-static bool fileExists(const std::string& path) {
-    if (path.empty()) return false;
-    DWORD attrs = GetFileAttributesA(path.c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES &&
-           !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
 
 // Scope guard: while a common-dialog is open, drop the SDL window out
 // of fullscreen (Windows misbehaves badly when a modal dialog stacks
@@ -1985,6 +1995,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
         float availableHeight = ImGui::GetContentRegionAvail().y;
         float separatorH = ImGui::GetTextLineHeightWithSpacing() * 0.5f;
         int   divisor    = (trackCount < FIT_LIMIT) ? trackCount : FIT_LIMIT;
+        if (divisor < 1) divisor = 1;   // avoid div-by-zero when trackCount==0
         float perTrackH  = availableHeight / (float)divisor;
         if (perTrackH < MIN_TRACK_H) perTrackH = MIN_TRACK_H;
         float perTrackBlockH = perTrackH - separatorH;
@@ -3213,6 +3224,27 @@ void GUIManager::renderWaveform(float height) {
         }
     }
 
+    // A session with NO tracks draws no track strips, so nothing above
+    // captured the frame→pixel mapping and the whole overlay below would be
+    // skipped: no loop or punch markers, no play line, nothing to aim at.
+    // A fresh session should still be a usable timeline you can place
+    // markers on and run the playhead over — there is simply no audio.
+    //
+    // Synthesise the mapping from the arrangement child's own width and the
+    // shared view state (m_viewStartD / m_visibleFramesD), which the pre-pass
+    // at the top of renderWaveform maintains regardless of track count.
+    if (!arrHasDrawnTrack) {
+        const float pad = ImGui::GetStyle().WindowPadding.x;
+        float w = ImGui::GetWindowSize().x - pad * 2.0f;
+        if (w < 1.0f) w = 1.0f;
+        arrHasDrawnTrack     = true;
+        arrLastCursorX       = ImGui::GetWindowPos().x + pad;
+        arrLastWaveW         = w;
+        arrLastViewStart     = (size_t)m_viewStartD;
+        arrLastVisibleFrames = (m_visibleFramesD > 1.0) ? (size_t)m_visibleFramesD : 1;
+        arrLastViewEnd       = arrLastViewStart + arrLastVisibleFrames;
+    }
+
     // Marker + playhead overlay — pinned to the arrangement child's
     // screen bounds so triangles, vertical lines, and the loop/rec bar
     // stay fixed at the top/bottom edges regardless of vertical scroll.
@@ -4184,6 +4216,7 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
     file << "  \"silentScrubSpeed\":    " << m_audioEngine->getSilentScrubSpeed()<< ",\n";
     file << "  \"scrubSpeed\":          " << m_audioEngine->getScrubSpeed()      << ",\n";
     file << "  \"loopEnabled\":         " << (m_audioEngine->getLoopEnabled()          ? "true" : "false") << ",\n";
+    file << "  \"loopPlayback\":        " << (m_audioEngine->getLoopPlaybackEnabled()  ? "true" : "false") << ",\n";
     file << "  \"recordEnabled\":       " << (m_audioEngine->getRecordEnabled()        ? "true" : "false") << ",\n";
     file << "  \"returnToStartOnStop\": " << (m_audioEngine->getReturnToStartOnStop()  ? "true" : "false") << ",\n";
     file << "  \"totalMixMuted\":       " << (m_audioEngine->getTotalMixInputPairMuted() ? "true" : "false") << ",\n";
@@ -4426,6 +4459,10 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
     if ((k = readTop("silentScrubSpeed"))     != std::string::npos) m_audioEngine->setSilentScrubSpeed((float)readNumber(k));
     if ((k = readTop("scrubSpeed"))           != std::string::npos) m_audioEngine->setScrubSpeed((float)readNumber(k));
     if ((k = readTop("loopEnabled"))          != std::string::npos) m_audioEngine->setLoopEnabled(readBool(k));
+    // Absent in sessions saved before loop playback became separable from
+    // the markers — default ON so they behave as they always did.
+    m_audioEngine->setLoopPlaybackEnabled(
+        (k = readTop("loopPlayback")) != std::string::npos ? readBool(k) : true);
     if ((k = readTop("recordEnabled"))        != std::string::npos) m_audioEngine->setRecordEnabled(readBool(k));
     if ((k = readTop("returnToStartOnStop"))  != std::string::npos) m_audioEngine->setReturnToStartOnStop(readBool(k));
 

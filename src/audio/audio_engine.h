@@ -336,6 +336,12 @@ public:
 
     // Toggle-state accessors for session save/load.
     bool getLoopEnabled() const   { return m_loopLeftEnabled.load(); }
+    // Whether playback wraps at the loop markers. Separate from the markers
+    // being enabled, so looping can be switched off (double-tap pad 15)
+    // without losing the loop points. Defaults ON, which preserves the old
+    // behaviour where enabling the loop pair made playback loop.
+    bool getLoopPlaybackEnabled() const { return m_loopPlaybackEnabled.load(); }
+    void setLoopPlaybackEnabled(bool on) { m_loopPlaybackEnabled.store(on); }
     void setLoopEnabled(bool on)  { m_loopLeftEnabled.store(on); m_loopRightEnabled.store(on); markSessionDirty(); }
     bool getRecordEnabled() const { return m_recordLeftEnabled.load(); }
     void setRecordEnabled(bool on){ m_recordLeftEnabled.store(on); m_recordRightEnabled.store(on); markSessionDirty(); }
@@ -680,6 +686,9 @@ private:
 
     // Loop-left mode (pad 20 / LED 4). When enabled AND marker 0 is set,
     // pressing play jumps to marker 0 before starting playback.
+    // Loop playback (wrap-around) on/off, toggled by double-tapping pad 15.
+    // Defaults true so existing sessions behave exactly as before.
+    std::atomic<bool> m_loopPlaybackEnabled{true};
     std::atomic<bool> m_loopLeftEnabled{false};
     int m_lastLoopLeftLedState = -1;  // same -1 startup-sync trick as LED 3
 
