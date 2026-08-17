@@ -2428,14 +2428,17 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     if (pad == 36) {
         if (!pressed) {
             undoPop();
-            // Show UNDO briefly, then fall back to the playback state.
-            // undoPop() ends stopped and pushes its own OLED update, so
-            // this has to come after it or it would be overwritten.
-            oledShow("UNDO", " ");
-            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            m_oledRevertAtMs.store(nowMs + 1000);
-            dawLog("OLED: UNDO shown, revert scheduled +1000ms");
+            // Do NOT write the OLED here. undoPop() clears
+            // m_startupOledPushed, which makes the next updateController()
+            // tick re-push SETMODE:DESC + the playback state — landing on
+            // top of anything we write now. Queue it instead and let
+            // updateController emit it AFTER that forced push.
+            //
+            // This is why UNDO used to appear for a random length of time
+            // and then stopped appearing at all: the two writes always
+            // raced, and the serial layer's variable latency (fixed in
+            // 8f4c00e) was the only thing that ever let UNDO win.
+            m_pendingUndoOled.store(true);
         }
         return;
     }
@@ -2654,6 +2657,18 @@ void AudioEngine::updateController() {
         pushPlaybackStateToOled();
         syncSoloMuteLedsNow();   // paint the selected track's flags on 0/1
         syncInputMonitorLedNow();
+    }
+
+    // Pad-36 undo banner. Emitted HERE, after the block above, because
+    // undoPop() deliberately clears m_startupOledPushed to force the OLED
+    // back to the playback state — writing UNDO from the pad handler would
+    // simply be overwritten by that push a moment later.
+    if (m_pendingUndoOled.exchange(false)) {
+        oledShow("UNDO", " ");
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_oledRevertAtMs.store(nowMs + 1000);
+        dawLog("OLED: UNDO shown, revert scheduled +1000ms");
     }
 
     // Cheap tick: the DAW's own S/M buttons (or session load) can flip

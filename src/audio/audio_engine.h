@@ -686,6 +686,10 @@ private:
 
     // Loop-left mode (pad 20 / LED 4). When enabled AND marker 0 is set,
     // pressing play jumps to marker 0 before starting playback.
+    // Set by the pad-36 undo handler, consumed by updateController() so the
+    // "UNDO" banner is written AFTER undoPop's forced playback-state push
+    // rather than racing it.
+    std::atomic<bool> m_pendingUndoOled{false};
     // Loop playback (wrap-around) on/off, toggled by double-tapping pad 15.
     // Defaults true so existing sessions behave exactly as before.
     std::atomic<bool> m_loopPlaybackEnabled{true};
