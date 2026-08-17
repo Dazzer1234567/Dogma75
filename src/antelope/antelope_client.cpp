@@ -45,22 +45,25 @@ inline uint32_t stateKey(int mixerId, int channelId) {
 //
 // We never needed those reports: our reader thread only listens for
 // set_mixer_cfg broadcasts, which arrive regardless.
-// EXPERIMENT (2026-08-16): authorative flipped to false.
+// CONFIRMED FIX (2026-08-16): authorative MUST stay false.
 //
-// Hypothesis: the daemon hands authoritative ownership to whichever client
-// claims it and does NOT release it when that client disconnects. That
-// would explain why launching the DAW kills the CP's meters, why closing
-// the DAW does not restore them, and why the CP afterwards shows only the
-// device power tile — it can never reclaim ownership. Restarting
-// Antelope-Manager-Service is the only recovery, which is consistent with
-// ownership being daemon-resident state.
+// Sending true leaves the daemon in a state the Control Panel cannot
+// recover from: every meter dies, and the CP afterwards fails to open,
+// showing only the device power tile. It appears the daemon hands
+// authoritative ownership to whichever client claims it and never releases
+// it on disconnect.
 //
-// Cost if this is the cause: setChannelMute may stop reaching the DSP,
-// since authoritative was originally found to be what made writes take
-// effect (see the RE notes). That is the trade-off being measured here —
-// if the CP survives but mutes stop working, we need a design that claims
-// ownership only momentarily around a write rather than holding it for the
-// lifetime of the app.
+// The damage is sticky and daemon-resident: closing the DAW does NOT
+// restore the CP — only restarting Antelope-Manager-Service does. That
+// makes the obvious test ("close the DAW and see if it recovers") return a
+// false negative, which is exactly how this went undiagnosed for a while.
+// Reset the daemon before re-testing anything here.
+//
+// DSP writes still land with false — verified by ear, the monitor button
+// genuinely mutes the channel. So authority was never what made writes take
+// effect, despite what the RE notes originally concluded. What matters is
+// the persistent socket opened with initialize_format carrying raw
+// [cmd, args, kwargs] requests rather than the send_notification wrapper.
 constexpr const char kHandshakeBody[] =
     "[\"initialize_format\", [{"
     "\"authorative\": false, "
