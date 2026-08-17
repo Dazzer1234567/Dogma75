@@ -140,6 +140,16 @@ bool AntelopeClient::connectLocked() {
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&flag), sizeof(flag));
 
+    // Bound how long a send may block. setChannelMute() runs on the MAIN
+    // thread (and the serial reader thread for pad 35), so without this an
+    // AntelopeAudioServer that stops reading its socket would stall the DAW
+    // outright once the send window filled. That daemon has hung on us
+    // repeatedly, so this is a real failure mode, not a theoretical one.
+    // A dropped mute is recoverable; a frozen DAW is not.
+    DWORD sndTimeoutMs = 250;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&sndTimeoutMs), sizeof(sndTimeoutMs));
+
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
     dst.sin_port   = htons(m_port);
