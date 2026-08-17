@@ -1,7 +1,8 @@
-#include "gui_manager.h"
+﻿#include "gui_manager.h"
 #include "../audio/audio_engine.h"
 #include "../controller/serial_controller.h"
 #include "../util/daw_log.h"
+#include "../util/app_paths.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -10,7 +11,7 @@
 #include <algorithm>
 #include <chrono>
 
-// windows.h has to be included BEFORE SDL_syswm.h — the SDL header
+// windows.h has to be included BEFORE SDL_syswm.h â€” the SDL header
 // references HWND / HGLRC without pulling windows.h in itself.
 #ifdef _WIN32
 #define NOMINMAX
@@ -263,7 +264,7 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    // Start MAXIMISED, not fullscreen — an ordinary window filling the
+    // Start MAXIMISED, not fullscreen â€” an ordinary window filling the
     // screen, keeping its title bar and the taskbar accessible. Fullscreen
     // is still available at runtime via the existing toggle.
     m_window = SDL_CreateWindow(
@@ -286,7 +287,7 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     }
 
     SDL_GL_MakeCurrent(m_window, m_glContext);
-    SDL_GL_SetSwapInterval(0); // VSync off: shaves ~16 ms off input→pixel latency
+    SDL_GL_SetSwapInterval(0); // VSync off: shaves ~16 ms off inputâ†’pixel latency
                                // at the cost of possible tearing on the waveform.
 
     // Load OpenGL 3.3 functions
@@ -299,7 +300,7 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     // Load custom font
-    io.Fonts->AddFontFromFileTTF("c:\\0_CODE\\Dogma75\\external\\imgui\\misc\\fonts\\Glass_TTY_VT220.ttf", 16.0f);
+    io.Fonts->AddFontFromFileTTF(appPath("external\\imgui\\misc\\fonts\\Glass_TTY_VT220.ttf").c_str(), 16.0f);
 
     ImGui::StyleColorsDark();
 
@@ -315,7 +316,7 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
 
     // Auto-load the most recently used session, skipping any whose file has
     // since been moved or deleted. Replaces a hardcoded path that pointed at
-    // one particular session on one particular machine — it did not exist on
+    // one particular session on one particular machine â€” it did not exist on
     // the second machine, so every launch started empty and logged a failure.
     // Falls through to an empty session if the list is empty or nothing in it
     // still exists.
@@ -879,7 +880,7 @@ void GUIManager::renderBloom() {
     }
 
     // ===== LAYER 3: WAVEFORM =====
-    // Same story — deleting the last track cleared the draw commands but
+    // Same story â€” deleting the last track cleared the draw commands but
     // left the last blurred waveform in m_uiBlurTexture, so it kept
     // showing through as a ghost. Blur an empty FBO to zero it out.
     if (m_bloomUIIntensity > 0.001f) {
@@ -985,7 +986,7 @@ void GUIManager::drawLinesLayer() {
 #endif
 }
 
-// Native HWND for the SDL window — used as the owner for Win32
+// Native HWND for the SDL window â€” used as the owner for Win32
 // file-dialogs so they stay in front of the DAW and don't cause it to
 // drop behind. Returns NULL if SDL can't provide it (headless / non-
 // Windows), which falls back to an ownerless dialog.
@@ -1001,7 +1002,7 @@ static HWND sdlWindowHwnd(SDL_Window* window) {
 
 // Scope guard: while a common-dialog is open, drop the SDL window out
 // of fullscreen (Windows misbehaves badly when a modal dialog stacks
-// over a fullscreen-desktop window — the app can end up hidden). On
+// over a fullscreen-desktop window â€” the app can end up hidden). On
 // destruction, restores fullscreen if we had it.
 class DialogFullscreenGuard {
 public:
@@ -1030,9 +1031,9 @@ void GUIManager::processFrame() {
 #ifdef SDL2_FOUND
 #ifdef IMGUI_FOUND
     // Two paths post a jump request via AudioEngine:
-    //   * Pad-13 + E1 bookmark nav → anchor is -1 → "recentre so the
+    //   * Pad-13 + E1 bookmark nav â†’ anchor is -1 â†’ "recentre so the
     //     target frame sits 15% from the left" (only if off-screen).
-    //   * Loop/punch double-tap → anchor is the OLD playhead frame →
+    //   * Loop/punch double-tap â†’ anchor is the OLD playhead frame â†’
     //     pan the view by (target - anchor) so the marker lands under
     //     wherever the play line was drawn. Zoom unchanged in both.
     if (m_audioEngine) {
@@ -1056,7 +1057,7 @@ void GUIManager::processFrame() {
                 if (newCenter < minCenter) newCenter = minCenter;
                 if (newCenter > maxCenter) newCenter = maxCenter;
                 m_viewCenterPosition = (size_t)newCenter;
-                dawLog("GUI jump: anchor=%lld target=%lld delta=%+lld → viewCenter=%zu",
+                dawLog("GUI jump: anchor=%lld target=%lld delta=%+lld â†’ viewCenter=%zu",
                        (long long)anchorFrame, (long long)jumpFrame,
                        delta, m_viewCenterPosition);
             } else {
@@ -1071,7 +1072,7 @@ void GUIManager::processFrame() {
                 bool onScreen = ((size_t)jumpFrame >= curStart &&
                                  (size_t)jumpFrame <  curEnd);
                 if (onScreen) {
-                    dawLog("GUI jump: frame=%lld already on-screen (view=[%zu..%zu]) — no snap",
+                    dawLog("GUI jump: frame=%lld already on-screen (view=[%zu..%zu]) â€” no snap",
                            (long long)jumpFrame, curStart, curEnd);
                 } else {
                     long long viewStart = (long long)jumpFrame
@@ -1081,7 +1082,7 @@ void GUIManager::processFrame() {
                         viewStart = (m_timelineFrames > vis)
                                   ? (long long)(m_timelineFrames - vis) : 0;
                     m_viewCenterPosition = (size_t)viewStart + vis / 2;
-                    dawLog("GUI jump: frame=%lld off-screen → viewCenter=%zu (vis=%zu)",
+                    dawLog("GUI jump: frame=%lld off-screen â†’ viewCenter=%zu (vis=%zu)",
                            (long long)jumpFrame, m_viewCenterPosition, vis);
                 }
             }
@@ -1101,9 +1102,9 @@ void GUIManager::processFrame() {
         if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_RESIZED) {
             int w = event.window.data1;
             int h = event.window.data2;
-            // Minimize fires a 0×0 resize on Windows. Recreating bloom
-            // FBOs at 0×0 corrupts the GL state and the app never
-            // recovers on restore. Ignore any non-positive size — we'll
+            // Minimize fires a 0Ã—0 resize on Windows. Recreating bloom
+            // FBOs at 0Ã—0 corrupts the GL state and the app never
+            // recovers on restore. Ignore any non-positive size â€” we'll
             // get another RESIZED event with real dimensions when the
             // window is restored.
             if (w > 0 && h > 0) {
@@ -1169,7 +1170,7 @@ void GUIManager::processFrame() {
         }
     } else if (ImGui::IsKeyPressed(ImGuiKey_A, false) && !io.WantTextInput && !io.KeyCtrl) {
 #ifdef _WIN32
-        // Drop out of fullscreen for the duration of the dialog —
+        // Drop out of fullscreen for the duration of the dialog â€”
         // otherwise Windows can hide the DAW behind it.
         DialogFullscreenGuard fsGuard(m_window);
         char filename[MAX_PATH] = "";
@@ -1318,7 +1319,7 @@ void GUIManager::reportFrameStats(float total_ms, float midi_ms, float update_ms
 
     // Dump the whole ring buffer to perf.log with a SPIKE marker on the
     // triggering frame. Append mode so successive spikes accumulate.
-    std::ofstream f("c:\\0_CODE\\Dogma75\\perf.log", std::ios::app);
+    std::ofstream f(appPath("perf.log"), std::ios::app);
     if (!f.is_open()) return;
     f << "===== SPIKE " << total_ms << " ms at t=" << (nowMs - m_perfStartMs)
       << " ms (playing=" << (m_audioEngine && m_audioEngine->isPlaying() ? 1 : 0)
@@ -1359,7 +1360,7 @@ void GUIManager::renderToolbar() {
 #ifdef IMGUI_FOUND
     ImGuiIO& io = ImGui::GetIO();
 
-    // File menu — Open / Save / Revert / New in a single dropdown.
+    // File menu â€” Open / Save / Revert / New in a single dropdown.
     // Uses a button + BeginPopup rather than the main menu bar so it
     // stays visually consistent with the other toolbar buttons.
     static bool sPendingNewSession = false;   // opens modal after popup closes
@@ -1369,7 +1370,7 @@ void GUIManager::renderToolbar() {
     static std::string sPendingRecentOpen;   // loaded after the popup closes
     if (ImGui::BeginPopup("FileMenu")) {
         if (ImGui::MenuItem("Open session")) openSession();
-        // Recent Projects — hover to pop the list out to the right.
+        // Recent Projects â€” hover to pop the list out to the right.
         // Disabled (rather than hidden) when empty, so the entry doesn't
         // appear and disappear as the list fills up.
         if (m_recentSessions.empty()) ImGui::BeginDisabled();
@@ -1379,7 +1380,7 @@ void GUIManager::renderToolbar() {
                 size_t slash = full.find_last_of("/\\");
                 std::string name = (slash == std::string::npos)
                                  ? full : full.substr(slash + 1);
-                // Strip the .json extension — the folder path is in the
+                // Strip the .json extension â€” the folder path is in the
                 // tooltip, so the menu can show just the project name.
                 if (name.size() > 5 &&
                     name.compare(name.size() - 5, 5, ".json") == 0) {
@@ -1397,7 +1398,7 @@ void GUIManager::renderToolbar() {
                     sPendingRecentOpen = full;
                 }
                 if (missing) ImGui::EndDisabled();
-                // Full path on hover — the filename alone is ambiguous
+                // Full path on hover â€” the filename alone is ambiguous
                 // once the same project name exists in two folders.
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                     ImGui::SetTooltip("%s%s", full.c_str(),
@@ -1440,7 +1441,7 @@ void GUIManager::renderToolbar() {
         ImGui::OpenPopup("Unsaved changes");
         sPendingNewSession = false;
     }
-    // The modal itself — Save / Don't Save / Cancel.
+    // The modal itself â€” Save / Don't Save / Cancel.
     if (ImGui::BeginPopupModal("Unsaved changes", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted("The current session has unsaved changes.");
@@ -1468,7 +1469,7 @@ void GUIManager::renderToolbar() {
     }
     ImGui::SameLine();
 
-    // Current session name — filename only, no path or .json extension.
+    // Current session name â€” filename only, no path or .json extension.
     // "*" suffix when there are unsaved edits since the last save/load.
     // "(no session)" when nothing has been opened this run.
     {
@@ -1618,14 +1619,14 @@ void GUIManager::renderToolbar() {
         m_ledBrightnessNeedsPush = false;
     }
 
-    // LED brightness popup — one slider per channel + an "identify" button
+    // LED brightness popup â€” one slider per channel + an "identify" button
     // beside each so the user can locate which physical LED is which. The
     // popup is anchored to the "LED" toolbar button; toggle it with a click.
     ImGui::SameLine();
     if (ImGui::Button("LED")) {
         ImGui::OpenPopup("LEDPopup");
     }
-    // All-ON / All-OFF mode belongs to the popup — kept out here so we
+    // All-ON / All-OFF mode belongs to the popup â€” kept out here so we
     // can cancel it the moment the popup closes.
     // 0 = none, 1 = all on, 2 = all off
     static int sAllMode = 0;
@@ -1639,7 +1640,7 @@ void GUIManager::renderToolbar() {
     };
 
     if (ImGui::BeginPopup("LEDPopup")) {
-        // "All ON" / "All OFF" — mutually-exclusive toggle buttons that
+        // "All ON" / "All OFF" â€” mutually-exclusive toggle buttons that
         // hold every LED steady on / off for the physical wiring check.
         // Click one to activate, click again to deactivate. Clicking the
         // other flips the state and cancels the first.
@@ -1691,7 +1692,7 @@ void GUIManager::renderToolbar() {
             ImGui::PushID(ch);
             ImGui::TextUnformatted(ledNames[ch]);
             ImGui::SameLine(90);
-            ImGui::SetNextItemWidth(320);   // roughly 2× the original width
+            ImGui::SetNextItemWidth(320);   // roughly 2Ã— the original width
             if (ImGui::SliderFloat("##bright", &m_ledBrightness[ch], 0.0f, 1.0f, "%.2f")) {
                 uint16_t pca = (uint16_t)((1.0f - m_ledBrightness[ch]) * 4095.0f);
                 char buf[32];
@@ -1732,7 +1733,7 @@ void GUIManager::renderToolbar() {
         }
         ImGui::EndPopup();
     } else {
-        // Popup was closed — cancel any diagnostic overrides so the
+        // Popup was closed â€” cancel any diagnostic overrides so the
         // controller LEDs snap back to reflecting real application state.
         if (m_ledIdentifyChannel >= 0) {
             if (m_serialController) {
@@ -1809,7 +1810,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
         ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
 
-        // Inline lambda copied from the track view — needed for slider glow.
+        // Inline lambda copied from the track view â€” needed for slider glow.
         auto storeSliderGrab = [this](float value, float minVal, float maxVal) {
             ImVec2 sliderMin = ImGui::GetItemRectMin();
             ImVec2 sliderMax = ImGui::GetItemRectMax();
@@ -2073,7 +2074,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                                 m_audioEngine->getRenameBuffer(liveBuf, liveCursor);
                 if (renaming) {
                     // Fill pulses on the same triangle-wave phase as the
-                    // physical pad-20 / pad-21 LEDs — we reconstruct that
+                    // physical pad-20 / pad-21 LEDs â€” we reconstruct that
                     // phase on the DAW side from the RENAMESYNC message.
                     float b = m_audioEngine->getLedFlashBrightness();  // 0..1
                     // Cursor character follows the same phase: shown while
@@ -2167,12 +2168,12 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, c);
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,  c);
             };
-            // Mute — green when active (mirrors the controller's LED 0)
+            // Mute â€” green when active (mirrors the controller's LED 0)
             if (track->muted) pushBtnColor(ImVec4(0.00f, 0.70f, 0.30f, 1.0f));
             if (ImGui::Button("M", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->muted = !track->muted; m_audioEngine->markSessionDirty(); }
             if (track->muted) ImGui::PopStyleColor(3);
             ImGui::SameLine();
-            // Solo — yellow when active (mirrors the controller's LED 1)
+            // Solo â€” yellow when active (mirrors the controller's LED 1)
             if (track->solo) pushBtnColor(ImVec4(0.85f, 0.75f, 0.00f, 1.0f));
             if (ImGui::Button("S", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->solo = !track->solo; m_audioEngine->markSessionDirty(); }
             if (track->solo) ImGui::PopStyleColor(3);
@@ -2182,7 +2183,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
             if (ImGui::Button("R", msrBtnSize)) { m_audioEngine->undoSnapshot(); track->armed = !track->armed; m_audioEngine->markSessionDirty(); }
             if (track->armed) ImGui::PopStyleColor(3);
             ImGui::SameLine();
-            // Input monitor — cyan/teal when active. Just a state toggle for
+            // Input monitor â€” cyan/teal when active. Just a state toggle for
             // now; audio path wiring can come later.
             if (track->inputMonitor) pushBtnColor(ImVec4(0.10f, 0.65f, 0.85f, 1.0f));
             if (ImGui::Button("I", msrBtnSize)) {
@@ -2276,7 +2277,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                         }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
-                    // Then mono channels — a single output channel is
+                    // Then mono channels â€” a single output channel is
                     // useful for routing to a single hardware output that
                     // the audio interface's mixer will then handle.
                     int numMonoOut = numPairs * 2;
@@ -2304,9 +2305,9 @@ void GUIManager::renderTrackPanel(float width, float height) {
             // peak (input signal when the "I" monitor is on, playback
             // when off) and applies attack-fast / decay-slow smoothing.
             // Colour bands mirror a standard channel-strip meter:
-            //   0.0 .. -18 dB  → green
-            //   -18 .. -6 dB   → yellow
-            //   -6  .. 0  dB   → red (clip zone)
+            //   0.0 .. -18 dB  â†’ green
+            //   -18 .. -6 dB   â†’ yellow
+            //   -6  .. 0  dB   â†’ red (clip zone)
             {
                 if ((int)m_trackMeterDecay.size() <= (int)i) m_trackMeterDecay.resize(i + 1, 0.0f);
                 float raw = m_audioEngine->getTrackMeter((int)i);
@@ -2320,11 +2321,11 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 m_trackMeterDecay[i] = v;
 
                 // Log-ish mapping so the bar reflects perceived level
-                // instead of linear amplitude: -60 dB → 0 %, 0 dB → 100 %.
+                // instead of linear amplitude: -60 dB â†’ 0 %, 0 dB â†’ 100 %.
                 float bar = 0.0f;
                 if (v > 1e-4f) {
                     float db = 20.0f * std::log10(v);
-                    bar = 1.0f + db / 60.0f;   // -60 → 0, 0 → 1
+                    bar = 1.0f + db / 60.0f;   // -60 â†’ 0, 0 â†’ 1
                     if (bar < 0.0f) bar = 0.0f;
                     if (bar > 1.0f) bar = 1.0f;
                 }
@@ -2352,7 +2353,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
 
             ImGui::EndChild();
 
-            // Horizontal separator between tracks — visually carries into the
+            // Horizontal separator between tracks â€” visually carries into the
             // arrangement view (which also uses Separator at matching heights).
             ImGui::Separator();
 
@@ -2429,7 +2430,7 @@ void GUIManager::renderWaveform(float height) {
         if (visD < 100.0) visD = 100.0;
         size_t playPos       = m_audioEngine->getPlaybackPosition();
 
-        // E3 + modifier scroll — same handling per-track used to do.
+        // E3 + modifier scroll â€” same handling per-track used to do.
         long scrollDelta = m_audioEngine->consumeViewScrollDelta();
         if (scrollDelta != 0) {
             long newCenter = (long)m_viewCenterPosition + scrollDelta;
@@ -2491,7 +2492,7 @@ void GUIManager::renderWaveform(float height) {
         // Publish the viewport to the reader thread so encoder marker
         // moves and enableMarkerAtDefault (loop/rec pair press) can
         // compute frame positions from the CURRENT view, not from an
-        // outdated one — even when no track has any audio (the per-track
+        // outdated one â€” even when no track has any audio (the per-track
         // publish path used to be skipped in that case).
         m_audioEngine->setViewportRange((size_t)m_viewStartD,
                                         (size_t)m_visibleFramesD);
@@ -2500,7 +2501,7 @@ void GUIManager::renderWaveform(float height) {
     // ---- Time ruler ----
     // Same left/width as the arrangement child below, so tick x-positions
     // line up with the waveform frames underneath. Tick interval scales
-    // with zoom — at 1 second per pixel we show 1-min marks with minor
+    // with zoom â€” at 1 second per pixel we show 1-min marks with minor
     // 10-sec ticks; zooming in walks that down to 1-second increments.
     {
         // View state was already computed by the pre-pass above, so we
@@ -2517,12 +2518,12 @@ void GUIManager::renderWaveform(float height) {
         size_t viewStart = (size_t)viewStartD;
         size_t viewEnd   = viewStart + visibleFrames;
 
-        // Ruler layout — major ticks span the full ruler height, labels
+        // Ruler layout â€” major ticks span the full ruler height, labels
         // sit vertically centred right next to their tick. The reserved
         // vertical space matches ImGui::GetFrameHeight() so the trailing
         // Separator ends up at the SAME Y as the left panel's Separator
         // (which sits directly under its "TRACKS / SCRUBBING / WAVEFORM"
-        // combo — same frame height).
+        // combo â€” same frame height).
         const float rulerH        = ImGui::GetFrameHeight();
         const float labelH        = ImGui::GetTextLineHeight();
         const float labelY        = (rulerH - labelH) * 0.5f;     // centred
@@ -2541,7 +2542,7 @@ void GUIManager::renderWaveform(float height) {
         ImGui::Dummy(ImVec2(1.0f, 15.0f));
 
         // Feed the tick / bookmark X math the full-precision viewStart
-        // and visibleFrames — using the truncated size_t versions would
+        // and visibleFrames â€” using the truncated size_t versions would
         // re-introduce the same 1-frame jitter we just eliminated.
         double startSec = viewStartD / sampleRate;
         double endSec   = (viewStartD + visD) / sampleRate;
@@ -2549,7 +2550,7 @@ void GUIManager::renderWaveform(float height) {
         if (spanSec > 0.0 && width > 1.0f) {
             double pxPerSec = (double)width / spanSec;
             // Pick the smallest interval from the ladder below that gives
-            // at least ~70 px between major ticks — labels stay readable.
+            // at least ~70 px between major ticks â€” labels stay readable.
             const double ladder[] = { 0.1, 0.5, 1, 5, 10, 30, 60, 300, 600, 1800, 3600 };
             const int nLadder = sizeof(ladder) / sizeof(ladder[0]);
             double major = ladder[nLadder - 1];
@@ -2669,7 +2670,7 @@ void GUIManager::renderWaveform(float height) {
     int selectedTrack = m_audioEngine->getSelectedTrack();
     int trackCount = m_audioEngine->getTrackCount();
 
-    // Per-track slot height — MUST match the left panel exactly so the
+    // Per-track slot height â€” MUST match the left panel exactly so the
     // horizontal separators line up. Auto-fit up to FIT_LIMIT tracks,
     // then lock at 1/FIT_LIMIT and let the scrollbar handle overflow.
     static constexpr int    FIT_LIMIT_ARR   = 5;
@@ -2690,7 +2691,7 @@ void GUIManager::renderWaveform(float height) {
     // its marker/playhead line into the separator gap so the vertical stack
     // reads as one unbroken line rather than a series of segments.
     bool isFirstArrangementTrack = true;
-    // Captured from the FIRST drawn track: X-axis mapping (frame → pixel)
+    // Captured from the FIRST drawn track: X-axis mapping (frame â†’ pixel)
     // used by the after-loop overlay that draws markers, playhead, the
     // top triangles, and the bottom horizontal bar. The overlay pins those
     // to the arrangement child's screen bounds so scrolling the tracks
@@ -2707,14 +2708,14 @@ void GUIManager::renderWaveform(float height) {
         if (track && !track->audioData.empty()) {
             bool isSelected = (selectedTrack == i);
 
-            // (Track name intentionally not drawn here — the left panel's
+            // (Track name intentionally not drawn here â€” the left panel's
             // TR# label is the single source of truth for name/state.)
 
             const std::vector<float>& audioData = track->audioData;
             int channels = track->channels;
             // Defensive: never divide by zero. audioData being non-empty
             // with channels==0 would be a bug in loadAudio / recording
-            // setup — treat it as "no audio" for this frame so the render
+            // setup â€” treat it as "no audio" for this frame so the render
             // doesn't crash, and log the inconsistency exactly once.
             if (channels <= 0) {
                 static bool sLoggedOnce = false;
@@ -2731,7 +2732,7 @@ void GUIManager::renderWaveform(float height) {
             }
             // trackFrames = this track's own audio length (used for texture
             // uv mapping and clip). totalFrames = the shared arrangement
-            // timeline used for view / zoom / scroll math — independent of
+            // timeline used for view / zoom / scroll math â€” independent of
             // any single track so recording never resizes the view.
             size_t trackFrames = audioData.size() / channels;
             size_t totalFrames = (m_timelineFrames > 0) ? m_timelineFrames : trackFrames;
@@ -2798,7 +2799,7 @@ void GUIManager::renderWaveform(float height) {
                 // pre-pass at the top of renderWaveform, so
                 // m_viewCenterPosition / m_viewStartD / m_visibleFramesD
                 // are already up-to-date. The duplicated per-track
-                // pin logic used to run here — kept as a false branch
+                // pin logic used to run here â€” kept as a false branch
                 // just to preserve the structure below without divergence.
                 long   scrollDelta = 0;
                 bool   zoomChanged = false;
@@ -2816,7 +2817,7 @@ void GUIManager::renderWaveform(float height) {
                     // Determine anchor mode. Sticky within a zoom operation:
                     // we only re-evaluate on direction reversal or first zoom
                     // ever. Continuing zoom in the same direction keeps the
-                    // previous anchor mode — so a zoom-out that reveals the
+                    // previous anchor mode â€” so a zoom-out that reveals the
                     // playhead mid-operation keeps zooming around the view
                     // centre until the user reverses direction.
                     int currentDir = (zoom > m_lastZoom) ? +1 : -1;
@@ -2843,7 +2844,7 @@ void GUIManager::renderWaveform(float height) {
 
                     if (m_zoomAnchorPinPlayhead) {
                         // Pin the playhead using the captured stable
-                        // fraction — no accumulated truncation error.
+                        // fraction â€” no accumulated truncation error.
                         // Compute visibleFrames as DOUBLE (not the
                         // truncated size_t) so the pin math stays
                         // sub-frame accurate. Store the double result
@@ -2877,7 +2878,7 @@ void GUIManager::renderWaveform(float height) {
                 // the user has that turned on AND playback is actually
                 // running. Skip on zoom-change ticks so we don't undo the
                 // playhead-pinning we just did above. And skip while paused
-                // — otherwise panning the view (with pad 24 + E2) so the
+                // â€” otherwise panning the view (with pad 24 + E2) so the
                 // playhead ends up off-screen would trigger a jump back
                 // to the playhead the moment you release the encoder.
                 if (needsRecenter && scrollDelta == 0 && m_waveformAutoPage
@@ -2933,7 +2934,7 @@ void GUIManager::renderWaveform(float height) {
                     float sumSquares = 0.0f;
                     size_t sampleCount = 0;
                     for (size_t frame = barFrameStart; frame < barFrameEnd; frame++) {
-                        // Belt-and-braces bound check — trackFrames is
+                        // Belt-and-braces bound check â€” trackFrames is
                         // audioData.size()/channels so frame*channels+ch
                         // should always fit, but guard anyway to survive
                         // any concurrent audioData replacement.
@@ -2972,7 +2973,7 @@ void GUIManager::renderWaveform(float height) {
                     m_waveformDrawCmds.push_back(cmd);
                 }
             } else {
-                // Pre-rendered GPU texture path — sub-pixel smooth under
+                // Pre-rendered GPU texture path â€” sub-pixel smooth under
                 // zoom / pan because the GPU linear-filters the texture.
                 // Two levels of detail:
                 //   overview  : whole track, built once at load time
@@ -2989,7 +2990,7 @@ void GUIManager::renderWaveform(float height) {
                 if (tMut && tMut->waveformTex && trackFrames > 0) {
                     // Track's audio occupies world frames [0, trackFrames].
                     // Draw only the portion that overlaps the shared view
-                    // [viewStart, viewEnd] — a track shorter than the
+                    // [viewStart, viewEnd] â€” a track shorter than the
                     // timeline (e.g. a fresh recording mid-take) occupies
                     // just its left portion, not the whole row width.
                     size_t drawStartFrame = viewStart;
@@ -3004,7 +3005,7 @@ void GUIManager::renderWaveform(float height) {
                     if (bottom > cursorPos.y + waveformSize.y) bottom = cursorPos.y + waveformSize.y;
 
                     // Pixel bounds for the visible portion of the track's
-                    // audio — mapped through the SHARED timeline view.
+                    // audio â€” mapped through the SHARED timeline view.
                     float pxLeft  = cursorPos.x + (float)((double)(drawStartFrame - viewStart) / (double)visibleFrames) * waveformSize.x;
                     float pxRight = cursorPos.x + (float)((double)(drawEndFrame   - viewStart) / (double)visibleFrames) * waveformSize.x;
 
@@ -3028,7 +3029,7 @@ void GUIManager::renderWaveform(float height) {
                         // fewer than one bucket doesn't shift any texel
                         // content, and panning past the covered edge just
                         // re-uploads the same texels for a different aligned
-                        // window — no per-rebuild content jitter.
+                        // window â€” no per-rebuild content jitter.
                         size_t fpbTarget = 1;
                         while (fpbTarget * 2 <= viewFPP) fpbTarget *= 2;
 
@@ -3087,7 +3088,7 @@ void GUIManager::renderWaveform(float height) {
                     cmd.color  = waveColor;
                     m_waveformDrawCmds.push_back(cmd);
 
-                    // Fresh-take overlay — paint the frame range covered
+                    // Fresh-take overlay â€” paint the frame range covered
                     // by the most recent recording in orange, on top of
                     // the standard blue/white waveform. Uses the same
                     // texture (uv clipped to the take range) so the shape
@@ -3148,7 +3149,7 @@ void GUIManager::renderWaveform(float height) {
             }
             isFirstArrangementTrack = false;
 
-            // Horizontal separator between tracks — visually pairs with the
+            // Horizontal separator between tracks â€” visually pairs with the
             // matching Separator in the left panel's TRACKS view, and picks
             // up the track's blue/gray colour like the rest of the row.
             ImGui::PushStyleColor(ImGuiCol_Separator,
@@ -3158,7 +3159,7 @@ void GUIManager::renderWaveform(float height) {
             ImGui::PopStyleColor();
         }
         else if (track) {
-            // Empty track (no audio loaded yet) — show a placeholder slot so
+            // Empty track (no audio loaded yet) â€” show a placeholder slot so
             // the user can see the track exists in the arrangement. Name
             // is intentionally not drawn here; only in the left panel.
             bool isSelected = (selectedTrack == i);
@@ -3225,10 +3226,10 @@ void GUIManager::renderWaveform(float height) {
     }
 
     // A session with NO tracks draws no track strips, so nothing above
-    // captured the frame→pixel mapping and the whole overlay below would be
+    // captured the frameâ†’pixel mapping and the whole overlay below would be
     // skipped: no loop or punch markers, no play line, nothing to aim at.
     // A fresh session should still be a usable timeline you can place
-    // markers on and run the playhead over — there is simply no audio.
+    // markers on and run the playhead over â€” there is simply no audio.
     //
     // Synthesise the mapping from the arrangement child's own width and the
     // shared view state (m_viewStartD / m_visibleFramesD), which the pre-pass
@@ -3245,7 +3246,7 @@ void GUIManager::renderWaveform(float height) {
         arrLastViewEnd       = arrLastViewStart + arrLastVisibleFrames;
     }
 
-    // Marker + playhead overlay — pinned to the arrangement child's
+    // Marker + playhead overlay â€” pinned to the arrangement child's
     // screen bounds so triangles, vertical lines, and the loop/rec bar
     // stay fixed at the top/bottom edges regardless of vertical scroll.
     if (arrHasDrawnTrack) {
@@ -3323,9 +3324,9 @@ void GUIManager::renderWaveform(float height) {
             m_lineDrawCmds.push_back(textCmd);
         }
 
-        // Playhead — same fixed vertical span as the markers. If it
+        // Playhead â€” same fixed vertical span as the markers. If it
         // lands on top of an enabled loop/punch marker (within a couple
-        // of pixels — screen-space, not frame-space, since one pixel
+        // of pixels â€” screen-space, not frame-space, since one pixel
         // covers many frames when zoomed out), switch to dashed so the
         // marker's yellow/red bar shows through the gaps and you can
         // tell they're stacked instead of losing the marker under the
@@ -3386,7 +3387,7 @@ void GUIManager::renderWaveform(float height) {
             }
         }
 
-        // Loop/rec horizontal bars — pinned to the bottom edge of the
+        // Loop/rec horizontal bars â€” pinned to the bottom edge of the
         // arrangement child window (does not scroll away). When BOTH
         // markers of a pair are defined but the pair is currently OFF
         // (isMarkerEnabled false, markerEverSet true), the bar draws
@@ -3406,7 +3407,7 @@ void GUIManager::renderWaveform(float height) {
         // Draws the bottom bar segment between two markers, either solid
         // (segment is "on") or dashed (segment is "defined but off").
         // Whether it draws at all is left to the caller (loop/record
-        // states are independent — the yellow segments follow the loop
+        // states are independent â€” the yellow segments follow the loop
         // pair, the red middle follows the record pair).
         auto drawSegment = [&](size_t posA, size_t posB, ImU32 color, bool solid) {
             size_t drawStart = (posA < arrLastViewStart) ? arrLastViewStart : posA;
@@ -3433,8 +3434,8 @@ void GUIManager::renderWaveform(float height) {
         bool recOn   = m_audioEngine->isMarkerEnabled(1) &&
                        m_audioEngine->isMarkerEnabled(2);
 
-        // Yellow — loop pair. Split around the record region when it
-        // exists, otherwise draw one continuous line loop-left → loop-right.
+        // Yellow â€” loop pair. Split around the record region when it
+        // exists, otherwise draw one continuous line loop-left â†’ loop-right.
         if (loopDef) {
             size_t p0 = m_audioEngine->getMarkerPosition(0);
             size_t p3 = m_audioEngine->getMarkerPosition(3);
@@ -3447,7 +3448,7 @@ void GUIManager::renderWaveform(float height) {
                 drawSegment(p0, p3, yellowColor, loopOn);
             }
         }
-        // Red — record pair, whatever the loop is doing.
+        // Red â€” record pair, whatever the loop is doing.
         if (recDef) {
             size_t p1 = m_audioEngine->getMarkerPosition(1);
             size_t p2 = m_audioEngine->getMarkerPosition(2);
@@ -3613,7 +3614,7 @@ void GUIManager::renderTransportBar() {
         ImGui::PopStyleColor(3);
     }
 
-    // (Glow controls moved to left panel → WAVEFORM view.)
+    // (Glow controls moved to left panel â†’ WAVEFORM view.)
 
     // Color picker popup
     if (m_colorScheme == 1 && m_showColorPickers) {
@@ -3970,12 +3971,14 @@ void GUIManager::applyColorScheme(int scheme) {
 }
 
 void GUIManager::saveSettings() {
-    // Create settings directory if it doesn't exist
+    // Create settings directory if it doesn't exist. CreateDirectoryA
+    // rather than shelling out to cmd — no console window flash, no quoting
+    // hazards, and it works wherever the project happens to live.
     #ifdef _WIN32
-    system("if not exist \"c:\\0_CODE\\Dogma75\\settings\" mkdir \"c:\\0_CODE\\Dogma75\\settings\"");
+    CreateDirectoryA(appPath("settings").c_str(), nullptr);
     #endif
 
-    std::ofstream file("c:\\0_CODE\\Dogma75\\settings\\user_settings.json");
+    std::ofstream file(appPath("settings\\user_settings.json"));
     if (!file.is_open()) {
         std::cerr << "Failed to save settings!" << std::endl;
         return;
@@ -4084,13 +4087,13 @@ void GUIManager::saveSettings() {
     file << "}\n";
 
     file.close();
-    std::cout << "Settings saved to c:\\0_CODE\\Dogma75\\settings\\user_settings.json" << std::endl;
+    std::cout << ("Settings saved to " + appPath("settings\\user_settings.json")) << std::endl;
 }
 
 void GUIManager::saveSession() {
     // Overwrite the current session file with no prompt. Only falls back
     // to Save As if we don't yet have a target path (fresh session, or a
-    // session loaded from disk hasn't been re-saved yet — actually load
+    // session loaded from disk hasn't been re-saved yet â€” actually load
     // sets m_currentSessionPath too, so in practice this branch fires
     // only when nothing has been opened or saved this run).
     if (m_currentSessionPath.empty()) {
@@ -4104,8 +4107,9 @@ void GUIManager::saveSession() {
 // saved yet, so m_currentSessionPath is empty) always offers to save
 // here; once a session lives somewhere else, that becomes its home and
 // Save As reopens there instead.
-static const char kDefaultSessionDir[] =
-    "c:\\0_CODE\\Dogma75\\Workspace\\SESSIONS";
+static std::string defaultSessionDir() {
+    return appPath("Workspace\\SESSIONS");
+}
 
 #ifdef _WIN32
 // Folder the session dialogs should open in.
@@ -4120,16 +4124,17 @@ static std::string sessionDialogDir(const std::string& currentSessionPath) {
                 return dir;
             }
             // Fall through if the session's folder has since been moved
-            // or deleted — better the default than a dead path.
+            // or deleted â€” better the default than a dead path.
         }
     }
     // Create on demand: the common-dialog silently IGNORES an
     // lpstrInitialDir that doesn't exist and drops the user next to the
     // .exe instead, which is what used to happen with the stale paths
     // carried over in user_settings.json.
-    CreateDirectoryA("c:\\0_CODE\\Dogma75\\Workspace", nullptr);
-    CreateDirectoryA(kDefaultSessionDir, nullptr);
-    return kDefaultSessionDir;
+    const std::string dflt = defaultSessionDir();
+    CreateDirectoryA(appPath("Workspace").c_str(), nullptr);
+    CreateDirectoryA(dflt.c_str(), nullptr);
+    return dflt;
 }
 #endif
 
@@ -4263,7 +4268,7 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
     }
     file << "  ],\n";
 
-    // Bookmarks — timeline markers dropped via pad 13. Each entry has
+    // Bookmarks â€” timeline markers dropped via pad 13. Each entry has
     // a frame position + a user-typed name. Read back on session load.
     auto escape = [](const std::string& s) {
         std::string out;
@@ -4323,7 +4328,7 @@ void GUIManager::openSession() {
         saveSettings();
     }
     loadSessionFromFile(filename);
-    // User-triggered open — the loaded mute state IS authoritative here.
+    // User-triggered open â€” the loaded mute state IS authoritative here.
     // Push it to TotalMix + the OLED indicator (loadSessionFromFile
     // deliberately leaves this to the caller so startup auto-load can
     // opt out).
@@ -4345,7 +4350,7 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
     std::stringstream buf; buf << file.rdbuf();
     std::string json = buf.str();
 
-    // Minimal JSON walker — we only read strings, numbers, and booleans from
+    // Minimal JSON walker â€” we only read strings, numbers, and booleans from
     // fixed keys the saver wrote. Each track object starts at a "{" nested
     // inside the "tracks" array; we scan sequentially.
     auto findKeyAfter = [&](const std::string& key, size_t from) -> size_t {
@@ -4439,7 +4444,7 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         if (nxt == std::string::npos || json[nxt] == ']') break;
     }
 
-    // Top-level scalar restore. Each is optional — missing keys leave the
+    // Top-level scalar restore. Each is optional â€” missing keys leave the
     // current value in place, which is the right behaviour for older
     // session files that pre-date some of these fields.
     auto readTop = [&](const std::string& key) -> size_t {
@@ -4460,13 +4465,13 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
     if ((k = readTop("scrubSpeed"))           != std::string::npos) m_audioEngine->setScrubSpeed((float)readNumber(k));
     if ((k = readTop("loopEnabled"))          != std::string::npos) m_audioEngine->setLoopEnabled(readBool(k));
     // Absent in sessions saved before loop playback became separable from
-    // the markers — default ON so they behave as they always did.
+    // the markers â€” default ON so they behave as they always did.
     m_audioEngine->setLoopPlaybackEnabled(
         (k = readTop("loopPlayback")) != std::string::npos ? readBool(k) : true);
     if ((k = readTop("recordEnabled"))        != std::string::npos) m_audioEngine->setRecordEnabled(readBool(k));
     if ((k = readTop("returnToStartOnStop"))  != std::string::npos) m_audioEngine->setReturnToStartOnStop(readBool(k));
 
-    // Markers array — walk it the same way as the tracks array.
+    // Markers array â€” walk it the same way as the tracks array.
     size_t markersKey = json.find("\"markers\"");
     if (markersKey != std::string::npos) {
         size_t mcur = markersKey;
@@ -4496,7 +4501,7 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         }
     }
 
-    // OSC mute shadow — restore silently (no OSC push here; the syncTotalMix
+    // OSC mute shadow â€” restore silently (no OSC push here; the syncTotalMix
     // call at the end of this function forces external state to match).
     {
         size_t k = json.find("\"totalMixMuted\"");
@@ -4512,7 +4517,7 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         }
     }
 
-    // Bookmarks array — clear then repopulate.
+    // Bookmarks array â€” clear then repopulate.
     m_audioEngine->clearBookmarks();
     size_t bookmarksKey = json.find("\"bookmarks\"");
     if (bookmarksKey != std::string::npos) {
@@ -4578,7 +4583,7 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         m_audioEngine->setSessionDir(sdir);
         // Mute-to-hardware sync is intentionally NOT called here. Startup
         // auto-load must always land unmuted regardless of what the file
-        // has — only user-triggered opens (openSession / revertSession)
+        // has â€” only user-triggered opens (openSession / revertSession)
         // are allowed to activate mute. Those paths call sync explicitly
         // right after this returns.
     }
@@ -4592,7 +4597,7 @@ void GUIManager::revertSession() {
     // opened this DAW run.
     if (m_currentSessionPath.empty()) return;
     loadSessionFromFile(m_currentSessionPath);
-    // Same as openSession — user-triggered load pushes the reloaded mute
+    // Same as openSession â€” user-triggered load pushes the reloaded mute
     // state to hardware.
     if (m_audioEngine) {
         m_audioEngine->syncTotalMixMuteToHardware();
@@ -4601,7 +4606,7 @@ void GUIManager::revertSession() {
 }
 
 void GUIManager::closeSession() {
-    // Wipe all tracks, markers, and per-session state — leaves the DAW
+    // Wipe all tracks, markers, and per-session state â€” leaves the DAW
     // running with a blank slate ready for a new session or fresh audio.
     if (!m_audioEngine) return;
     for (int i = m_audioEngine->getTrackCount() - 1; i >= 0; i--) {
@@ -4667,8 +4672,8 @@ void GUIManager::uploadWaveformTexture(Track* t) {
     }
     // Wide, short texture: enough horizontal resolution that GPU linear
     // filtering never shows individual texels even at deep zoom, and just
-    // tall enough that vertical scaling looks smooth. 16384 × 256 × 4 =
-    // 16 MB per track — comfortable on any GPU from the last decade.
+    // tall enough that vertical scaling looks smooth. 16384 Ã— 256 Ã— 4 =
+    // 16 MB per track â€” comfortable on any GPU from the last decade.
     const int W = 16384;
     const int H = 256;
     std::vector<uint32_t> pixels(W * H, 0);
@@ -4717,7 +4722,7 @@ void GUIManager::uploadWaveformDetailTexture(Track* t, size_t startFrame, size_t
     if (total == 0 || framesPerBucket == 0) return;
     const int W = 8192;
     const int H = 256;
-    // Snap startFrame down to a framesPerBucket boundary — key invariant
+    // Snap startFrame down to a framesPerBucket boundary â€” key invariant
     // that keeps texel content identical across rebuilds.
     startFrame = (startFrame / framesPerBucket) * framesPerBucket;
     size_t endFrame = startFrame + (size_t)W * framesPerBucket;
@@ -4733,7 +4738,7 @@ void GUIManager::uploadWaveformDetailTexture(Track* t, size_t startFrame, size_t
     else std::fill(pixels.begin(), pixels.begin() + W * H, 0);
 
     // At extreme zoom, framesPerBucket can drop below the peak pyramid's
-    // base bucket size (64 samples) — the pyramid would then return the
+    // base bucket size (64 samples) â€” the pyramid would then return the
     // coarser 64-sample level, blurring what should be sample-accurate.
     // Read raw samples directly in that regime so the render stays crisp
     // all the way down to one sample per texel.
@@ -4791,7 +4796,7 @@ void GUIManager::uploadWaveformDetailTexture(Track* t, size_t startFrame, size_t
 }
 
 void GUIManager::loadSettings() {
-    std::ifstream file("c:\\0_CODE\\Dogma75\\settings\\user_settings.json");
+    std::ifstream file(appPath("settings\\user_settings.json"));
     if (!file.is_open()) {
         std::cout << "No settings file found, using defaults" << std::endl;
         return;
@@ -4868,7 +4873,7 @@ void GUIManager::loadSettings() {
     m_waveformVerticalZoom = getFloat("waveformVerticalZoom", 1.0f);
     m_trackHeight = getFloat("trackHeight", 80.0f);
     m_controllerMode = getInt("controllerMode", 1);  // Default to Custom Mackie
-    // Per-channel LED brightness. Missing key → defaults stay at 1.0 (max).
+    // Per-channel LED brightness. Missing key â†’ defaults stay at 1.0 (max).
     getFloatArray("ledBrightness", m_ledBrightness, 9);
     // Mark for one-shot push to firmware after the serial controller is up.
     m_ledBrightnessNeedsPush = true;
@@ -4908,7 +4913,7 @@ void GUIManager::loadSettings() {
     m_lastAudioDir   = unescape(getString("lastAudioDir"));
     m_lastSessionDir = unescape(getString("lastSessionDir"));
 
-    // Recent sessions array — walk the quoted strings between [ and ].
+    // Recent sessions array â€” walk the quoted strings between [ and ].
     // Deliberately does NOT drop entries whose file is missing: a session
     // on a disconnected drive should still be listed (greyed out) rather
     // than silently disappearing from the menu.
@@ -5012,5 +5017,7 @@ void GUIManager::loadSettings() {
     // Apply color scheme
     applyColorScheme(m_colorScheme);
 
-    std::cout << "Settings loaded from c:\\0_CODE\\Dogma75\\settings\\user_settings.json" << std::endl;
+    std::cout << ("Settings loaded from " + appPath("settings\\user_settings.json")) << std::endl;
 }
+
+

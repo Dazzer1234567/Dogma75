@@ -112,16 +112,11 @@ int main(int argc, char** argv) {
 
     std::cout << std::endl;
 
-    // Auto-load WAV file into a track
-    std::string defaultWavPath = "C:\\0_CODE\\Audio\\James.wav";
-    int trackIndex = audioEngine.addTrack("James");
-    if (audioEngine.loadTrackAudio(trackIndex, defaultWavPath)) {
-        std::cout << "Auto-loaded: " << defaultWavPath << std::endl;
-    } else {
-        std::cerr << "Warning: Could not auto-load " << defaultWavPath << std::endl;
-    }
-
-    std::cout << std::endl;
+    // (Removed) An auto-load of C:\0_CODE\Audio\James.wav used to run here.
+    // The path only existed on one machine, so on any other it failed and
+    // still left an empty track called "James" behind on every launch — the
+    // stray track that kept appearing in the logs. Startup now opens the
+    // most recent session instead (see GUIManager::initialize).
 
     // Initialize GUI
     GUIManager guiManager;

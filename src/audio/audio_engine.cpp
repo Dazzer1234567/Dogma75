@@ -1,5 +1,6 @@
-#include "audio_engine.h"
+﻿#include "audio_engine.h"
 #include "../util/daw_log.h"
+#include "../util/app_paths.h"
 #include "../osc/osc_sender.h"
 #include "../antelope/antelope_client.h"
 #include <iostream>
@@ -130,7 +131,7 @@ bool AudioEngine::initialize() {
 #endif
 
     // OSC to TotalMix FX. Local TotalMix listens on Remote Controller 1's
-    // "Port incoming" — 7001 by default. Failure is non-fatal; the chord
+    // "Port incoming" â€” 7001 by default. Failure is non-fatal; the chord
     // handler just no-ops if the sender never opened.
     m_osc = std::make_unique<OscSender>();
     if (!m_osc->init("127.0.0.1", 7001)) {
@@ -149,7 +150,7 @@ bool AudioEngine::initialize() {
     }
     // Follow the mixer as well as drive it: a mute toggled by hand in the
     // Antelope Control Panel now updates the matching track's monitor
-    // button. Fires on the client's READER thread, so it only queues —
+    // button. Fires on the client's READER thread, so it only queues â€”
     // updateController() applies it on the main thread where touching
     // m_tracks is safe.
     m_antelope->setMuteChangeCallback([this](int channel, bool muted) {
@@ -234,7 +235,7 @@ void AudioEngine::play() {
            (int)hasAudio, (int)anyArmed,
            (size_t)m_playbackPosition.load(),
            m_tracks.size(), m_maxInputChannels);
-    // Start playback unconditionally — even with no audio and no armed
+    // Start playback unconditionally â€” even with no audio and no armed
     // track, the playhead advances so the user can watch it sweep across
     // an empty arrangement (matches the "empty session" convention).
     {
@@ -245,7 +246,7 @@ void AudioEngine::play() {
         // press, end-of-file auto-stop, mod+play rejection, etc.).
         m_playStartPosition.store(m_playbackPosition.load());
 
-        // Prepare record slots for every armed track — clear the buffer,
+        // Prepare record slots for every armed track â€” clear the buffer,
         // fix the channel count for this take. Reserve ~2 minutes so
         // typical takes never reallocate on the audio thread. The
         // track's audioData is CLEARED here so no stale take is drawn
@@ -253,7 +254,7 @@ void AudioEngine::play() {
         // record buffer, growing left-to-right in step with the playhead.
         if (anyArmed && m_maxInputChannels > 0) {
             // Record gate: if the record pair is armed AND both markers
-            // are placed, capture is restricted to that frame range —
+            // are placed, capture is restricted to that frame range â€”
             // callback drops samples whose playhead position falls
             // outside, snapshot overlays onto audioData starting at
             // recLeft (not m_playStartPosition). Empty range disables
@@ -306,10 +307,10 @@ void AudioEngine::play() {
                 // The snapshot tick overlays captured samples over the
                 // take's frame range and converts capture-to-track
                 // channels as needed so nothing outside the take is
-                // affected — even when the input is mono and the track
+                // affected â€” even when the input is mono and the track
                 // is stereo (or vice versa).
                 if (t.audioData.empty()) {
-                    // First take on this track — take the recording's
+                    // First take on this track â€” take the recording's
                     // channel count as the track's channel count.
                     t.channels = captureChans;
                 }
@@ -343,7 +344,7 @@ void AudioEngine::stop() {
     // the main / reader thread. The audio callback checks m_recordActive
     // each buffer; setting it false here means any callback that starts
     // after this line will skip capture. m_finalising stays TRUE from
-    // here until finaliseRecording completes — while it's set, the
+    // here until finaliseRecording completes â€” while it's set, the
     // callback keeps skipping armed-track playback so a concurrent WAV
     // read or a late snapshot tick can't race with playback.
     if (m_recordActive.exchange(false)) {
@@ -462,11 +463,11 @@ void AudioEngine::undoStashTrackAudio(int trackIndex) {
 
 bool AudioEngine::undoPop() {
     // Two distinct pre-conditions:
-    //   (A) A take is actively capturing right now — treat this as
+    //   (A) A take is actively capturing right now â€” treat this as
     //       "cancel the take". No WAV is written, no finaliseRecording
     //       is spawned, the record slots are dropped, and the playhead
     //       snaps back to playStart (via the snapshot restore below).
-    //   (B) A take just stopped and finaliseRecording is in flight —
+    //   (B) A take just stopped and finaliseRecording is in flight â€”
     //       wait for it so the WAV path lands on the top undo entry
     //       before we pop it (so the pop can also delete the WAV).
     // In both cases we hold m_finalising=true through the whole restore
@@ -480,7 +481,7 @@ bool AudioEngine::undoPop() {
         // Give any in-flight callback / snapshot tick 20 ms to observe
         // the flag change so they don't race us into the audioData swap.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        // Drop the captured audio — nothing to persist.
+        // Drop the captured audio â€” nothing to persist.
         for (auto& slot : m_recordSlots) {
             if (!slot) continue;
             std::lock_guard<std::mutex> l(slot->mutex);
@@ -540,7 +541,7 @@ bool AudioEngine::undoPop() {
            (int)e.playing, (int)cancellingLiveTake);
 
     // Delete any WAV files that were produced BY the action we're
-    // rewinding — an unintentional take shouldn't leave garbage on disk.
+    // rewinding â€” an unintentional take shouldn't leave garbage on disk.
     for (const std::string& p : e.recordedWavPaths) {
         if (std::remove(p.c_str()) == 0) {
             std::cout << "Undo: deleted " << p << std::endl;
@@ -548,11 +549,11 @@ bool AudioEngine::undoPop() {
     }
 
     // Cancel any in-flight modal side-effects of the action we're undoing:
-    //   - Firmware text-input mode (flashes LEDs 4/5) — entered on add/
+    //   - Firmware text-input mode (flashes LEDs 4/5) â€” entered on add/
     //     rename track. Silent no-op if not active.
-    //   - Firmware flashMode (loop-edit, fades LEDs 4-7) — entered on
+    //   - Firmware flashMode (loop-edit, fades LEDs 4-7) â€” entered on
     //     pad 15 tap. Silent no-op if not active.
-    //   - Any pending main-thread requests queued from the controller —
+    //   - Any pending main-thread requests queued from the controller â€”
     //     otherwise a just-undone add would re-fire on the next tick.
     //   - Clear-markers mode on the DAW side.
     //   - Any half-started pad-12 press so a stale long-press can't fire.
@@ -566,7 +567,7 @@ bool AudioEngine::undoPop() {
     m_pad12PressTimeMs.store(0);
     m_pad12LongPressFired.store(false);
     m_clearMode.store(false);
-    // A rename in progress on the firmware is now stale — force the OLED
+    // A rename in progress on the firmware is now stale â€” force the OLED
     // back to the current playback state on the next tick.
     m_startupOledPushed = false;
 
@@ -583,7 +584,7 @@ bool AudioEngine::undoPop() {
     m_returnToStartOnStop.store(e.returnToStartOnStop);
     m_playbackPosition.store(e.playbackPosition);
 
-    // Bookmarks — full replace. Also drop any in-flight bookmark naming
+    // Bookmarks â€” full replace. Also drop any in-flight bookmark naming
     // so a rewound "add + name" doesn't leave a stale pending index
     // pointing past the restored list.
     m_pendingNameBookmarkIndex.store(-1);
@@ -632,7 +633,7 @@ bool AudioEngine::undoPop() {
         t.color         = s.color;
         if (s.hasAudioSnapshot) {
             // A prior action (recording, clear, load) captured the
-            // exact audio bytes — restore them directly, no disk I/O.
+            // exact audio bytes â€” restore them directly, no disk I/O.
             // Lock so a still-in-flight snapshot tick or finalise WAV
             // read can't tear the vector out from under us mid-swap.
             std::lock_guard<std::mutex> aLock(m_recordAudioMutex);
@@ -640,7 +641,7 @@ bool AudioEngine::undoPop() {
             t.channels  = s.channels;
             t.buildPeakPyramid();
             t.audioVersion++;
-            // The restored audio is the OLD take (pre-record) — no fresh
+            // The restored audio is the OLD take (pre-record) â€” no fresh
             // take colouring should remain from the just-undone recording.
             t.freshTakeStart = 0;
             t.freshTakeEnd   = 0;
@@ -662,14 +663,14 @@ bool AudioEngine::undoPop() {
 
     // Every undo ends stopped. Even if the restored entry captured
     // playing=true, we don't want the DAW to jump into playback on undo
-    // — that's disorienting when the user is walking back several steps.
+    // â€” that's disorienting when the user is walking back several steps.
     // Snapshot's e.playing is intentionally ignored here.
     if (m_playing.load()) {
         stop();
     }
 
     // When undoing a live take, the playhead ALWAYS snaps back to
-    // playStart — the entry captured that position, and the take was a
+    // playStart â€” the entry captured that position, and the take was a
     // mistake so return-on-stop preferences don't apply.
     if (cancellingLiveTake) {
         m_playbackPosition.store(m_playStartPosition.load());
@@ -751,7 +752,7 @@ void AudioEngine::finaliseRecording() {
             continue;
         }
 
-        // Write the whole composite audioData — the snapshot tick has
+        // Write the whole composite audioData â€” the snapshot tick has
         // already built [existing][captured][existing tail] correctly,
         // so we just persist that. Load-on-session-reopen then puts the
         // exact same content back into the track. Lock so a late
@@ -1282,7 +1283,7 @@ void AudioEngine::processMidiMessages() {
                     }
                 }
             }
-            // (MIDI park-2 audio-scrub removed — audio scrubbing is now
+            // (MIDI park-2 audio-scrub removed â€” audio scrubbing is now
             //  driven by pad 24 held + encoder E6 on the physical controller.)
         }
     }
@@ -1430,7 +1431,7 @@ void AudioEngine::syncMuteFlashNow() {
     m_lastMuteFlashState = want;
     m_serialController->sendMessage(want ? "MUTEFLASH:1" : "MUTEFLASH:0");
     if (want == 1) {
-        // Entering scroll mode — turn every other LED off so the only
+        // Entering scroll mode â€” turn every other LED off so the only
         // thing lit is the flashing mute LED. Reset "last sent" caches
         // to 0 so on exit, the per-LED sync functions detect divergence
         // vs the true DAW state and repaint the LEDs back to normal.
@@ -1469,7 +1470,7 @@ void AudioEngine::handleResync() {
     m_lastHeartbeatSendMs       = 0;   // force an immediate HB
     m_startupOledPushed         = false; // force SETMODE:DESC + playback push
     // Held-state flags that live on the DAW side but mirror physical pads
-    // are wiped too — the firmware just cleared its side, so anything we
+    // are wiped too â€” the firmware just cleared its side, so anything we
     // still thought was held is stale.
     m_modifierHeld.store(false);
     m_panModifierHeld.store(false);
@@ -1481,7 +1482,7 @@ void AudioEngine::handleResync() {
 
     // Firmware just booted (RESYNC = fresh controller). Policy: any
     // DAW-controller reconnect defaults mute OFF, regardless of what the
-    // shadow flag held — that flag only survives an explicit user
+    // shadow flag held â€” that flag only survives an explicit user
     // session-open. Force flag off + push MUTEIND:0 / OSC unmute.
     m_totalMixInputPairMuted.store(false);
     syncTotalMixMuteToHardware();
@@ -1526,7 +1527,7 @@ bool AudioEngine::getRenameBuffer(std::string& out, int& cursorPosOut) const {
 }
 
 void AudioEngine::handleTrackNameFromController(const std::string& name) {
-    // Bookmark naming takes precedence — a pending bookmark index means
+    // Bookmark naming takes precedence â€” a pending bookmark index means
     // pad 13 just requested TEXTIN and we now have the completed name.
     int bmIdx = m_pendingNameBookmarkIndex.exchange(-1);
     if (bmIdx >= 0) {
@@ -1545,7 +1546,7 @@ void AudioEngine::handleTrackNameFromController(const std::string& name) {
     Track* t = getTrack(idx);
     if (!t) return;
     if (!name.empty()) { t->name = name; markSessionDirty(); }
-    // Silent — repaint the persistent OLED playback state so the "TRACK N
+    // Silent â€” repaint the persistent OLED playback state so the "TRACK N
     // ADDED,NAME:" prompt line is replaced immediately.
     pushPlaybackStateToOled();
 }
@@ -1592,7 +1593,7 @@ void AudioEngine::pushPlaybackStateToOled() {
 void AudioEngine::oledShowForce(const char* line1, const char* line2) {
     if (!m_serialController) return;
     // Protocol: two "DISPFORCE:<line>:<text>" commands. Firmware writes in
-    // both display modes — used for live status readouts inside interactive
+    // both display modes â€” used for live status readouts inside interactive
     // modes like clear-markers.
     std::string m1 = "DISPFORCE:1:"; m1 += line1;
     std::string m2 = "DISPFORCE:2:"; m2 += line2;
@@ -1604,14 +1605,14 @@ void AudioEngine::enableMarkerAtDefault(int markerIndex, double fractionFromLeft
     if (markerIndex < 0 || markerIndex > 3) return;
 
     if (m_markerEverSet[markerIndex]) {
-        // Restore at preserved position — clearMarker() left it intact.
+        // Restore at preserved position â€” clearMarker() left it intact.
         setMarkerPosition(markerIndex, getMarkerPosition(markerIndex));
         return;
     }
 
     // First-time placement: position at a fraction of the current viewport.
     // The old code clamped to getTotalFrames(), which is 0 in an empty
-    // session — that made every marker fall at frame 0. Use the viewport
+    // session â€” that made every marker fall at frame 0. Use the viewport
     // directly if the GUI has published one; only fall back to whole-track
     // if not.
     size_t start  = m_viewStartFrame.load();
@@ -1650,7 +1651,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
     }
 
     // Nudging any marker encoder (E3-E6) while clear-markers mode is on
-    // is an implicit exit — the user has moved from pair-management to
+    // is an implicit exit â€” the user has moved from pair-management to
     // marker-positioning. Firmware exits its own flashMode symmetrically.
     if (m_clearMode.load() && encoder >= 3 && encoder <= 6) {
         m_clearMode.store(false);
@@ -1664,7 +1665,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         // the view so the marker sits 15% from the left. Requires 200
         // encoder ticks per step so a nudge doesn't skip several markers.
         // Once entered (via encoder move during a pad-13 hold), scroll
-        // mode STAYS ACTIVE after pad 13 is released — the user exits
+        // mode STAYS ACTIVE after pad 13 is released â€” the user exits
         // by pressing pad 13 again.
         if (m_pad13Held.load() || m_bookmarkScrollMode.load()) {
             m_pad13UsedAsModifier.store(true);
@@ -1720,7 +1721,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
                 oledShowForce("MARKER:", name);
                 m_playbackPosition.store(bm.frame);
                 m_requestedJumpFrame.store((int64_t)bm.frame);
-                dawLog("bookmark nav (entry) → orig=%d frame=%zu name='%s'",
+                dawLog("bookmark nav (entry) â†’ orig=%d frame=%zu name='%s'",
                        m_bookmarkNavIdx, bm.frame, name);
                 return;
             }
@@ -1744,7 +1745,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             oledShowForce("MARKER:", name);
             m_playbackPosition.store(bm.frame);
             m_requestedJumpFrame.store((int64_t)bm.frame);
-            dawLog("bookmark nav → orig=%d frame=%zu name='%s'",
+            dawLog("bookmark nav â†’ orig=%d frame=%zu name='%s'",
                    m_bookmarkNavIdx, bm.frame, name);
             return;
         }
@@ -1760,7 +1761,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         }
 
         // Use the shared timeline extent (falls back to totalFrames if
-        // the GUI hasn't pushed one yet) — otherwise a fresh session with
+        // the GUI hasn't pushed one yet) â€” otherwise a fresh session with
         // no audio can't scrub the playhead around at all.
         size_t totalFrames = getTimelineFrames();
         if (totalFrames > 0) {
@@ -1802,7 +1803,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
                        delta, scrollAmount, visibleFrames, getPlaybackPosition(), (int)isPlaying());
             }
         } else {
-            // E2 zoom is 20% faster per encoder tick — the base was
+            // E2 zoom is 20% faster per encoder tick â€” the base was
             // 1.0005^delta; scaling the exponent by 1.2 gives the same
             // per-tick zoom step 20% larger without changing anything
             // else about the log-scaled feel.
@@ -1863,7 +1864,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
     }
     else if (encoder == 6 && m_panModifierHeld.load()) {
         // Pad 24 + E6: audio scrub. Rate is set DIRECTLY from the encoder
-        // delta on every tick — no accumulator, no coast. When the user
+        // delta on every tick â€” no accumulator, no coast. When the user
         // stops turning, updateController() zeros the rate within the
         // short SCRUB_TIMEOUT_S window and audio stops immediately.
         //
@@ -1888,7 +1889,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         return;
     }
     else if (encoder >= 3 && encoder <= 6) {
-        // E3-E6: adjust markers 0-3. A disabled/hidden marker is inert here —
+        // E3-E6: adjust markers 0-3. A disabled/hidden marker is inert here â€”
         // markers can only be created via clear-mode restore (which places
         // them at the pair's default viewport fraction on first use).
         int markerIdx = encoder - 3;
@@ -1903,8 +1904,8 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         float zoom = getWaveformZoom();
         size_t visibleFrames = (size_t)(totalFrames / zoom);
         if (visibleFrames < 100) visibleFrames = 100;
-        // Marker step is 1/9600 of the visible range per encoder tick —
-        // half the previous 1/4800 rate — so marker placement is finer.
+        // Marker step is 1/9600 of the visible range per encoder tick â€”
+        // half the previous 1/4800 rate â€” so marker placement is finer.
         size_t stepSize = (size_t)((double)visibleFrames / 9600.0 * std::abs(delta));
         if (stepSize < 1) stepSize = 1;
 
@@ -1972,14 +1973,14 @@ static int ledChannelForPad(int pad) {
 // -------------- handleTouch dispatch helpers --------------
 // Extracted from a 340-line switch of nested ifs. Each helper is either
 // a self-contained "was it consumed?" fragment (returns bool) or a
-// per-pad worker (void). Behaviour is unchanged — pure code motion.
+// per-pad worker (void). Behaviour is unchanged â€” pure code motion.
 
 bool AudioEngine::touchHandleDeletePairSentinel(int pad) {
     // Sentinel 202/203 = RETURNONSTOP:1/0 combo from firmware.
     if (pad == 202) { m_returnToStartOnStop.store(true);  return true; }
     if (pad == 203) { m_returnToStartOnStop.store(false); return true; }
     // Sentinel 204 = double-tap on pad 15: toggle loop playback. Distinct
-    // from the loop markers existing — the markers stay exactly where they
+    // from the loop markers existing â€” the markers stay exactly where they
     // are and stay visible; only the wrap-around is switched off.
     if (pad == 204) {
         bool now = !m_loopPlaybackEnabled.load();
@@ -2034,7 +2035,7 @@ bool AudioEngine::touchHandlePad26(bool pressed) {
     }
 
     if (pressed) {
-        // Start of a new hold — reset the "was it used as a modifier?"
+        // Start of a new hold â€” reset the "was it used as a modifier?"
         // guard so a bare tap can fire undo on release.
         m_modifierHeld.store(true);
         m_pad26Consumed = false;
@@ -2064,7 +2065,7 @@ bool AudioEngine::touchHandlePad15Press() {
         int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         if (s_startMs == 0) s_startMs = nowMs;
-        std::ofstream lg("c:\\0_CODE\\Dogma75\\ctrl.log", std::ios::app);
+        std::ofstream lg(appPath("ctrl.log"), std::ios::app);
         if (lg.is_open())
             lg << (nowMs - s_startMs) << " !! DAW pad15 press: clearMode "
                << wasOn << " -> " << nowOn << "\n";
@@ -2084,7 +2085,7 @@ bool AudioEngine::touchHandlePad15Press() {
 }
 
 bool AudioEngine::touchHandlePad12(bool pressed) {
-    // Pad 12 — short tap = add track (queued for main thread), long-press
+    // Pad 12 â€” short tap = add track (queued for main thread), long-press
     // triggers rename, and modifier+12 = delete. Rate-limited so light
     // MPR121 grazes don't spawn a burst of tracks.
     int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2184,7 +2185,7 @@ void AudioEngine::touchHandlePairPad(int markerIdx) {
     //   defined enabled  -> jump playhead to that marker
     //   defined enabled + double-tap same pad within 400 ms
     //                    -> also recenter the arrangement view on the
-    //                       marker (via m_requestedJumpFrame — same
+    //                       marker (via m_requestedJumpFrame â€” same
     //                       mechanism bookmark nav uses)
     bool loopSide = (markerIdx == 0 || markerIdx == 3);
     int a = loopSide ? 0 : 1;
@@ -2238,7 +2239,7 @@ void AudioEngine::touchHandlePairPad(int markerIdx) {
         // wherever the play line was BEFORE the first of the two taps
         // moved it (m_lastPairPadAnchor was captured then). Zoom
         // unchanged. Anchor==target on a first-tap is what we want on a
-        // fresh single tap — no view shift there.
+        // fresh single tap â€” no view shift there.
         if (isDoubleTap) {
             m_requestedJumpAnchorFrame.store((int64_t)m_lastPairPadAnchor);
             m_requestedJumpFrame.store((int64_t)markerPos);
@@ -2276,7 +2277,7 @@ void AudioEngine::toggleTotalMixStripMute(int stripIndex, const char* label) {
 void AudioEngine::syncTotalMixMuteToHardware() {
     // Same wire messages as a toggle, minus the flag flip + OLED text.
     // Used to force external state to match the shadow flag (startup,
-    // after session load). Silent if OSC / serial aren't up — the caller
+    // after session load). Silent if OSC / serial aren't up â€” the caller
     // is expected to retry via the toggle path if the user acts.
     bool muted = m_totalMixInputPairMuted.load();
     if (m_osc) m_osc->sendFloat("/1/mute/1/2", muted ? 1.0f : 0.0f);
@@ -2308,7 +2309,7 @@ static int trackOutputChannels(const Track& t, int (&out)[2]) {
 // tracks that route audio to it. Rule: if ANY track with a monitor
 // button ON routes to this channel we UNMUTE it; only when every
 // track routing to it has monitor OFF do we mute. Otherwise two
-// tracks sharing a channel would fight — the later one's write would
+// tracks sharing a channel would fight â€” the later one's write would
 // silently override the earlier one's, which was the fingerprint of
 // the startup-sync bug.
 static bool channelShouldBeMuted(const std::vector<Track>& tracks, int channelId1Based) {
@@ -2335,7 +2336,7 @@ void AudioEngine::setTrackInputMonitor(int trackIndex, bool on) {
     markSessionDirty();
     // Push to the Antelope mixer, re-aggregating across ALL tracks so
     // shared channels don't get stomped by whichever track we handled
-    // last. Only touches the channels this track routes to — other
+    // last. Only touches the channels this track routes to â€” other
     // channels stay at whatever state the previous sync left them.
     if (m_antelope) {
         int chans[2];
@@ -2355,7 +2356,7 @@ void AudioEngine::syncAllInputMonitorsToAntelope() {
         return;
     }
     // Build the unique set of channels that any track routes to, then
-    // send ONE mute command per channel — aggregating monitor states
+    // send ONE mute command per channel â€” aggregating monitor states
     // across all tracks routed to it. Otherwise two tracks sharing a
     // channel race and the second one's write always wins, which was
     // the startup-sync bug.
@@ -2371,7 +2372,7 @@ void AudioEngine::syncAllInputMonitorsToAntelope() {
         m_antelope->setChannelMute(ch, mute);
         if (mute) nMuted++; else nUnmuted++;
     }
-    dawLog("syncAllInputMonitorsToAntelope: %zu tracks → %d channels muted, %d unmuted (unique chans=%zu)",
+    dawLog("syncAllInputMonitorsToAntelope: %zu tracks â†’ %d channels muted, %d unmuted (unique chans=%zu)",
            m_tracks.size(), nMuted, nUnmuted, uniqueChans.size());
 }
 
@@ -2380,7 +2381,7 @@ void AudioEngine::syncAllInputMonitorsToAntelope() {
 void AudioEngine::handleTouch(int pad, bool pressed) {
     // DELETEPAIR sentinels bypass diagnostic-mode gating.
     if (pressed && touchHandleDeletePairSentinel(pad)) return;
-    // Diagnostic mode: controller is inert — silently drop everything.
+    // Diagnostic mode: controller is inert â€” silently drop everything.
     if (m_diagnosticMode.load()) return;
 
     // Marker-scroll mode: everything except pad 13 (press-to-exit),
@@ -2397,7 +2398,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
             return;
         }
         if (pad == 24) {
-            // Pan modifier — mirror the normal handler so E2 can pan
+            // Pan modifier â€” mirror the normal handler so E2 can pan
             // while nav mode is on. Skips the LED-8 toggle since all
             // non-mute LEDs are dark in scroll mode.
             m_panModifierHeld.store(pressed);
@@ -2411,9 +2412,9 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     // Undo snapshot: any pad-press that reaches this dispatcher can
     // mutate state, so we capture BEFORE the action runs. Excluded: the
     // pure modifier pads (26 = undo owner, 24 = pan modifier, 3/14 =
-    // held-state trackers) — those get their own handling below and
+    // held-state trackers) â€” those get their own handling below and
     // don't need a snapshot on the modifier press itself. Also exclude
-    // solo/mute/arm on release (pad 16/17/18) — for those we snapshot
+    // solo/mute/arm on release (pad 16/17/18) â€” for those we snapshot
     // on the press instead of the release so the sequence undoes cleanly.
     // Pad 36 (the big CAP1188 strip) is also excluded: it IS the undo
     // button, and snapshotting on its press would push a new entry onto
@@ -2423,14 +2424,14 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         undoSnapshot();
     }
 
-    // Pad 36 — big undo pad. Fires on RELEASE, matching pad 26's tap-undo,
-    // so resting a hand on a 90 cm² strip doesn't repeat-fire.
+    // Pad 36 â€” big undo pad. Fires on RELEASE, matching pad 26's tap-undo,
+    // so resting a hand on a 90 cmÂ² strip doesn't repeat-fire.
     if (pad == 36) {
         if (!pressed) {
             undoPop();
             // Do NOT write the OLED here. undoPop() clears
             // m_startupOledPushed, which makes the next updateController()
-            // tick re-push SETMODE:DESC + the playback state — landing on
+            // tick re-push SETMODE:DESC + the playback state â€” landing on
             // top of anything we write now. Queue it instead and let
             // updateController emit it AFTER that forced push.
             //
@@ -2449,7 +2450,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     if (pad == 3)  { m_pad3Held.store(pressed);        return; }
     if (pad == 14) { m_pad14Held.store(pressed);       return; }
 
-    // Pad 35 — toggle input monitor on the selected track. Delegates to
+    // Pad 35 â€” toggle input monitor on the selected track. Delegates to
     // setTrackInputMonitor so the Antelope mixer mute stays in sync,
     // LED 9 mirrors the state, and undoSnapshot at the top of handleTouch
     // already captured the pre-press state so undo works.
@@ -2463,12 +2464,12 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     }
     if (pad == 35) return;  // swallow release
 
-    // (Pad 8 OSC-mute hotkey retired — the OSC / MUTEIND plumbing stays
+    // (Pad 8 OSC-mute hotkey retired â€” the OSC / MUTEIND plumbing stays
     // wired so we can hook it up to a different pad later without another
     // refactor. toggleTotalMixStripMute + syncTotalMixMuteToHardware are
     // still called from the session-load path.)
 
-    // Loop-edit toggle — press-only.
+    // Loop-edit toggle â€” press-only.
     if (pad == 15) {
         if (pressed) touchHandlePad15Press();
         return;
@@ -2480,12 +2481,12 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     // Pad 12 handles both press and release (add-track, rename, delete).
     if (pad == 12) { touchHandlePad12(pressed); return; }
 
-    // Pad 13 — press starts a "bookmark modifier" window. Release
+    // Pad 13 â€” press starts a "bookmark modifier" window. Release
     // decides between two behaviours based on whether the hold was
     // actually used as a modifier (e.g. pad13 + encoder1 to walk
     // through markers):
-    //   * hold + encoder navigation → don't create a marker on release
-    //   * tap-release alone         → append a new marker at playhead +
+    //   * hold + encoder navigation â†’ don't create a marker on release
+    //   * tap-release alone         â†’ append a new marker at playhead +
     //                                   open the text-input naming flow
     if (pad == 13 && pressed) {
         if (m_bookmarkScrollMode.load()) {
@@ -2508,7 +2509,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         bool wasModifier = m_pad13UsedAsModifier.exchange(false);
         m_pad13Held.store(false);
         // Only reset the nav state when we are NOT staying in scroll
-        // mode — scroll mode keeps its selection between encoder events
+        // mode â€” scroll mode keeps its selection between encoder events
         // after the physical pad has been released.
         if (!m_bookmarkScrollMode.load()) {
             m_bookmarkNavIdx   = -1;
@@ -2551,7 +2552,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
 
     if (!pressed) return;  // remainder is press-only
 
-    // (14+19 / 15+19 return-on-stop combos are retired — firmware now
+    // (14+19 / 15+19 return-on-stop combos are retired â€” firmware now
     // handles 19+14 / 19+15 end-to-end and sends RETURNONSTOP:1/0.)
 
     // Marker pads in clear-mode: toggle pair. In normal mode: pair-aware
@@ -2598,7 +2599,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
 //
 // The critical property is idempotence. Every mute WE send is broadcast
 // back to us, so this runs for our own writes too. When the desired state
-// already matches we must change nothing and — above all — send nothing
+// already matches we must change nothing and â€” above all â€” send nothing
 // back, otherwise the DAW and the mixer ping-pong forever. Hence the
 // deliberate use of the raw t.inputMonitor field here rather than
 // setTrackInputMonitor(), which would push straight back to the Antelope.
@@ -2661,7 +2662,7 @@ void AudioEngine::updateController() {
 
     // Pad-36 undo banner. Emitted HERE, after the block above, because
     // undoPop() deliberately clears m_startupOledPushed to force the OLED
-    // back to the playback state — writing UNDO from the pad handler would
+    // back to the playback state â€” writing UNDO from the pad handler would
     // simply be overwritten by that push a moment later.
     if (m_pendingUndoOled.exchange(false)) {
         oledShow("UNDO", " ");
@@ -2676,7 +2677,7 @@ void AudioEngine::updateController() {
     // once per updateController tick and sync when it happens.
     syncSoloMuteLedsNow();
     syncInputMonitorLedNow();
-    // Same story for the mute-LED marker-scroll flash — reflects the
+    // Same story for the mute-LED marker-scroll flash â€” reflects the
     // AudioEngine-side m_bookmarkScrollMode state to the firmware.
     syncMuteFlashNow();
 
@@ -2689,7 +2690,7 @@ void AudioEngine::updateController() {
     if (m_recordActive.load()) {
         int64_t nowSnapMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        // 100 ms tick — cheap now that the pyramid update is incremental,
+        // 100 ms tick â€” cheap now that the pyramid update is incremental,
         // giving ~10 fps waveform-grow updates without slamming the GPU
         // texture rebuild (which alloc + uploads a 16 MB overview texture
         // whenever audioVersion bumps).
@@ -2710,7 +2711,7 @@ void AudioEngine::updateController() {
                 RecordSlot* slot = m_recordSlots[i].get();
                 if (!slot) continue;
 
-                // Read the CURRENT captured length (in frames) — the
+                // Read the CURRENT captured length (in frames) â€” the
                 // callback has been push_back-ing into slot->buffer
                 // since play(). Anything between prev and now is the
                 // delta we need to overlay this tick.
@@ -2730,7 +2731,7 @@ void AudioEngine::updateController() {
                 if (availableFrames <= prevCaptureFrames) continue;
                 size_t newFrames = availableFrames - prevCaptureFrames;
 
-                // Grow audioData just enough to fit the new tail — the
+                // Grow audioData just enough to fit the new tail â€” the
                 // existing samples before the fresh-take range and any
                 // audio past it survive untouched.
                 size_t neededSamples = (recordStartFrame + availableFrames)
@@ -2742,7 +2743,7 @@ void AudioEngine::updateController() {
                     }
                     t.channels = trackChans;
 
-                    // Delta write — only the freshly-captured samples.
+                    // Delta write â€” only the freshly-captured samples.
                     // slot->buffer pointer is stable (pre-reserved 120 s
                     // in play()), so we can memcpy from it without
                     // holding slot->mutex; the callback only appends.
@@ -2774,7 +2775,7 @@ void AudioEngine::updateController() {
                         }
                     }
                     t.freshTakeEnd = recordStartFrame + availableFrames;
-                    // Incremental pyramid update over the delta only —
+                    // Incremental pyramid update over the delta only â€”
                     // O(newFrames / PEAK_BASE_BUCKET). Much cheaper than
                     // scanning the whole track.
                     t.rebuildPeakPyramidRange(writeFrame,
@@ -2838,7 +2839,7 @@ void AudioEngine::updateController() {
             int newSel = getSelectedTrack();
             if (newSel >= getTrackCount()) setSelectedTrack(getTrackCount() - 1);
         }
-        // No OLED banner — deletion is visible in the DAW GUI.
+        // No OLED banner â€” deletion is visible in the DAW GUI.
     }
     if (m_pendingRenameRequest.exchange(false)) {
         int idx = getSelectedTrack();
@@ -2847,7 +2848,7 @@ void AudioEngine::updateController() {
             char line1[32];
             snprintf(line1, sizeof(line1), "TR%d RENAME,NAME:", idx + 1);
             oledShowForce(line1, " ");
-            // Start with an empty buffer for now — cursor navigation of the
+            // Start with an empty buffer for now â€” cursor navigation of the
             // existing name will come later.
             m_serialController->sendMessage("TEXTIN:");
             m_pendingNameTrackIndex.store(idx);
@@ -2867,7 +2868,7 @@ void AudioEngine::updateController() {
         }
     }
 
-    // Timed OLED revert — currently used to auto-clear the mode-switch
+    // Timed OLED revert â€” currently used to auto-clear the mode-switch
     // banner after ~3 s so the screen doesn't get stuck on "DISPLAY MODE".
     int64_t revertAt = m_oledRevertAtMs.load();
     if (revertAt != 0) {
@@ -2893,13 +2894,13 @@ void AudioEngine::updateController() {
     }
 
     // (Return-on-stop is now applied inside the audio callback, after the
-    // fade-out completes — otherwise a mid-fade playhead teleport would
+    // fade-out completes â€” otherwise a mid-fade playhead teleport would
     // reintroduce the click the fade was there to prevent.)
 
     // Play LED (channel 3): on only during active playback. Firmware toggles
     // predictively on pad 19 press; this catches auto-stops (end of file) and
     // corrects any mismatch from play()-no-op cases.
-    // NB: while a scrub-resume is pending we're "conceptually playing" —
+    // NB: while a scrub-resume is pending we're "conceptually playing" â€”
     // playback was internally paused for the scrub and will resume 100 ms
     // after the encoder stops. Keep the LED on across the whole window so
     // it doesn't flicker off/on with every scrub.
@@ -2909,7 +2910,7 @@ void AudioEngine::updateController() {
         m_lastPlayLedState = wantPlay;
     }
 
-    // Mode LEDs (channels 4/5/6/7 — loop-left, record-left, record-right,
+    // Mode LEDs (channels 4/5/6/7 â€” loop-left, record-left, record-right,
     // loop-right). Normally the firmware toggle keeps the cache in sync via
     // handleTouch, so this only fires on startup (cache is -1) to force-sync
     // the physical LEDs to the DAW's boot state (all disabled).
@@ -2930,7 +2931,7 @@ void AudioEngine::updateController() {
         }
     }
 
-    // Pan-modifier LED (channel 8) is fully firmware-owned — no host sync.
+    // Pan-modifier LED (channel 8) is fully firmware-owned â€” no host sync.
 
     // Push PAIRDEF whenever a pair's "defined" state changes. Defined ==
     // both markers have ever been placed (markerEverSet); goes back to
@@ -2946,14 +2947,14 @@ void AudioEngine::updateController() {
         m_lastRecordPairDefinedSent = recDef;
     }
 
-    // (STATE:<byte> drift-correct retired — firmware no longer does
+    // (STATE:<byte> drift-correct retired â€” firmware no longer does
     // predictive LED toggles, so the DAW's cache-diff sends are the sole
     // authoritative LED path and can't diverge.)
 }
 
 // ==================== AUDIO CALLBACK ====================
 
-// Breadcrumb — the callback bumps this on entry to each of its blocks.
+// Breadcrumb â€” the callback bumps this on entry to each of its blocks.
 // The SEH handler reads it after a crash so we know which region faulted.
 static std::atomic<int> s_audioCallbackRegion{0};
 static const char* audioCallbackRegionName(int r) {
@@ -2989,7 +2990,7 @@ static int portAudioCallback(const void* inputBuffer, void* outputBuffer,
                (unsigned long)GetExceptionCode(), framesPerBuffer,
                r, audioCallbackRegionName(r));
         dawLogFlush();
-        // Emit silence and continue — better than tearing down the
+        // Emit silence and continue â€” better than tearing down the
         // PortAudio stream mid-buffer.
         if (outputBuffer) {
             float* out = static_cast<float*>(outputBuffer);
@@ -3048,7 +3049,7 @@ bool AudioEngine::startAudio(int deviceId) {
 
     // If the ASIO device advertises input channels, open a full-duplex
     // stream so the audio callback receives interleaved input samples too.
-    // Recording just consumes what's already there — no extra thread, no
+    // Recording just consumes what's already there â€” no extra thread, no
     // cross-clock issues since input and output share the ASIO device's
     // sample clock. If maxInputChannels == 0 we fall back to output-only.
     PaStreamParameters inputParameters;
@@ -3063,7 +3064,7 @@ bool AudioEngine::startAudio(int deviceId) {
     }
 
     // Drop paClipOff so PortAudio clamps out-of-range floats itself
-    // (previously we handed the driver raw samples and let it decide —
+    // (previously we handed the driver raw samples and let it decide â€”
     // some drivers wrap-around into nasty distortion instead of clipping
     // cleanly, which could sound harsher than the actual over-level).
     PaError err = Pa_OpenStream(
@@ -3130,14 +3131,14 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
     // channel/pair on this device, append input samples to the track's
     // record slot. Uses try_lock so the callback never blocks; the
     // finaliser holds the slot's mutex while draining and reloading, so
-    // captures during that window are dropped (rare — only at stop).
+    // captures during that window are dropped (rare â€” only at stop).
     if (m_recordActive.load() && in != nullptr && m_maxInputChannels > 0) {
         s_audioCallbackRegion.store(1);   // record-capture
         // Frame-position gate. When the record pair is enabled, gateStart <
         // gateEnd and we only keep samples where the absolute playhead
         // position is inside [gateStart, gateEnd). Otherwise (gateEnd == 0)
         // the take is open-ended from m_playStartPosition and every sample
-        // is kept — same as before this change.
+        // is kept â€” same as before this change.
         const size_t gateStart = m_recordGateStart.load();
         const size_t gateEnd   = m_recordGateEnd.load();
         const bool   gated     = (gateEnd > gateStart);
@@ -3180,10 +3181,10 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
     bool finalisingNow = m_finalising.load();
     // Anything that reads / writes an armed track's audioData off the
     // audio thread (snapshot tick, finaliseRecording) sets one of these
-    // flags. The callback treats both the same way — it keeps armed
+    // flags. The callback treats both the same way â€” it keeps armed
     // tracks silent so no torn read of audioData is possible.
     bool armedGuardActive = recordingNow || finalisingNow;
-    // Punch region — when recording with the record pair enabled, we
+    // Punch region â€” when recording with the record pair enabled, we
     // only silence the armed track WITHIN [gateStart, gateEnd). Outside
     // that range the original audio still plays. Finalising always
     // fully silences (audioData is mid-swap on the main thread).
@@ -3264,11 +3265,11 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     if (track.muted) continue;
                     if (anySolo && !track.solo) continue;
                     // Armed-track mute rules during a take:
-                    //   • finalising: always skip (audioData is mid-swap)
-                    //   • recording + punch region: silence only inside
-                    //     [gateStart, gateEnd) — outside, original audio
+                    //   â€¢ finalising: always skip (audioData is mid-swap)
+                    //   â€¢ recording + punch region: silence only inside
+                    //     [gateStart, gateEnd) â€” outside, original audio
                     //     plays as normal (scrubbing over the region too)
-                    //   • recording without a region: silence for the
+                    //   â€¢ recording without a region: silence for the
                     //     whole take (open-ended from playStart)
                     if (track.armed) {
                         if (finalisingNow) continue;
@@ -3326,7 +3327,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
         }
     }
     // Enter the playback branch while `playing` OR while the fade
-    // envelope is still winding down — that's what actually renders the
+    // envelope is still winding down â€” that's what actually renders the
     // stop-side fade-out. Playhead is only advanced while `playing`.
     // Runs even with no tracks / no audio so the playhead still moves
     // during recording (empty armed track) and in a fresh session.
@@ -3348,8 +3349,8 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             // moves visibly through the arrangement, but skip all the
             // per-sample mixing since there's nothing to play.
             if (playing) playPos += framesPerBuffer;
-            // On the play → stop transition the return-jump flag was set
-            // upstream. Apply it here too — the mixing branch does this
+            // On the play â†’ stop transition the return-jump flag was set
+            // upstream. Apply it here too â€” the mixing branch does this
             // inside its fade path but we skip that in the empty-session
             // case, so we'd otherwise lose the "return-on-stop" behaviour
             // entirely when no track has any audio.
@@ -3382,7 +3383,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
 
             for (unsigned long i = 0; i < framesPerBuffer; i++) {
                 // Auto-stop when the playhead runs off the end of every
-                // track's audio — unless a take is being captured, since
+                // track's audio â€” unless a take is being captured, since
                 // recording extends the effective length past what any
                 // existing audio covers.
                 if (playing && !recordingNow && playPos >= maxTotalFrames) {
@@ -3398,7 +3399,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     m_playFadeGain -= m_playFadeStep;
                     if (m_playFadeGain < targetGain) m_playFadeGain = targetGain;
                 }
-                // Fully faded out and not playing — apply any pending
+                // Fully faded out and not playing â€” apply any pending
                 // return-to-start jump NOW (safe: no more samples get
                 // read this callback), then stop emitting.
                 if (!playing && m_playFadeGain <= 0.0f) {
@@ -3454,7 +3455,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                 }
 
                 // Advance playhead whether we're actively playing OR just
-                // fading out — audio continues underneath the fade
+                // fading out â€” audio continues underneath the fade
                 // envelope so the transition at the callback boundary is
                 // sample-continuous (no click). Playhead just runs a
                 // little past the "stop" point during the ~5 ms fade.
@@ -3495,7 +3496,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
 
     // Peak-hold: scan the buffer for the max |sample| and update the
     // atomic peak meter so the GUI can display a level / clip indicator.
-    // Cheap even for large buffers — one pass over the interleaved output.
+    // Cheap even for large buffers â€” one pass over the interleaved output.
     {
         float peak = 0.0f;
         for (int i = 0; i < totalSamples; i++) {
@@ -3508,10 +3509,10 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
 
     // Per-track meters: one entry per track, atomic so the GUI thread
     // can read without a lock. Meters whatever the track is set to hear:
-    //   inputMonitor on → the raw ASIO input for the track's input pair
-    //                    / mono channel (unaffected by mute/solo — it's
+    //   inputMonitor on â†’ the raw ASIO input for the track's input pair
+    //                    / mono channel (unaffected by mute/solo â€” it's
     //                    what the Antelope is monitoring on that channel)
-    //   inputMonitor off → the track's playback samples at the current
+    //   inputMonitor off â†’ the track's playback samples at the current
     //                     playhead, gated by mute/solo like the mixer.
     // Both include the track's volume so the meter tracks audible level.
     {
@@ -3549,7 +3550,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             } else if (t.hasAudio() && playbackActive && !t.muted &&
                        !(anySolo && !t.solo)) {
                 // Match the playback branch's mute/solo gating so a
-                // silenced track meters silent — otherwise a soloed-out
+                // silenced track meters silent â€” otherwise a soloed-out
                 // track would still show its source signal level.
                 size_t trackFrames = t.getTotalFrames();
                 for (unsigned long f = 0; f < framesPerBuffer; f++) {
@@ -3774,7 +3775,7 @@ bool AudioEngine::loadTrackAudio(int trackIndex, const std::string& filepath) {
     if (result) {
         std::cout << "Loaded audio to track " << trackIndex << ": " << track->name
                   << " (" << track->getTotalFrames() << " frames, " << track->channels << " channels)" << std::endl;
-        // A freshly-loaded file is all "old" audio — no punch-in region.
+        // A freshly-loaded file is all "old" audio â€” no punch-in region.
         track->freshTakeStart = 0;
         track->freshTakeEnd   = 0;
         markSessionDirty();
@@ -3792,3 +3793,4 @@ void AudioEngine::clearTrackAudio(int trackIndex) {
     track->clearAudio();
     markSessionDirty();
 }
+

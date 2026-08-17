@@ -1,4 +1,5 @@
 #include "daw_log.h"
+#include "app_paths.h"
 
 #include <chrono>
 #include <cstdio>
@@ -11,7 +12,7 @@ static int64_t        s_startMs = 0;
 
 static void ensureOpen_locked() {
     if (s_logFile) return;
-    s_logFile = std::fopen("c:\\0_CODE\\Dogma75\\daw.log", "w");   // truncate each run
+    s_logFile = std::fopen(appPath("daw.log").c_str(), "w");   // truncate each run
     s_startMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
     if (s_logFile) {

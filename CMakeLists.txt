@@ -22,6 +22,8 @@ set(SOURCES
     src/gui/gui_manager.h
     src/util/daw_log.cpp
     src/util/daw_log.h
+    src/util/app_paths.cpp
+    src/util/app_paths.h
     src/osc/osc_sender.cpp
     src/osc/osc_sender.h
     src/antelope/antelope_client.cpp

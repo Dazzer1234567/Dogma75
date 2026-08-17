@@ -1,4 +1,5 @@
 ﻿#include "serial_controller.h"
+#include "../util/app_paths.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -20,7 +21,7 @@
 // stops growing without bound across sessions.
 static void logCtrlLine(const char* dir, const std::string& text) {
     static std::mutex   s_mutex;
-    static std::ofstream s_file("c:\\0_CODE\\Dogma75\\ctrl.log", std::ios::trunc);
+    static std::ofstream s_file(appPath("ctrl.log"), std::ios::trunc);
     static int64_t      s_startMs = 0;
 
     int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -389,7 +390,7 @@ void SerialController::writerLoop() {
         auto t1 = std::chrono::steady_clock::now();
         auto writeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
         if (writeMs > 100.0f) {
-            std::ofstream f("c:\\0_CODE\\Dogma75\\perf.log", std::ios::app);
+            std::ofstream f(appPath("perf.log"), std::ios::app);
             if (f.is_open()) {
                 if (!msg.empty() && msg.back() == '\n') msg.pop_back();
                 f << "SLOW WRITE (bg)  " << writeMs << " ms  msg=\"" << msg << "\"\n";
@@ -691,4 +692,5 @@ void SerialController::processLine(const std::string& line) {
         return;
     }
 }
+
 
