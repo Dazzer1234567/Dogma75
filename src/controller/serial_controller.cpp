@@ -1,4 +1,4 @@
-#include "serial_controller.h"
+﻿#include "serial_controller.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -13,13 +13,25 @@
 
 // Debug: append every serial in/out line to ctrl.log with a session-
 // relative ms timestamp. Used to diagnose firmware/DAW sync bugs.
+// Hold the file open for the process lifetime rather than reopening it per
+// line. This runs on the reader AND writer threads for EVERY serial message,
+// so an open/close/flush cycle each time was pure overhead sitting directly
+// in the controller's latency path. Truncates per run (like daw.log) so it
+// stops growing without bound across sessions.
 static void logCtrlLine(const char* dir, const std::string& text) {
-    static int64_t startMs = 0;
+    static std::mutex   s_mutex;
+    static std::ofstream s_file("c:\\0_CODE\\Dogma75\\ctrl.log", std::ios::trunc);
+    static int64_t      s_startMs = 0;
+
     int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (startMs == 0) startMs = nowMs;
-    std::ofstream f("c:\\0_CODE\\Dogma75\\ctrl.log", std::ios::app);
-    if (f.is_open()) f << (nowMs - startMs) << " " << dir << " " << text << "\n";
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (s_startMs == 0) s_startMs = nowMs;
+    if (s_file.is_open()) {
+        s_file << (nowMs - s_startMs) << " " << dir << " " << text << "\n";
+        s_file.flush();   // keep the tail intact if we crash
+    }
 }
 
 // ==================== VELOCITY CURVE IMPLEMENTATION ====================
@@ -110,10 +122,19 @@ bool SerialController::initialize(const std::string& portName) {
 
     std::string fullPortName = "\\\\.\\" + portName;
 
+    // FILE_FLAG_OVERLAPPED is essential, not an optimisation. On a
+    // SYNCHRONOUS handle Windows serialises every I/O request: the reader
+    // thread sits in a blocking ReadFile with a 50 ms ceiling, and each
+    // WriteFile from the writer thread has to queue behind whatever read is
+    // in flight. Measured on the synchronous handle: writes to the Teensy
+    // blocked for 610 ms on average and up to 5 s, which is why pressing
+    // add-track took about a second to light the pad LEDs while encoder
+    // moves (device->host, reader path only) stayed instant.
     HANDLE hSerial = CreateFileA(
         fullPortName.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+        0, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL
     );
 
     if (hSerial == INVALID_HANDLE_VALUE) {
@@ -149,13 +170,25 @@ bool SerialController::initialize(const std::string& portName) {
     timeouts.ReadIntervalTimeout = MAXDWORD;
     timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
     timeouts.ReadTotalTimeoutConstant = 50;
-    // Keep writes bounded — worst case ~15 ms so a stalled Teensy can't wedge
+    // Keep writes bounded â€” worst case ~15 ms so a stalled Teensy can't wedge
     // the reader thread (which shares this handle for LED sendMessage calls).
     timeouts.WriteTotalTimeoutConstant = 10;
     timeouts.WriteTotalTimeoutMultiplier = 1;
 
     if (!SetCommTimeouts(hSerial, &timeouts)) {
         std::cerr << "Failed to set serial port timeouts" << std::endl;
+        CloseHandle(hSerial);
+        return false;
+    }
+
+    // Manual-reset events, one per thread, for the overlapped operations.
+    m_readEvent  = CreateEventA(NULL, TRUE, FALSE, NULL);
+    m_writeEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!m_readEvent || !m_writeEvent) {
+        std::cerr << "Failed to create serial overlapped events" << std::endl;
+        if (m_readEvent)  CloseHandle(m_readEvent);
+        if (m_writeEvent) CloseHandle(m_writeEvent);
+        m_readEvent = m_writeEvent = nullptr;
         CloseHandle(hSerial);
         return false;
     }
@@ -170,7 +203,7 @@ bool SerialController::initialize(const std::string& portName) {
     // Spawn the reader thread now that the handle is valid.
     m_readerStop.store(false);
     m_readerThread = std::thread(&SerialController::readerLoop, this);
-    // Spawn the writer thread — sendMessage() now only enqueues, this
+    // Spawn the writer thread â€” sendMessage() now only enqueues, this
     // thread owns every WriteFile call so main-loop timing is decoupled
     // from Teensy USB-CDC stalls.
     m_writerStop.store(false);
@@ -267,6 +300,10 @@ void SerialController::shutdown() {
         m_serialHandle = nullptr;
         std::cout << "Teensy serial port closed" << std::endl;
     }
+    // Both threads have been joined above, so no overlapped op can still be
+    // referencing these.
+    if (m_readEvent)  { CloseHandle(static_cast<HANDLE>(m_readEvent));  m_readEvent  = nullptr; }
+    if (m_writeEvent) { CloseHandle(static_cast<HANDLE>(m_writeEvent)); m_writeEvent = nullptr; }
 #endif
 }
 
@@ -275,16 +312,16 @@ void SerialController::sendMessage(const std::string& message) {
     if (!m_serialHandle) return;
     logCtrlLine("->", message);
     // Non-blocking enqueue. The writer thread owns the actual WriteFile.
-    // Drop the OLDEST heartbeat when the queue overflows — heartbeats are
+    // Drop the OLDEST heartbeat when the queue overflows â€” heartbeats are
     // safe to lose (firmware just uses their arrival time). Any other
     // message is kept.
     std::unique_lock<std::mutex> lock(m_queueMutex);
 
     // Coalesce brightness updates: a fast slider drag can enqueue dozens
-    // of LEDBRT:<ch>:… messages per second, which then serialise out over
+    // of LEDBRT:<ch>:â€¦ messages per second, which then serialise out over
     // the USB CDC pipe and make the LED lag the pointer by ~1-2 s. Drop
     // any already-queued LEDBRT for the same channel before enqueueing
-    // the new one — only the newest value matters.
+    // the new one â€” only the newest value matters.
     if (message.compare(0, 7, "LEDBRT:") == 0) {
         // Extract "LEDBRT:<ch>:" prefix (channel-scoped).
         size_t colon = message.find(':', 7);
@@ -326,12 +363,29 @@ void SerialController::writerLoop() {
         lock.unlock();
 
         msg += '\n';
-        DWORD bytesWritten;
+        DWORD bytesWritten = 0;
         auto t0 = std::chrono::steady_clock::now();
-        // This can block for hundreds of ms — that's fine now, we're off
-        // the main thread. Log slow ones so we can still see when the
-        // Teensy is not draining its USB endpoint.
-        WriteFile(hSerial, msg.c_str(), (DWORD)msg.size(), &bytesWritten, NULL);
+        // Overlapped write. The handle is opened FILE_FLAG_OVERLAPPED, so a
+        // plain synchronous WriteFile would fail here â€” and, more to the
+        // point, overlapped is what lets this proceed concurrently with the
+        // reader thread's in-flight ReadFile instead of queueing behind it.
+        {
+            OVERLAPPED ov = {};
+            ov.hEvent = static_cast<HANDLE>(m_writeEvent);
+            ResetEvent(static_cast<HANDLE>(m_writeEvent));
+            if (!WriteFile(hSerial, msg.c_str(), (DWORD)msg.size(), &bytesWritten, &ov)) {
+                if (GetLastError() == ERROR_IO_PENDING) {
+                    // Bounded wait: a wedged Teensy must not stall the queue
+                    // forever. Cancel and move on if it does.
+                    if (WaitForSingleObject(static_cast<HANDLE>(m_writeEvent), 1000) == WAIT_OBJECT_0) {
+                        GetOverlappedResult(hSerial, &ov, &bytesWritten, FALSE);
+                    } else {
+                        CancelIoEx(hSerial, &ov);
+                        GetOverlappedResult(hSerial, &ov, &bytesWritten, TRUE);
+                    }
+                }
+            }
+        }
         auto t1 = std::chrono::steady_clock::now();
         auto writeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
         if (writeMs > 100.0f) {
@@ -357,11 +411,27 @@ void SerialController::readerLoop() {
     DWORD bytesRead;
 
     while (!m_readerStop.load()) {
-        // Blocks until any bytes arrive (or 50 ms elapses, per COMMTIMEOUTS
-        // in initialize()). Sub-ms wake once the Teensy sends anything.
-        if (!ReadFile(hSerial, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
-            // Port likely closed / device unplugged.
-            break;
+        // Overlapped read. Waits for bytes (or the 50 ms COMMTIMEOUTS
+        // ceiling), but crucially does NOT hold the handle against the
+        // writer thread the way a synchronous read does.
+        bytesRead = 0;
+        OVERLAPPED ov = {};
+        ov.hEvent = static_cast<HANDLE>(m_readEvent);
+        ResetEvent(static_cast<HANDLE>(m_readEvent));
+        if (!ReadFile(hSerial, buffer, sizeof(buffer) - 1, &bytesRead, &ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) {
+                break;   // port closed / device unplugged
+            }
+            // Poll the stop flag while waiting so shutdown stays responsive.
+            for (;;) {
+                DWORD w = WaitForSingleObject(static_cast<HANDLE>(m_readEvent), 50);
+                if (w == WAIT_OBJECT_0) break;
+                if (m_readerStop.load()) { CancelIoEx(hSerial, &ov); break; }
+            }
+            if (!GetOverlappedResult(hSerial, &ov, &bytesRead, TRUE)) {
+                if (m_readerStop.load()) break;
+                continue;
+            }
         }
         if (bytesRead == 0) continue;
 
@@ -518,7 +588,7 @@ void SerialController::processLine(const std::string& line) {
         return;
     }
 
-    // NAME:<text> — user finalised the on-controller name entry (pad 21).
+    // NAME:<text> â€” user finalised the on-controller name entry (pad 21).
     if (line.find("NAME:") == 0) {
         std::string name = line.substr(5);
         if (m_nameCallback) {
@@ -526,7 +596,7 @@ void SerialController::processLine(const std::string& line) {
         }
         return;
     }
-    // RENAMEBUF:<cursorPos>:<text> — live rename buffer update.
+    // RENAMEBUF:<cursorPos>:<text> â€” live rename buffer update.
     if (line.find("RENAMEBUF:") == 0) {
         std::string rest = line.substr(10);
         size_t colon = rest.find(':');
@@ -541,12 +611,12 @@ void SerialController::processLine(const std::string& line) {
         if (m_renameBufferCallback) m_renameBufferCallback(buf, cursor, true);
         return;
     }
-    // RENAMEEND — firmware left text-input mode without a finalise.
+    // RENAMEEND â€” firmware left text-input mode without a finalise.
     if (line == "RENAMEEND") {
         if (m_renameBufferCallback) m_renameBufferCallback("", 0, false);
         return;
     }
-    // DELETEPAIR:LOOP / :REC — user held pad 19 and tapped a marker pad
+    // DELETEPAIR:LOOP / :REC â€” user held pad 19 and tapped a marker pad
     // to wipe the pair. Handled via a sentinel pad number so we don't
     // need another dedicated wiring path. 200 = loop, 201 = record.
     if (line == "DELETEPAIR:LOOP" || line == "DELETEPAIR:REC") {
@@ -556,7 +626,7 @@ void SerialController::processLine(const std::string& line) {
         }
         return;
     }
-    // RETURNONSTOP:1 / :0 — 19+14 or 19+15 combo. Sentinel 202 = ON, 203 = OFF.
+    // RETURNONSTOP:1 / :0 â€” 19+14 or 19+15 combo. Sentinel 202 = ON, 203 = OFF.
     if (line == "RETURNONSTOP:1" || line == "RETURNONSTOP:0") {
         if (m_touchCallback) {
             int sentinel = (line == "RETURNONSTOP:1") ? 202 : 203;
@@ -564,13 +634,20 @@ void SerialController::processLine(const std::string& line) {
         }
         return;
     }
-    // RESYNC — firmware wants us to re-push authoritative state
+    // LOOPPLAY â€” double-tap on pad 15. Sentinel 204 = toggle loop playback
+    // (wrap-around between the loop markers), independently of whether the
+    // markers themselves are enabled.
+    if (line == "LOOPPLAY") {
+        if (m_touchCallback) m_touchCallback(204, true);
+        return;
+    }
+    // RESYNC â€” firmware wants us to re-push authoritative state
     // (mode, OLED, all LEDs, PAIRDEFs). Sent after the pad-18 hard reset.
     if (line == "RESYNC") {
         if (m_resyncCallback) m_resyncCallback();
         return;
     }
-    // RENAMESYNC:<phaseMs> — firmware LED-flash phase snapshot at the
+    // RENAMESYNC:<phaseMs> â€” firmware LED-flash phase snapshot at the
     // start of a rename, so the DAW can pulse in sync.
     if (line.find("RENAMESYNC:") == 0) {
         try {
@@ -614,3 +691,4 @@ void SerialController::processLine(const std::string& line) {
         return;
     }
 }
+

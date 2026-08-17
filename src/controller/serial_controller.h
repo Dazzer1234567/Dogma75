@@ -103,6 +103,13 @@ public:
 private:
     // Serial port
     void* m_serialHandle;
+    // Per-thread OVERLAPPED completion events. The handle is opened
+    // FILE_FLAG_OVERLAPPED so reads and writes can be in flight at the same
+    // time; each thread needs its OWN event or their completions would be
+    // confused for one another. Stored as void* to keep windows.h out of
+    // this header.
+    void* m_readEvent  = nullptr;
+    void* m_writeEvent = nullptr;
     std::string m_portName;
     std::string m_serialBuffer;
 
