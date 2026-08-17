@@ -288,9 +288,30 @@ void AudioEngine::play() {
 
             ensureRecordSlots();
             // Fresh-take highlight anchor: gate's left marker if gated,
-            // otherwise the free-run play start.
+            // otherwise the free-run play start. NOT shifted — instead
+            // we drop the first m_recordLatencyFrames of captured input
+            // (see m_recordLeadingSkipRemaining below). That way
+            // slot->buffer[0] corresponds to the sample that aligns
+            // with recordStartFrame in the reference, so writing at
+            // audioData[recordStartFrame + i] just works, including
+            // for record-from-zero cases where a negative anchor would
+            // clamp and undo the compensation.
             size_t recordStartFrame = (gateEnd > gateStart) ? gateStart
                                                             : m_playStartPosition.load();
+            // Arm the capture-side skip: drop the first N input samples
+            // so the first pushed sample represents audio that was
+            // actually played at recordStartFrame (mic input from
+            // before that moment is pre-record noise / silence).
+            //
+            // Extra fudge: PortAudio's reported latency underestimates
+            // the real round-trip by ~30 samples on the Antelope path
+            // (measured 2026-08-17 with a click/clap alignment test).
+            // Probably an unreported fixed delay in the driver or the
+            // converter's group delay. If a future interface reports
+            // differently, expose this as a setting.
+            constexpr size_t kRecordLatencyFudgeFrames = 30;
+            m_recordLeadingSkipRemaining.store(
+                m_recordLatencyFrames.load() + kRecordLatencyFudgeFrames);
             for (size_t i = 0; i < m_tracks.size(); i++) {
                 Track& t = m_tracks[i];
                 if (!t.armed) continue;
@@ -2703,6 +2724,9 @@ void AudioEngine::updateController() {
             size_t gateStart_snap = m_recordGateStart.load();
             size_t gateEnd_snap   = m_recordGateEnd.load();
             bool gatedSnap = (gateEnd_snap > gateStart_snap);
+            // Anchor is un-shifted — latency compensation happens on
+            // the capture side (see m_recordLeadingSkipRemaining in
+            // the audio callback).
             size_t recordStartFrame = gatedSnap ? gateStart_snap
                                                 : m_playStartPosition.load();
             for (size_t i = 0; i < m_tracks.size() && i < m_recordSlots.size(); i++) {
@@ -3085,6 +3109,29 @@ bool AudioEngine::startAudio(int deviceId) {
     // in PLAY_FADE_MS milliseconds.
     m_playFadeStep = 1.0f / ((PLAY_FADE_MS / 1000.0f) * (float)m_sampleRate);
 
+    // Record latency compensation. PortAudio reports the driver's actual
+    // input + output latency (in seconds); the sum is the round-trip
+    // delay between a sample being played and its recording appearing in
+    // the audio callback. Shifting recorded samples back by this amount
+    // makes overdubs land in time with the reference — without this a
+    // clap on the click track lands 30-60 ms late.
+    {
+        const PaStreamInfo* si = Pa_GetStreamInfo(static_cast<PaStream*>(m_stream));
+        if (si) {
+            double rt = si->inputLatency + si->outputLatency;
+            size_t frames = (size_t)std::llround(rt * m_sampleRate);
+            m_recordLatencyFrames.store(frames);
+            std::cout << "Record latency compensation: "
+                      << (rt * 1000.0) << " ms = " << frames << " frames"
+                      << " (in=" << (si->inputLatency * 1000.0) << " ms"
+                      << " out=" << (si->outputLatency * 1000.0) << " ms)"
+                      << std::endl;
+            dawLog("record latency: in=%.2f ms out=%.2f ms total=%.2f ms = %zu frames",
+                   si->inputLatency * 1000.0, si->outputLatency * 1000.0,
+                   rt * 1000.0, frames);
+        }
+    }
+
     err = Pa_StartStream(static_cast<PaStream*>(m_stream));
     if (err != paNoError) {
         std::cerr << "Failed to start stream: " << Pa_GetErrorText(err) << std::endl;
@@ -3144,6 +3191,21 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
         const bool   gated     = (gateEnd > gateStart);
         const size_t basePos   = m_playbackPosition.load();
 
+        // Latency-compensation head skip. The first N input samples
+        // after record-start represent audio the mic captured BEFORE
+        // the playhead reached the record start (round-trip delay is
+        // in-flight). Dropping them makes slot->buffer[0] correspond
+        // to the sample that was actually played at recordStartFrame,
+        // so writes at audioData[recordStartFrame + i] land in sync
+        // with the reference. Counter is armed in play() (or gate
+        // entry, see below) and decremented per input frame here.
+        size_t skipLeft = m_recordLeadingSkipRemaining.load();
+        size_t skipHere = std::min<size_t>(skipLeft, framesPerBuffer);
+        unsigned long startF = static_cast<unsigned long>(skipHere);
+        if (skipHere > 0) {
+            m_recordLeadingSkipRemaining.store(skipLeft - skipHere);
+        }
+
         size_t nTracks = m_tracks.size();
         for (size_t ti = 0; ti < nTracks && ti < m_recordSlots.size(); ti++) {
             const Track& t = m_tracks[ti];
@@ -3155,7 +3217,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             if (slot->channels == 1) {
                 int ch = t.inputMonoChan;
                 if (ch < 0 || ch >= m_maxInputChannels) continue;
-                for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                for (unsigned long f = startF; f < framesPerBuffer; f++) {
                     size_t pos = basePos + f;
                     if (gated && (pos < gateStart || pos >= gateEnd)) continue;
                     slot->buffer.push_back(in[f * m_maxInputChannels + ch]);
@@ -3164,7 +3226,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                 int chL = t.inputPair * 2;
                 int chR = chL + 1;
                 if (chL < 0 || chR >= m_maxInputChannels) continue;
-                for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                for (unsigned long f = startF; f < framesPerBuffer; f++) {
                     size_t pos = basePos + f;
                     if (gated && (pos < gateStart || pos >= gateEnd)) continue;
                     slot->buffer.push_back(in[f * m_maxInputChannels + chL]);

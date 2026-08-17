@@ -543,6 +543,16 @@ private:
     // audioData starting at recLeft. Zero-length range disables gating
     // (unbounded take from m_playStartPosition).
     std::atomic<size_t> m_recordGateStart{0};
+    // Round-trip latency between a sample leaving the DAW and the same
+    // moment's captured audio arriving in the callback (sum of ASIO's
+    // reported input+output latency, in frames). Populated when the
+    // audio stream opens; zero when no stream is running.
+    std::atomic<size_t> m_recordLatencyFrames{0};
+    // Countdown of leading input frames to drop after record-start.
+    // Armed to m_recordLatencyFrames when a take begins so the first
+    // pushed sample represents mic audio from the moment the reference
+    // reached recordStartFrame — anything earlier is in-flight lag.
+    std::atomic<size_t> m_recordLeadingSkipRemaining{0};
     std::atomic<size_t> m_recordGateEnd{0};
 
     // Bookmark positions (each pad-13 release appends the playhead).
