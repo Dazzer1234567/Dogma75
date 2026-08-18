@@ -1752,10 +1752,24 @@ void GUIManager::renderToolbar() {
         }
     }
 
-    // Fullscreen/Close buttons (right-aligned)
+    // Help / Fullscreen / Close buttons (right-aligned).
+    // Three 30 px buttons + 2 gaps + a little slack = ~120 px block.
     ImGui::SameLine();
-    float rightButtonsX = io.DisplaySize.x - 80;
+    float rightButtonsX = io.DisplaySize.x - 120;
     ImGui::SetCursorPosX(rightButtonsX);
+
+    // "?" — opens the shortcuts / reference document in the user's
+    // default browser. The file lives at docs/shortcuts.html; appPath
+    // resolves it from wherever the exe was launched.
+    if (ImGui::Button("?", ImVec2(30, 0))) {
+        std::string docPath = appPath("docs\\shortcuts.html");
+        ShellExecuteA(nullptr, "open", docPath.c_str(),
+                      nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Controller + keyboard reference");
+    }
+    ImGui::SameLine();
 
     const char* fsLabel = m_isFullscreen ? "[]" : "[#]";
     const char* fsTooltip = m_isFullscreen ? "Switch to windowed mode" : "Switch to fullscreen";
