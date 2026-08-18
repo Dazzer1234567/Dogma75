@@ -2202,28 +2202,83 @@ void GUIManager::renderTrackPanel(float width, float height) {
             int numInputPairs = m_audioEngine->getNumInputStereoPairs();
             float halfW = ImGui::GetContentRegionAvail().x * 0.5f - 4.0f;
 
+            // Channel-entry live preview: while the user is typing an I/O
+            // channel on the controller for THIS track, replace the combo
+            // with a red-pulsing readout so the DAW-side field mirrors
+            // the OLED buffer live. Same look as the rename Selectable.
+            int chanEntryMode = m_audioEngine->getChannelEntryMode();
+            std::string chanEntryBuf;
+            bool inputBeingEdited  = (chanEntryMode == 1) && (selectedTrack == (int)i) &&
+                                     m_audioEngine->getChannelEntryBuffer(chanEntryBuf);
+            bool outputBeingEdited = (chanEntryMode == 2) && (selectedTrack == (int)i) &&
+                                     m_audioEngine->getChannelEntryBuffer(chanEntryBuf);
+            auto pulseFill = [this]() {
+                float b = m_audioEngine->getChannelEntryPulse();
+                ImVec4 redDim    = ImVec4(0.30f, 0.04f, 0.04f, 1.0f);
+                ImVec4 redBright = ImVec4(1.00f, 0.10f, 0.10f, 1.0f);
+                return ImVec4(
+                    redDim.x + (redBright.x - redDim.x) * b,
+                    redDim.y + (redBright.y - redDim.y) * b,
+                    redDim.z + (redBright.z - redDim.z) * b,
+                    1.0f);
+            };
+
             if (numInputPairs > 0) {
-                // Stereo takes the pair index (e.g. "I = 1-2"); mono takes
-                // an absolute channel index (e.g. "I = 1"). Whichever is
-                // active drives the combo preview.
+                // Stereo takes the actual L/R channel indices (e.g. "I = 1-2"
+                // or non-adjacent "I = 1&7"); mono takes an absolute channel
+                // index (e.g. "I = 1"). Whichever is active drives the label.
                 char inLabel[32];
                 if (track->inputMono) {
                     sprintf(inLabel, "I = %d", track->inputMonoChan + 1);
                 } else {
-                    sprintf(inLabel, "I = %d-%d", (track->inputPair * 2) + 1,
-                                                  (track->inputPair * 2) + 2);
+                    int L = track->inputLeftChan  + 1;
+                    int R = track->inputRightChan + 1;
+                    // Use the same " & " separator (with spaces) as the
+                    // channel-entry pulse text so the field doesn't visually
+                    // reflow when the user presses pad 21 to commit.
+                    sprintf(inLabel, "I = %d & %d", L, R);
                 }
+                if (inputBeingEdited) {
+                    // Red-pulsing preview of the live-typed digits — mirrors
+                    // the OLED "INPUT CHAN: 1 & 7" readout in real time.
+                    // Manual draw so the "I" sits at exactly the same X/Y
+                    // pixel as the combo's preview text: BeginCombo insets
+                    // its label by style.FramePadding, but Selectable does
+                    // not, so swapping to Selectable would shift the label.
+                    char lbl[64];
+                    snprintf(lbl, sizeof(lbl), "I = %s", chanEntryBuf.c_str());
+                    ImVec4 fill = pulseFill();
+                    ImVec2 pos  = ImGui::GetCursorScreenPos();
+                    float h     = ImGui::GetFrameHeight();
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 fillCol  = ImGui::ColorConvertFloat4ToU32(fill);
+                    dl->AddRectFilled(pos, ImVec2(pos.x + halfW, pos.y + h),
+                                      fillCol, ImGui::GetStyle().FrameRounding);
+                    ImVec2 pad = ImGui::GetStyle().FramePadding;
+                    dl->AddText(ImVec2(pos.x + pad.x, pos.y + pad.y),
+                                IM_COL32_WHITE, lbl);
+                    ImGui::Dummy(ImVec2(halfW, h));   // reserve the space
+                    ImGui::SameLine();
+                } else {
                 ImGui::SetNextItemWidth(halfW);
                 if (ImGui::BeginCombo("##in", inLabel, ImGuiComboFlags_NoArrowButton)) {
-                    // Stereo pairs first.
+                    // Stereo pairs first. Selecting a pair from the dropdown
+                    // still assumes adjacent channels; non-adjacent pairs are
+                    // entered via the controller's channel-entry mode
+                    // (pad 12 + pad 0) and shown here read-only in the label.
                     for (int p = 0; p < numInputPairs; p++) {
-                        bool sel = (!track->inputMono && track->inputPair == p);
+                        int L = p * 2, R = p * 2 + 1;
+                        bool sel = (!track->inputMono &&
+                                    track->inputLeftChan == L &&
+                                    track->inputRightChan == R);
                         char item[32];
-                        sprintf(item, "I = %d-%d", (p * 2) + 1, (p * 2) + 2);
+                        sprintf(item, "I = %d & %d", L + 1, R + 1);
                         if (ImGui::Selectable(item, sel)) {
                             m_audioEngine->undoSnapshot();
-                            track->inputMono = false;
-                            track->inputPair = p;
+                            track->inputMono      = false;
+                            track->inputPair      = p;
+                            track->inputLeftChan  = L;
+                            track->inputRightChan = R;
                             m_audioEngine->markSessionDirty();
                         }
                         if (sel) ImGui::SetItemDefaultFocus();
@@ -2249,6 +2304,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                     ImGui::EndCombo();
                 }
                 ImGui::SameLine();
+                }  // end else (input dropdown vs entry pulse)
             }
 
             if (numPairs > 0) {
@@ -2258,21 +2314,51 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 if (track->outputMono) {
                     sprintf(outLabel, "O = %d", track->outputMonoChan + 1);
                 } else {
-                    sprintf(outLabel, "O = %d-%d",
-                            (track->outputPair * 2) + 1,
-                            (track->outputPair * 2) + 2);
+                    // Same " & " separator as the entry-mode pulse so the
+                    // output field doesn't reflow when the commit lands.
+                    // Uses the L/R chan indices — supports non-adjacent
+                    // stereo output (e.g. "O = 1 & 7").
+                    sprintf(outLabel, "O = %d & %d",
+                            track->outputLeftChan  + 1,
+                            track->outputRightChan + 1);
                 }
+                if (outputBeingEdited) {
+                    // Same manual-draw approach as the input pulse.
+                    char lbl[64];
+                    snprintf(lbl, sizeof(lbl), "O = %s", chanEntryBuf.c_str());
+                    ImVec4 fill = pulseFill();
+                    float outW = numInputPairs > 0 ? halfW
+                                                   : ImGui::GetContentRegionAvail().x;
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    float h    = ImGui::GetFrameHeight();
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImU32 fillCol  = ImGui::ColorConvertFloat4ToU32(fill);
+                    dl->AddRectFilled(pos, ImVec2(pos.x + outW, pos.y + h),
+                                      fillCol, ImGui::GetStyle().FrameRounding);
+                    ImVec2 pad = ImGui::GetStyle().FramePadding;
+                    dl->AddText(ImVec2(pos.x + pad.x, pos.y + pad.y),
+                                IM_COL32_WHITE, lbl);
+                    ImGui::Dummy(ImVec2(outW, h));
+                } else {
                 ImGui::SetNextItemWidth(numInputPairs > 0 ? halfW : -1.0f);
                 if (ImGui::BeginCombo("##out", outLabel, ImGuiComboFlags_NoArrowButton)) {
-                    // Stereo pairs first.
+                    // Stereo pairs first. Dropdown offers adjacent pairs only;
+                    // non-adjacent stereo outputs are entered via the
+                    // controller channel-entry mode (pad 12 + pad 4) and shown
+                    // in the label read-only.
                     for (int p = 0; p < numPairs; p++) {
-                        bool sel = (!track->outputMono && track->outputPair == p);
+                        int L = p * 2, R = p * 2 + 1;
+                        bool sel = (!track->outputMono &&
+                                    track->outputLeftChan == L &&
+                                    track->outputRightChan == R);
                         char item[32];
-                        sprintf(item, "O = %d-%d", (p * 2) + 1, (p * 2) + 2);
+                        sprintf(item, "O = %d & %d", L + 1, R + 1);
                         if (ImGui::Selectable(item, sel)) {
                             m_audioEngine->undoSnapshot();
-                            track->outputMono = false;
-                            track->outputPair = p;
+                            track->outputMono       = false;
+                            track->outputPair       = p;
+                            track->outputLeftChan   = L;
+                            track->outputRightChan  = R;
                             m_audioEngine->markSessionDirty();
                         }
                         if (sel) ImGui::SetItemDefaultFocus();
@@ -2298,6 +2384,7 @@ void GUIManager::renderTrackPanel(float width, float height) {
                     }
                     ImGui::EndCombo();
                 }
+                }  // end else (output dropdown vs entry pulse)
             }
 
             // --- Per-track level meter ---
@@ -4260,9 +4347,13 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
         file << "      \"outputPair\":    " << t->outputPair << ",\n";
         file << "      \"outputMono\":    " << (t->outputMono ? "true" : "false") << ",\n";
         file << "      \"outputMonoChan\":" << t->outputMonoChan << ",\n";
+        file << "      \"outputLeftChan\":" << t->outputLeftChan  << ",\n";
+        file << "      \"outputRightChan\":"<< t->outputRightChan << ",\n";
         file << "      \"inputPair\":     " << t->inputPair  << ",\n";
         file << "      \"inputMono\":     " << (t->inputMono ? "true" : "false") << ",\n";
         file << "      \"inputMonoChan\": " << t->inputMonoChan << ",\n";
+        file << "      \"inputLeftChan\": " << t->inputLeftChan  << ",\n";
+        file << "      \"inputRightChan\":" << t->inputRightChan << ",\n";
         file << "      \"inputMonitor\":  " << (t->inputMonitor ? "true" : "false") << "\n";
         file << "    }" << (i + 1 < trackCount ? "," : "") << "\n";
     }
@@ -4411,9 +4502,17 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         int outputPair       = keyIn("outputPair") != std::string::npos ? (int)readNumber(keyIn("outputPair")) : 0;
         bool outputMono      = keyIn("outputMono") != std::string::npos ? readBool(keyIn("outputMono"))         : false;
         int outputMonoChan   = keyIn("outputMonoChan") != std::string::npos ? (int)readNumber(keyIn("outputMonoChan")) : 0;
+        // Non-adjacent stereo output pair: default derived from outputPair
+        // so legacy sessions load unchanged.
+        int outputLeftChan   = keyIn("outputLeftChan")  != std::string::npos ? (int)readNumber(keyIn("outputLeftChan"))  : (outputPair * 2);
+        int outputRightChan  = keyIn("outputRightChan") != std::string::npos ? (int)readNumber(keyIn("outputRightChan")) : (outputPair * 2 + 1);
         int inputPair        = keyIn("inputPair")  != std::string::npos ? (int)readNumber(keyIn("inputPair"))  : 0;
         bool inputMono       = keyIn("inputMono")  != std::string::npos ? readBool(keyIn("inputMono"))         : false;
         int inputMonoChan    = keyIn("inputMonoChan") != std::string::npos ? (int)readNumber(keyIn("inputMonoChan")) : 0;
+        // Non-adjacent stereo pair: default to the derived adjacent pair
+        // so legacy sessions load with unchanged behaviour.
+        int inputLeftChan    = keyIn("inputLeftChan")  != std::string::npos ? (int)readNumber(keyIn("inputLeftChan"))  : (inputPair * 2);
+        int inputRightChan   = keyIn("inputRightChan") != std::string::npos ? (int)readNumber(keyIn("inputRightChan")) : (inputPair * 2 + 1);
         bool inputMonitor    = keyIn("inputMonitor") != std::string::npos ? readBool(keyIn("inputMonitor"))    : false;
 
         int newIdx = m_audioEngine->addTrack(name);
@@ -4428,9 +4527,13 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
             t->outputPair    = outputPair;
             t->outputMono    = outputMono;
             t->outputMonoChan= outputMonoChan;
+            t->outputLeftChan = outputLeftChan;
+            t->outputRightChan= outputRightChan;
             t->inputPair     = inputPair;
             t->inputMono     = inputMono;
             t->inputMonoChan = inputMonoChan;
+            t->inputLeftChan = inputLeftChan;
+            t->inputRightChan= inputRightChan;
             t->inputMonitor  = inputMonitor;
         }
         if (!filePath.empty()) {

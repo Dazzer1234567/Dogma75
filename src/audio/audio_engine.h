@@ -30,9 +30,13 @@ struct UndoTrackState {
     int         outputPair;
     int         outputMonoChan;
     bool        outputMono;
+    int         outputLeftChan;
+    int         outputRightChan;
     int         inputPair;
     int         inputMonoChan;
     bool        inputMono;
+    int         inputLeftChan;
+    int         inputRightChan;
     int         color;
     // Optional audio snapshot — populated ONLY for tracks that are about
     // to have their audio replaced (record start, clear, load). Otherwise
@@ -243,20 +247,37 @@ public:
         m_undoGuiCapture = std::move(cap);
         m_undoGuiRestore = std::move(res);
     }
-    // Push a snapshot of current state onto the undo stack. Thread-safe.
-    // Cheap to call — capping the stack at UNDO_MAX drops the oldest.
-    void undoSnapshot();
+    // Two independent undo histories:
+    //   CONTENT — tracks, mixer state, bookmarks, mute state, arm state.
+    //             What the user REC'd / added / deleted / edited.
+    //   VIEW    — playback position, marker positions (loop/punch), zoom,
+    //             view center, timeline frames. Where the eye is looking
+    //             and where the play line / markers are placed on the
+    //             timeline. Doesn't touch audio content or track state.
+    //
+    // Split so a "I moved my markers by mistake" undo doesn't discard the
+    // recording the user did between now and then, and vice versa.
+    void undoSnapshot();                // shorthand for undoSnapshot(CONTENT)
+    void undoSnapshotView();
+    // Same as undoSnapshotView but suppressed if we already snapshotted
+    // within the last VIEW_SNAPSHOT_COALESCE_MS — collapses a scrub /
+    // zoom / pan gesture (dozens of encoder ticks) into a single stack
+    // entry so view-undo pops walk back gestures, not individual ticks.
+    void undoSnapshotViewIfBurst();
     // Copy the current audio buffer of every armed track into the top
-    // undo entry so a later undo can restore the pre-recording take.
-    // Called from play() when a take is starting.
+    // (content) undo entry so a later undo can restore the pre-recording
+    // take. Called from play() when a take is starting.
     void undoStashArmedTrackAudio();
     // Same for a single track index — used by clear-audio / load-audio
     // paths where the caller has already snapshotted metadata and now
     // wants the pre-change bytes attached.
     void undoStashTrackAudio(int trackIndex);
-    // Pop the most recent snapshot and restore state. No-op if empty.
-    // Returns true if something was restored.
-    bool undoPop();
+    // Pop most recent CONTENT snapshot; leaves view/playhead/markers alone.
+    // Wired to pad 36 tap-release. Returns true if something was restored.
+    bool undoPop();                     // pops CONTENT stack
+    // Pop most recent VIEW snapshot; leaves tracks/mixer/bookmarks alone.
+    // Wired to pad 36 held + pad 20/21/22/23 press.
+    bool undoPopView();
 
     // Waveform zoom
     float getWaveformZoom() const { return m_waveformZoom; }
@@ -388,6 +409,16 @@ public:
     // Invalidates the LED / PAIRDEF / OLED caches and the startup-push
     // flag so updateController re-sends everything on its next tick.
     void handleResync();
+    // Periodic (non-destructive) LED / mode-flag re-assert. Called from
+    // updateController every RESYNC_PERIOD_MS to correct any drift
+    // between the DAW's shadow model and the firmware's actual LED /
+    // mode state. Unlike handleResync this does NOT wipe held-state
+    // trackers (which reflect real physical pad state).
+    void periodicControllerResync();
+    // Wall-clock ms at which we last did a periodic resync push. Used
+    // by updateController to fire it every RESYNC_PERIOD_MS.
+    int64_t m_lastPeriodicResyncMs = 0;
+    static constexpr int64_t RESYNC_PERIOD_MS = 2000;
     // Read side for the GUI. Returns "" and false if no rename is active.
     // Also fills `cursorPosOut` with where the DAW should overlay the cursor.
     bool  getRenameBuffer(std::string& out, int& cursorPosOut) const;
@@ -396,6 +427,15 @@ public:
     // from the last RENAMESYNC + elapsed wall time. Matches the physical
     // pad 20 / pad 21 LED brightness step-for-step.
     float getLedFlashBrightness() const;
+
+    // Channel-entry read side for the GUI. Returns the current mode
+    // (0=off, 1=input, 2=output) and populates `bufOut` with the live
+    // digit buffer formatted like "1 & 7" (or "_" if empty). Also
+    // returns a 0..1 brightness for the red pulse fill so the input /
+    // output field can throb in step with the LED-8 flash.
+    int   getChannelEntryMode() const { return m_channelEntryMode.load(); }
+    bool  getChannelEntryBuffer(std::string& bufOut) const;
+    float getChannelEntryPulse() const;
 
     // Called from the main loop each frame. Mirrors internal state onto
     // the controller's LEDs (play LED, orange encoder-enable LED) and
@@ -606,8 +646,14 @@ private:
 
     // ---- Undo state ----
     static constexpr size_t UNDO_MAX = 50;
-    std::deque<UndoEntry>   m_undoStack;
+    std::deque<UndoEntry>   m_undoStack;      // CONTENT history
+    std::deque<UndoEntry>   m_undoStackView;  // VIEW history — playhead, markers, zoom, view center
     std::mutex              m_undoMutex;
+    // Wall-clock ms of the last view-activity call to undoSnapshotViewIfBurst.
+    // Activity-based (updated on every call, not just successful snapshots)
+    // so a continuous burst produces exactly one entry — the pre-burst state.
+    int64_t                 m_lastViewActivityMs = 0;
+    static constexpr int64_t VIEW_SNAPSHOT_COALESCE_MS = 400;
     // Monotonic id assigned to each new entry. Never reused so the
     // finalise-recording thread can always locate its entry, or safely
     // skip if the deque has since dropped it.
@@ -700,6 +746,12 @@ private:
     // "UNDO" banner is written AFTER undoPop's forced playback-state push
     // rather than racing it.
     std::atomic<bool> m_pendingUndoOled{false};
+    // Pad 36 (big undo pad) held-state + combo fired flag. The tap-
+    // release path fires CONTENT undo unless a held-combo (pad 36 held
+    // while pressing pad 20/21/22/23 for VIEW undo) already consumed
+    // the press.
+    std::atomic<bool> m_pad36Held{false};
+    std::atomic<bool> m_pad36ComboFired{false};
     // Loop playback (wrap-around) on/off, toggled by double-tapping pad 15.
     // Defaults true so existing sessions behave exactly as before.
     std::atomic<bool> m_loopPlaybackEnabled{true};
@@ -852,10 +904,36 @@ private:
     // track; holding for >= 1 s cancels the add and instead starts a rename
     // of the currently-selected track. m_pad12PressTimeMs is 0 when pad 12
     // isn't held; m_pad12LongPressFired guards against re-firing during the
-    // same hold.
+    // same hold. m_pad12Held tracks the current down state so combo gestures
+    // (pad 12 + pad 0 for input channel entry) know when to activate.
     std::atomic<int64_t> m_pad12PressTimeMs{0};
     std::atomic<bool>    m_pad12LongPressFired{false};
+    std::atomic<bool>    m_pad12Held{false};
     static constexpr int64_t RENAME_HOLD_MS = 1000;
+
+    // ---- Channel-entry mode ----
+    // Hold pad 12 + tap pad 0 → enter INPUT channel entry (pad 4 → OUTPUT).
+    // The DAW-side input/output field for the selected track paints red
+    // and pulses while active. User types digits on the number pads
+    // (1,2,3,5,6,7,9,10,11 → 1..9, pad 15 → 0), accumulating a decimal
+    // number for the current channel. Pad 20 commits the current number
+    // as the LEFT channel and switches accumulation to the RIGHT.
+    // Pad 21 commits everything: one number = mono, two numbers = stereo
+    // (possibly non-adjacent, e.g. 10 & 11). Applied to the selected track.
+    enum class ChannelEntryMode { None, Input, Output };
+    std::atomic<int>     m_channelEntryMode{0};   // ChannelEntryMode
+    mutable std::mutex   m_channelEntryMutex;
+    std::string          m_channelEntryLeftBuf;   // decimal digits, "10"
+    std::string          m_channelEntryRightBuf;
+    bool                 m_channelEntryOnRight = false;
+    void enterChannelEntry(ChannelEntryMode mode);
+    void appendChannelDigit(int digit);
+    void switchChannelEntrySide();  // pad 20: move accumulator to right channel
+    void commitChannelEntry();
+    void cancelChannelEntry();
+    void refreshChannelEntryOled();
+    // Number-pad → digit (0..9); returns -1 if `pad` isn't a number pad.
+    static int numberPadDigit(int pad);
     // Set by updateController when a long-press fires; consumed on the next
     // tick to actually start the rename OLED / TEXTIN flow.
     std::atomic<bool>    m_pendingRenameRequest{false};

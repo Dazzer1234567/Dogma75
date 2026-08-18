@@ -417,9 +417,13 @@ void AudioEngine::undoSnapshot() {
         s.outputPair    = t.outputPair;
         s.outputMonoChan= t.outputMonoChan;
         s.outputMono    = t.outputMono;
+        s.outputLeftChan = t.outputLeftChan;
+        s.outputRightChan= t.outputRightChan;
         s.inputPair     = t.inputPair;
         s.inputMonoChan = t.inputMonoChan;
         s.inputMono     = t.inputMono;
+        s.inputLeftChan = t.inputLeftChan;
+        s.inputRightChan= t.inputRightChan;
         s.color         = t.color;
         e.tracks.push_back(s);
     }
@@ -450,6 +454,42 @@ void AudioEngine::undoSnapshot() {
            e.id, m_undoStack.size() + 1, e.tracks.size());
     m_undoStack.push_back(std::move(e));
     while (m_undoStack.size() > UNDO_MAX) m_undoStack.pop_front();
+}
+
+void AudioEngine::undoSnapshotViewIfBurst() {
+    // Activity-based: reset the activity timer on every call, but only
+    // snapshot if the previous activity was > COALESCE_MS ago. Ensures a
+    // continuous run of rapid calls creates exactly ONE snapshot (the one
+    // captured BEFORE the burst began) — as opposed to snapshot-time-based
+    // coalescing which re-fires every COALESCE_MS during long gestures.
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    bool newBurst = (m_lastViewActivityMs == 0) ||
+                    (nowMs - m_lastViewActivityMs > VIEW_SNAPSHOT_COALESCE_MS);
+    m_lastViewActivityMs = nowMs;
+    if (newBurst) undoSnapshotView();
+}
+
+void AudioEngine::undoSnapshotView() {
+    // Lean view-only snapshot: JUST the fields the view-undo path will
+    // restore (marker positions, playback position, GUI zoom/scroll).
+    // Everything else in UndoEntry is left at default — undoPopView
+    // ignores those. Kept in the same UndoEntry struct to avoid a
+    // parallel type and to keep the GUI capture hook reusable.
+    UndoEntry e;
+    for (int i = 0; i < 4; i++) {
+        e.markerPositions[i] = m_markerPositions[i];
+        e.markerEnabled[i]   = m_markerEnabled[i];
+        e.markerEverSet[i]   = m_markerEverSet[i];
+    }
+    e.playbackPosition = m_playbackPosition.load();
+    if (m_undoGuiCapture) m_undoGuiCapture(e);   // fills zoom/scroll/timeline
+    std::lock_guard<std::mutex> lock(m_undoMutex);
+    e.id = m_nextUndoEntryId++;
+    m_undoStackView.push_back(std::move(e));
+    while (m_undoStackView.size() > UNDO_MAX) m_undoStackView.pop_front();
+    dawLog("undoSnapshotView id=%d viewStackDepth=%zu",
+           m_undoStackView.back().id, m_undoStackView.size());
 }
 
 void AudioEngine::undoStashArmedTrackAudio() {
@@ -592,9 +632,12 @@ bool AudioEngine::undoPop() {
     // back to the current playback state on the next tick.
     m_startupOledPushed = false;
 
-    // Restore transport / marker / toggle state first.
+    // Restore marker create/toggle state and playback flags. NOTE we
+    // deliberately do NOT restore marker POSITIONS or the playback
+    // position here — those are "view" state and belong to undoPopView.
+    // Content undo leaves the play line and marker placements alone so
+    // an unrelated "undo my recording" doesn't also yank the timeline.
     for (int i = 0; i < 4; i++) {
-        m_markerPositions[i] = e.markerPositions[i];
         m_markerEnabled[i]   = e.markerEnabled[i];
         m_markerEverSet[i]   = e.markerEverSet[i];
     }
@@ -603,7 +646,6 @@ bool AudioEngine::undoPop() {
     m_recordLeftEnabled.store(e.recordEnabled);
     m_recordRightEnabled.store(e.recordEnabled);
     m_returnToStartOnStop.store(e.returnToStartOnStop);
-    m_playbackPosition.store(e.playbackPosition);
 
     // Bookmarks â€” full replace. Also drop any in-flight bookmark naming
     // so a rewound "add + name" doesn't leave a stale pending index
@@ -648,9 +690,13 @@ bool AudioEngine::undoPop() {
         t.outputPair    = s.outputPair;
         t.outputMonoChan= s.outputMonoChan;
         t.outputMono    = s.outputMono;
+        t.outputLeftChan = s.outputLeftChan;
+        t.outputRightChan= s.outputRightChan;
         t.inputPair     = s.inputPair;
         t.inputMonoChan = s.inputMonoChan;
         t.inputMono     = s.inputMono;
+        t.inputLeftChan = s.inputLeftChan;
+        t.inputRightChan= s.inputRightChan;
         t.color         = s.color;
         if (s.hasAudioSnapshot) {
             // A prior action (recording, clear, load) captured the
@@ -680,7 +726,10 @@ bool AudioEngine::undoPop() {
         m_selectedTrack = m_tracks.empty() ? -1 : 0;
     }
 
-    if (m_undoGuiRestore) m_undoGuiRestore(e);
+    // View state (zoom, view center, timeline extent) intentionally NOT
+    // restored here — those belong to undoPopView. Content undo leaves
+    // the view exactly where the user has it.
+    // m_undoGuiRestore is called from undoPopView instead.
 
     // Every undo ends stopped. Even if the restored entry captured
     // playing=true, we don't want the DAW to jump into playback on undo
@@ -704,6 +753,32 @@ bool AudioEngine::undoPop() {
     syncSoloMuteLedsNow();
     syncPlayLedNow();
     markSessionDirty();
+    return true;
+}
+
+bool AudioEngine::undoPopView() {
+    // View-only undo. Pops the view stack, restores JUST the fields the
+    // view snapshot captured: marker positions, playback position, and
+    // GUI zoom / view center / timeline extent (via m_undoGuiRestore).
+    // Never touches tracks, mixer state, bookmarks, or arm/mute flags.
+    UndoEntry e;
+    {
+        std::lock_guard<std::mutex> lock(m_undoMutex);
+        if (m_undoStackView.empty()) {
+            dawLog("undoPopView empty");
+            return false;
+        }
+        e = std::move(m_undoStackView.back());
+        m_undoStackView.pop_back();
+    }
+    dawLog("undoPopView id=%d viewStackDepth=%zu", e.id, m_undoStackView.size());
+    for (int i = 0; i < 4; i++) {
+        m_markerPositions[i] = e.markerPositions[i];
+        // markerEnabled / markerEverSet are content-side toggles; leave
+        // them alone so undoing a marker MOVE doesn't also un-create it.
+    }
+    m_playbackPosition.store(e.playbackPosition);
+    if (m_undoGuiRestore) m_undoGuiRestore(e);   // zoom / view center / timeline
     return true;
 }
 
@@ -1472,6 +1547,44 @@ void AudioEngine::syncMuteFlashNow() {
     }
 }
 
+void AudioEngine::periodicControllerResync() {
+    if (!m_serialController) return;
+    if (m_bookmarkScrollMode.load()) return;   // scroll mode owns the LEDs
+    // Invalidate the LED shadow caches so each sync-fn detects "unknown"
+    // and re-emits the current authoritative state. Firmware may have
+    // silently drifted (predictive-LED prediction was wrong, brief serial
+    // glitch, whatever) — this corrects it every RESYNC_PERIOD_MS.
+    // Deliberately does NOT touch:
+    //   • held-state trackers (m_pad12Held, m_pad14Held, …) — those reflect
+    //     REAL pad state and clearing them would drop mid-press gestures
+    //   • m_startupOledPushed — the OLED is a large diff-driven buffer and
+    //     forcing a repush every 2 s would visibly re-render
+    //   • mute flash / OSC state — separately owned, not LED-shadow-based
+    m_lastPlayLedState          = -1;
+    m_lastLoopLeftLedState      = -1;
+    m_lastLoopRightLedState     = -1;
+    m_lastRecordLeftLedState    = -1;
+    m_lastRecordRightLedState   = -1;
+    m_lastLoopPairDefinedSent   = -1;
+    m_lastRecordPairDefinedSent = -1;
+    m_lastSoloLedState          = -1;
+    m_lastMuteLedState          = -1;
+    m_lastArmLedState           = -1;
+    m_lastInputMonitorLedState  = -1;
+    syncPlayLedNow();
+    syncLoopPairLedsNow();
+    syncRecordPairLedsNow();
+    syncSoloMuteLedsNow();
+    syncInputMonitorLedNow();
+    // Re-assert modal flags whose loss on the firmware would silently
+    // break the current DAW mode. If DAW is in channel-entry, tell
+    // firmware again — cheap and idempotent.
+    if ((int)m_channelEntryMode.load() != (int)ChannelEntryMode::None) {
+        m_serialController->sendMessage("EXCLUSIVE:1");
+        m_serialController->sendMessage("PAIRFLASH:1");
+    }
+}
+
 void AudioEngine::handleResync() {
     // Invalidate all "last sent" caches so the next updateController tick
     // re-sends every piece of controller-facing state. The firmware just
@@ -1657,16 +1770,23 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
     if (m_bookmarkScrollMode.load() && encoder != 1 && encoder != 2 && encoder != 3) return;
 
     // Undo coalescing: treat successive deltas from the same encoder as
-    // ONE user gesture. Only push an undo snapshot when this delta
-    // starts a new burst (500 ms of quiet on this encoder). E1-E6 come
-    // in as encoder 1..6; guard the index into m_encoderLastDeltaMs.
+    // ONE user gesture — captures state BEFORE the burst begins, and
+    // stays quiet until the user has been idle for > 500 ms (then the
+    // next tick is a new gesture). Note: activity-based, not
+    // snapshot-based — mid-gesture ticks don't create new entries
+    // however long the gesture runs.
+    //
+    // View snapshot rather than content, because every encoder branch
+    // in this handler is view-mutating (scrub, zoom, pan, marker nudge,
+    // audio scrub). The two-stack undo split (pad 36 tap = CONTENT,
+    // pad 36 held + pad 20/21/22/23 = VIEW) reads from this stack.
     if (encoder >= 1 && encoder <= 6) {
         int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         int idx = encoder - 1;
         if (m_encoderLastDeltaMs[idx] == 0 ||
             nowMs - m_encoderLastDeltaMs[idx] > 500) {
-            undoSnapshot();
+            undoSnapshotView();
         }
         m_encoderLastDeltaMs[idx] = nowMs;
     }
@@ -1689,6 +1809,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         // mode STAYS ACTIVE after pad 13 is released â€” the user exits
         // by pressing pad 13 again.
         if (m_pad13Held.load() || m_bookmarkScrollMode.load()) {
+            // (View-undo snapshot handled by the per-encoder burst check.)
             m_pad13UsedAsModifier.store(true);
             m_bookmarkScrollMode.store(true);
             // Snapshot bookmarks with their ORIGINAL indices so E3 can
@@ -1770,8 +1891,10 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
                    m_bookmarkNavIdx, bm.frame, name);
             return;
         }
-        // E1: Playhead scrub. If we're playing, pause and arm the resume
-        // timer so playback picks up 100 ms after the user stops moving.
+        // E1: Playhead scrub. (View-undo snapshot already handled by the
+        // per-encoder burst check at the top of this handler.)
+        // If we're playing, pause and arm the resume timer so playback
+        // picks up 100 ms after the user stops moving.
         double nowSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         m_lastScrubMoveTime.store(nowSec);
@@ -1811,6 +1934,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
     }
     else if (encoder == 2) {
         // E2: pan the timeline while pad 24 is held, otherwise zoom.
+        // (View-undo snapshot handled by the per-encoder burst check.)
         if (m_panModifierHeld.load()) {
             size_t totalFrames = getTimelineFrames();
             if (totalFrames > 0) {
@@ -1834,6 +1958,7 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         }
     }
     else if (encoder == 3 && m_bookmarkScrollMode.load()) {
+        // (View-undo snapshot handled by the per-encoder burst check.)
         // Marker-scroll mode + E3: nudge the currently selected marker's
         // frame. Selection is by original index so a frame edit doesn't
         // shuffle what E1 walks between.
@@ -2112,6 +2237,7 @@ bool AudioEngine::touchHandlePad12(bool pressed) {
     int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (pressed) {
+        m_pad12Held.store(true);
         if (m_modifierHeld.load()) {
             m_pad26Consumed = true;   // pad 26 tap-release must not undo
             m_pendingDeleteTrackRequest.store(true);
@@ -2123,6 +2249,7 @@ bool AudioEngine::touchHandlePad12(bool pressed) {
         m_pad12PressTimeMs.store(nowMs);
         m_pad12LongPressFired.store(false);
     } else {
+        m_pad12Held.store(false);
         m_pad12PressTimeMs.store(0);
         if (m_pad12LongPressFired.exchange(false)) return true;
         int64_t lastMs = m_lastAddTrackMs.load();
@@ -2246,6 +2373,10 @@ void AudioEngine::touchHandlePairPad(int markerIdx) {
         rightEnabled.store(true);
     } else if (isMarkerEnabled(markerIdx)) {
         size_t markerPos = getMarkerPosition(markerIdx);
+        // View-undo snapshot before jumping the playhead to the marker
+        // (and possibly panning the view on a double-tap). Coalesced so
+        // a rapid double-tap counts as one entry.
+        undoSnapshotViewIfBurst();
         // Position BEFORE this tap's playhead move. Stored for the NEXT
         // tap so that if a double-tap sequence lands within 400 ms, we
         // can still recover the "pre-first-tap" playhead position to
@@ -2321,8 +2452,9 @@ static int trackOutputChannels(const Track& t, int (&out)[2]) {
         out[0] = t.outputMonoChan + 1;
         return 1;
     }
-    out[0] = t.outputPair * 2 + 1;
-    out[1] = t.outputPair * 2 + 2;
+    // 1-based channel labels (matches the Antelope CP), so shift by +1.
+    out[0] = t.outputLeftChan  + 1;
+    out[1] = t.outputRightChan + 1;
     return 2;
 }
 
@@ -2397,6 +2529,207 @@ void AudioEngine::syncAllInputMonitorsToAntelope() {
            m_tracks.size(), nMuted, nUnmuted, uniqueChans.size());
 }
 
+// -------------- Channel-entry mode --------------
+
+// Map a physical pad to a 0..9 digit for channel-number entry.
+// Uses the same 3×3 letter-pad layout the firmware defines
+// (pads 1,2,3 / 5,6,7 / 9,10,11 — pads 0/4/8 are per-row spacers with
+// unrelated functions). Pad 15 (normally loop-edit) doubles as "0" while
+// entry mode is active. Returns -1 for any pad not in this map.
+int AudioEngine::numberPadDigit(int pad) {
+    switch (pad) {
+        case 1:  return 1;  case 2:  return 2;  case 3:  return 3;
+        case 5:  return 4;  case 6:  return 5;  case 7:  return 6;
+        case 9:  return 7;  case 10: return 8;  case 11: return 9;
+        case 15: return 0;
+        default: return -1;
+    }
+}
+
+void AudioEngine::enterChannelEntry(ChannelEntryMode mode) {
+    {
+        std::lock_guard<std::mutex> lock(m_channelEntryMutex);
+        m_channelEntryMode.store((int)mode);
+        m_channelEntryLeftBuf.clear();
+        m_channelEntryRightBuf.clear();
+        m_channelEntryOnRight = false;
+    }
+    dawLog("channel entry: enter %s",
+           mode == ChannelEntryMode::Input ? "INPUT" : "OUTPUT");
+    // Kick off the same pad-20/21 LED flash the rename flow uses AND
+    // put the firmware into DAW-exclusive input mode so its local
+    // predictive LED changes and gesture-to-command translations
+    // (LOOPPLAY, DELETEPAIR, RETURNONSTOP, mute/solo/arm LED prediction)
+    // are suppressed for the whole gesture. The DAW is the sole
+    // interpreter of every pad while entry mode is active.
+    if (m_serialController) {
+        m_serialController->sendMessage("EXCLUSIVE:1");
+        m_serialController->sendMessage("PAIRFLASH:1");
+    }
+    refreshChannelEntryOled();
+}
+
+void AudioEngine::appendChannelDigit(int digit) {
+    if (digit < 0 || digit > 9) return;
+    {
+        std::lock_guard<std::mutex> lock(m_channelEntryMutex);
+        if ((int)m_channelEntryMode.load() == (int)ChannelEntryMode::None) return;
+        std::string& buf = m_channelEntryOnRight ? m_channelEntryRightBuf
+                                                 : m_channelEntryLeftBuf;
+        if (buf.size() >= 2) return;   // cap at 2 decimal digits per channel
+        buf.push_back(char('0' + digit));
+    }
+    refreshChannelEntryOled();
+}
+
+void AudioEngine::switchChannelEntrySide() {
+    {
+        std::lock_guard<std::mutex> lock(m_channelEntryMutex);
+        if ((int)m_channelEntryMode.load() == (int)ChannelEntryMode::None) return;
+        // Only meaningful once: pressing pad 20 again after already
+        // being on the right does nothing.
+        if (m_channelEntryOnRight) return;
+        // Need SOMETHING typed for the left channel — otherwise there's
+        // nothing to commit as a left value and the right would be
+        // orphaned. Silently ignore stray pad-20 taps in that case.
+        if (m_channelEntryLeftBuf.empty()) return;
+        m_channelEntryOnRight = true;
+    }
+    refreshChannelEntryOled();
+}
+
+void AudioEngine::cancelChannelEntry() {
+    {
+        std::lock_guard<std::mutex> lock(m_channelEntryMutex);
+        if ((int)m_channelEntryMode.load() == (int)ChannelEntryMode::None) return;
+        dawLog("channel entry: cancelled");
+        m_channelEntryMode.store((int)ChannelEntryMode::None);
+        m_channelEntryLeftBuf.clear();
+        m_channelEntryRightBuf.clear();
+        m_channelEntryOnRight = false;
+    }
+    if (m_serialController) {
+        m_serialController->sendMessage("PAIRFLASH:0");
+        m_serialController->sendMessage("EXCLUSIVE:0");
+    }
+    pushPlaybackStateToOled();
+}
+
+void AudioEngine::commitChannelEntry() {
+    ChannelEntryMode mode;
+    std::string leftBuf, rightBuf;
+    bool onRight;
+    {
+        std::lock_guard<std::mutex> lock(m_channelEntryMutex);
+        mode = (ChannelEntryMode)m_channelEntryMode.load();
+        if (mode == ChannelEntryMode::None) return;
+        leftBuf  = m_channelEntryLeftBuf;
+        rightBuf = m_channelEntryRightBuf;
+        onRight  = m_channelEntryOnRight;
+    }
+    // Interpret buffers as decimal channel numbers.
+    //   left="5"                  → mono ch 5
+    //   left="10"                 → mono ch 10
+    //   left="10", right="11"     → stereo ch 10 & 11
+    //   left="5",  right="6"      → stereo ch 5 & 6
+    // If the user pressed pad 20 (onRight true) but never typed a right
+    // digit, treat it as mono using just the left value.
+    auto parseChan = [](const std::string& s) -> int {
+        if (s.empty()) return -1;
+        try { return std::stoi(s); } catch (...) { return -1; }
+    };
+    int ch1 = parseChan(leftBuf);
+    int ch2 = onRight ? parseChan(rightBuf) : -1;
+    if (ch1 <= 0) {
+        dawLog("channel entry: no left value, ignored");
+    } else {
+        int sel = getSelectedTrack();
+        Track* t = getTrack(sel);
+        if (t) {
+            undoSnapshot();
+            if (mode == ChannelEntryMode::Input) {
+                if (ch2 <= 0) {
+                    t->inputMono     = true;
+                    t->inputMonoChan = ch1 - 1;
+                    dawLog("channel entry: track %d input MONO ch=%d",
+                           sel, ch1);
+                } else {
+                    t->inputMono      = false;
+                    t->inputLeftChan  = ch1 - 1;
+                    t->inputRightChan = ch2 - 1;
+                    if (t->inputRightChan == t->inputLeftChan + 1 &&
+                        (t->inputLeftChan % 2) == 0) {
+                        t->inputPair = t->inputLeftChan / 2;
+                    }
+                    dawLog("channel entry: track %d input STEREO L=%d R=%d",
+                           sel, ch1, ch2);
+                }
+            } else {   // Output
+                if (ch2 <= 0) {
+                    t->outputMono     = true;
+                    t->outputMonoChan = ch1 - 1;
+                    dawLog("channel entry: track %d output MONO ch=%d",
+                           sel, ch1);
+                } else {
+                    t->outputMono       = false;
+                    t->outputLeftChan   = ch1 - 1;
+                    t->outputRightChan  = ch2 - 1;
+                    // Legacy outputPair on-disk hint when the chans form
+                    // an adjacent even/odd pair — kept so pre-L/R sessions
+                    // continue to load without change.
+                    if (t->outputRightChan == t->outputLeftChan + 1 &&
+                        (t->outputLeftChan % 2) == 0) {
+                        t->outputPair = t->outputLeftChan / 2;
+                    }
+                    dawLog("channel entry: track %d output STEREO L=%d R=%d",
+                           sel, ch1, ch2);
+                }
+            }
+            markSessionDirty();
+        }
+    }
+    cancelChannelEntry();
+}
+
+bool AudioEngine::getChannelEntryBuffer(std::string& bufOut) const {
+    if ((int)m_channelEntryMode.load() == (int)ChannelEntryMode::None) {
+        bufOut.clear();
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_channelEntryMutex);
+    // Layout examples:
+    //   left="" onRight=false             → "_"        (nothing typed yet)
+    //   left="1"                          → "1"
+    //   left="10"                         → "10"
+    //   left="10" onRight=true right=""   → "10 & _"   (just pressed pad 20)
+    //   left="10" onRight=true right="11" → "10 & 11"
+    std::string left  = m_channelEntryLeftBuf.empty()  ? "_" : m_channelEntryLeftBuf;
+    if (!m_channelEntryOnRight) {
+        bufOut = left;
+    } else {
+        std::string right = m_channelEntryRightBuf.empty() ? "_" : m_channelEntryRightBuf;
+        bufOut = left + " & " + right;
+    }
+    return true;
+}
+
+float AudioEngine::getChannelEntryPulse() const {
+    // Reuse the firmware-broadcast rename LED phase — same triangle
+    // wave the physical pads 20/21 are running under PAIRFLASH — so
+    // the DAW's red fill pulses in perfect sync with the hardware.
+    return getLedFlashBrightness();
+}
+
+void AudioEngine::refreshChannelEntryOled() {
+    if (!m_serialController) return;
+    ChannelEntryMode mode = (ChannelEntryMode)m_channelEntryMode.load();
+    std::string buf;
+    if (!getChannelEntryBuffer(buf)) return;
+    const char* line1 = (mode == ChannelEntryMode::Input)
+                      ? "INPUT CHAN:" : "OUTPUT CHAN:";
+    oledShowForce(line1, buf.c_str());
+}
+
 // -------------- Top-level touch dispatcher --------------
 
 void AudioEngine::handleTouch(int pad, bool pressed) {
@@ -2430,6 +2763,37 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         // below (which knows how to exit scroll mode on press).
     }
 
+    // Channel-entry mode: while active, the number pads type digits into
+    // the current channel accumulator (multi-digit decimal), pad 20 moves
+    // to the RIGHT channel, and pad 21 commits + exits. Everything else
+    // — including pad 24 (formerly the commit), pad 12, and any other
+    // pad — is swallowed so it can't fire its normal function or mess
+    // with the accumulator. Undo isn't snapshotted per keystroke; the
+    // commit does one snapshot for the whole gesture.
+    if (m_channelEntryMode.load() != (int)ChannelEntryMode::None) {
+        if (pressed) {
+            if (pad == 21) { commitChannelEntry();      return; }
+            if (pad == 20) { switchChannelEntrySide();  return; }
+            int digit = numberPadDigit(pad);   // 0..9 or -1
+            if (digit >= 0) { appendChannelDigit(digit); return; }
+            // Any other pad while in entry mode is silently ignored so
+            // it doesn't accidentally trigger its normal behaviour mid-
+            // entry. The user cancels by pressing pad 21 with an empty
+            // buffer, or just types garbage that fails commit validation.
+        }
+        return;   // swallow all other traffic including releases
+    }
+
+    // Combo gesture: pad 12 held + pad 0 press → enter INPUT channel
+    // entry; + pad 4 → OUTPUT. Marks pad 12's long-press as fired so
+    // its release does NOT trigger add-track.
+    if (pressed && m_pad12Held.load() && (pad == 0 || pad == 4)) {
+        m_pad12LongPressFired.store(true);
+        enterChannelEntry(pad == 0 ? ChannelEntryMode::Input
+                                   : ChannelEntryMode::Output);
+        return;
+    }
+
     // Undo snapshot: any pad-press that reaches this dispatcher can
     // mutate state, so we capture BEFORE the action runs. Excluded: the
     // pure modifier pads (26 = undo owner, 24 = pan modifier, 3/14 =
@@ -2445,23 +2809,40 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         undoSnapshot();
     }
 
-    // Pad 36 â€” big undo pad. Fires on RELEASE, matching pad 26's tap-undo,
-    // so resting a hand on a 90 cmÂ² strip doesn't repeat-fire.
+    // Pad 36 â€” big undo pad. TWO modes:
+    //   • Held while user presses pad 20/21/22/23 → VIEW undo (rewinds
+    //     the last playhead / marker / zoom / view-pan gesture, leaves
+    //     tracks alone). Handled in the combo block below.
+    //   • Tap-release with no combo → CONTENT undo (rewinds the last
+    //     record / delete / mixer change, leaves the view alone).
+    // Deferring content-undo to release lets the held-combo take
+    // precedence without needing a "cancel" mechanism.
     if (pad == 36) {
-        if (!pressed) {
-            undoPop();
-            // Do NOT write the OLED here. undoPop() clears
-            // m_startupOledPushed, which makes the next updateController()
-            // tick re-push SETMODE:DESC + the playback state â€” landing on
-            // top of anything we write now. Queue it instead and let
-            // updateController emit it AFTER that forced push.
-            //
-            // This is why UNDO used to appear for a random length of time
-            // and then stopped appearing at all: the two writes always
-            // raced, and the serial layer's variable latency (fixed in
-            // 8f4c00e) was the only thing that ever let UNDO win.
-            m_pendingUndoOled.store(true);
+        if (pressed) {
+            m_pad36Held.store(true);
+            m_pad36ComboFired.store(false);
+        } else {
+            m_pad36Held.store(false);
+            if (!m_pad36ComboFired.exchange(false)) {
+                undoPop();
+                // Do NOT write the OLED here. undoPop() clears
+                // m_startupOledPushed, which makes the next
+                // updateController() tick re-push SETMODE:DESC +
+                // the playback state â€” landing on top of anything
+                // we write now. Queue it instead and let
+                // updateController emit it AFTER that forced push.
+                m_pendingUndoOled.store(true);
+            }
         }
+        return;
+    }
+    // Pad 36 held + pad 20/21/22/23 press → VIEW undo. Marks combo
+    // fired so pad 36's own release doesn't ALSO fire a content undo.
+    if (pressed && m_pad36Held.load() &&
+        (pad == 20 || pad == 21 || pad == 22 || pad == 23)) {
+        m_pad36ComboFired.store(true);
+        undoPopView();
+        m_pendingUndoOled.store(true);
         return;
     }
 
@@ -2668,6 +3049,18 @@ void AudioEngine::updateController() {
 
     // Fold in anything the Antelope mixer changed under us.
     applyPendingAntelopeMutes();
+
+    // Periodic controller-state re-assert. Corrects any drift between
+    // the DAW's LED shadow model and the firmware's actual pad LEDs
+    // (predictive-LED mispredictions, missed serial writes, etc.).
+    {
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowMs - m_lastPeriodicResyncMs >= RESYNC_PERIOD_MS) {
+            m_lastPeriodicResyncMs = nowMs;
+            periodicControllerResync();
+        }
+    }
 
     // One-shot: on the first tick after DAW startup, force the controller
     // into descriptive mode (regardless of what it was doing before) and
@@ -3223,9 +3616,12 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     slot->buffer.push_back(in[f * m_maxInputChannels + ch]);
                 }
             } else {
-                int chL = t.inputPair * 2;
-                int chR = chL + 1;
-                if (chL < 0 || chR >= m_maxInputChannels) continue;
+                // Independent L/R channel indices — supports non-adjacent
+                // stereo like L=ch1 R=ch7. inputPair is legacy on-disk only.
+                int chL = t.inputLeftChan;
+                int chR = t.inputRightChan;
+                if (chL < 0 || chL >= m_maxInputChannels ||
+                    chR < 0 || chR >= m_maxInputChannels) continue;
                 for (unsigned long f = startF; f < framesPerBuffer; f++) {
                     size_t pos = basePos + f;
                     if (gated && (pos < gateStart || pos >= gateEnd)) continue;
@@ -3370,11 +3766,13 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                         if (c >= 0 && c < m_maxOutputChannels)
                             out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
                     } else {
-                        int trackLeftChan  = track.outputPair * 2;
-                        int trackRightChan = trackLeftChan + 1;
+                        // Independent L/R channel indices — supports non-adjacent
+                        // stereo output like L=ch1 R=ch7. outputPair is legacy on-disk only.
+                        int trackLeftChan  = track.outputLeftChan;
+                        int trackRightChan = track.outputRightChan;
                         if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
                             out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
-                        if (trackRightChan < m_maxOutputChannels)
+                        if (trackRightChan >= 0 && trackRightChan < m_maxOutputChannels)
                             out[i * m_maxOutputChannels + trackRightChan] += rightSample;
                     }
                 }
@@ -3507,11 +3905,13 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                         if (c >= 0 && c < m_maxOutputChannels)
                             out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
                     } else {
-                        int trackLeftChan  = track.outputPair * 2;
-                        int trackRightChan = trackLeftChan + 1;
+                        // Independent L/R channel indices — supports non-adjacent
+                        // stereo output like L=ch1 R=ch7. outputPair is legacy on-disk only.
+                        int trackLeftChan  = track.outputLeftChan;
+                        int trackRightChan = track.outputRightChan;
                         if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
                             out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
-                        if (trackRightChan < m_maxOutputChannels)
+                        if (trackRightChan >= 0 && trackRightChan < m_maxOutputChannels)
                             out[i * m_maxOutputChannels + trackRightChan] += rightSample;
                     }
                 }
@@ -3598,9 +3998,10 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                         }
                     }
                 } else {
-                    int chL = t.inputPair * 2;
-                    int chR = chL + 1;
-                    if (chL >= 0 && chR < m_maxInputChannels) {
+                    int chL = t.inputLeftChan;
+                    int chR = t.inputRightChan;
+                    if (chL >= 0 && chL < m_maxInputChannels &&
+                        chR >= 0 && chR < m_maxInputChannels) {
                         for (unsigned long f = 0; f < framesPerBuffer; f++) {
                             float aL = std::fabs(in[f * m_maxInputChannels + chL]);
                             float aR = std::fabs(in[f * m_maxInputChannels + chR]);

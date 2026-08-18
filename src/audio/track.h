@@ -19,12 +19,24 @@ struct Track {
     float pan = 0.0f;       // -1.0 = left, 0.0 = center, 1.0 = right
     bool muted = false;
     bool solo = false;
-    int outputPair = 0;     // Which stereo pair to output to (used when outputMono is false)
+    int outputPair = 0;     // Legacy adjacent-pair index. Kept for session-load compat;
+                            // runtime uses outputLeftChan/outputRightChan even for adjacent pairs.
     int outputMonoChan = 0; // Mono output channel index (0 = channel 1, 1 = channel 2, ...)
-    bool outputMono = false;// false = play into outputPair (stereo), true = play into outputMonoChan
-    int inputPair = 0;      // Stereo pair index (0 = channels 1-2, 1 = 3-4, ...)
+    bool outputMono = false;// false = play into outputLeftChan/outputRightChan, true = outputMonoChan
+    // Stereo output channel indices (0-based). Independent so a track can
+    // play to ANY two hardware output channels — e.g. L=ch1 R=ch7. Defaults
+    // to (0,1) which is the same as outputPair=0 for legacy behaviour.
+    int outputLeftChan  = 0;
+    int outputRightChan = 1;
+    int inputPair = 0;      // Legacy adjacent-pair index. Kept for session-load compat only;
+                            // runtime uses inputLeftChan/inputRightChan even for the adjacent case.
     int inputMonoChan = 0;  // Mono channel index (0 = channel 1, 1 = channel 2, ...)
-    bool inputMono = false; // false = record from inputPair (stereo), true = from inputMonoChan
+    bool inputMono = false; // false = record from inputLeftChan/inputRightChan, true = from inputMonoChan
+    // Stereo input channel indices (0-based). Independent so we can record
+    // a stereo track from ANY two hardware channels — e.g. left = ch1, right = ch7.
+    // Defaults chosen so a fresh Track behaves like inputPair=0 (channels 1-2).
+    int inputLeftChan  = 0;
+    int inputRightChan = 1;
     bool armed = false;     // Record-arm — armed tracks capture input during playback
     bool inputMonitor = false; // "I" button — reserved for input-monitor wiring
 

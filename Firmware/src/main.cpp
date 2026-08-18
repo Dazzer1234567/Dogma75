@@ -839,6 +839,20 @@ static const uint32_t FAST_FLASH_HALFPERIOD_MS = 50;   // 10 Hz square wave
 // the combo pair.
 bool comboFired = false;
 
+// DAW-exclusive input mode. Toggled via serial EXCLUSIVE:1 / EXCLUSIVE:0.
+// While set, handleTouchPressed / handleTouchReleased forward raw TOUCH:N
+// and RELEASE:N to the DAW WITHOUT running any local predictive-LED
+// changes, gesture-to-command translations (LOOPPLAY, DELETEPAIR, etc.),
+// combo locks, or mode dispatch (text-input / flash mode). The DAW owns
+// every semantic reaction. Used by DAW modes like channel-entry where a
+// stray local behaviour on pad 15/19/etc. would collide with the DAW's
+// interpretation of the same tap.
+//
+// NOT set for track-rename entry — rename relies on the firmware's local
+// letter-cycling (via PAIRFLASH + textInputMode) and DAW-exclusive would
+// disable it. Use PAIRFLASH:1 on its own for that case.
+bool dawExclusiveMode = false;
+
 // Pad-15 hold-to-delete-all-loops. Short tap toggles loop-edit mode
 // (deferred until release so the two behaviours can share the pad); a
 // hold of DELETE_ALL_HOLD_MS wipes both marker pairs and runs a
@@ -1047,13 +1061,11 @@ void textInputFlashStep() {
 
 // Enter / exit text-input mode. Enter starts the pad-20/21 flash and
 // resets the character cycler; exit restores the LEDs to their DAW-driven
-// state and clears the pending cycle.
-void textInputEnter() {
-    textInputMode        = true;
-    textInputPending     = 0;
-    textInputCurrentPad  = -1;
-    textInputCursorPos   = (int8_t)strlen(textInputBuffer);
-    textInputE1Accum     = 0;
+// Flash-only helpers — used by BOTH textInputEnter/Exit (track rename)
+// and the DAW's PAIRFLASH:1/:0 command (channel-entry mode). Keeps the
+// LED behaviour on pads 20 & 21 identical in both cases without dragging
+// the letter-cycling state into channel-entry.
+void pairFlashStart() {
     textInputFlashActive = true;
     textInputFlashLastMs = 0;   // 0 = let the next flashStep run immediately
     // Anchor the flash to NOW, offset half a period so we start at the
@@ -1063,29 +1075,41 @@ void textInputEnter() {
     // Paint them immediately rather than waiting for the next 20 ms tick.
     pca9685SetPWM(4, 0);   // wiring: 0 = fully on
     pca9685SetPWM(5, 0);
-    // Only pads 20 (LED 4) and 21 (LED 5) should visibly flash while the
-    // user names a track. Force the other marker LEDs (6 = record-right,
-    // 7 = loop-right) OFF here regardless of whether the DAW has them
-    // enabled — the paired-flash pattern would otherwise be misleading.
+    // Only pads 20 (LED 4) and 21 (LED 5) should visibly flash. Force the
+    // other marker LEDs (6 = record-right, 7 = loop-right) OFF here
+    // regardless of whether the DAW has them enabled — the paired-flash
+    // pattern would otherwise be misleading.
     ledSet(6, false);
     ledSet(7, false);
     // Broadcast the current LED-flash phase (0 .. FLASH_PERIOD_MS-1) to
-    // the DAW so its rename-preview UI can pulse in perfect sync with the
-    // physical pad LEDs. The DAW extrapolates from wall-clock time.
+    // the DAW so its red-fill pulse can sync with the physical LEDs.
     Serial.print("RENAMESYNC:");
     Serial.println(textInputFlashPhase());
 }
-void textInputExit() {
-    bool wasActive       = textInputMode;
-    textInputMode        = false;
-    textInputPending     = 0;
-    textInputCurrentPad  = -1;
+void pairFlashStop() {
     textInputFlashActive = false;
     // Restore all four marker LEDs from the mirrored authoritative state.
     ledSet(4, loopLeftLocal);
     ledSet(5, recordLeftLocal);
     ledSet(6, recordRightLocal);
     ledSet(7, loopRightLocal);
+}
+
+// state and clears the pending cycle.
+void textInputEnter() {
+    textInputMode        = true;
+    textInputPending     = 0;
+    textInputCurrentPad  = -1;
+    textInputCursorPos   = (int8_t)strlen(textInputBuffer);
+    textInputE1Accum     = 0;
+    pairFlashStart();
+}
+void textInputExit() {
+    bool wasActive       = textInputMode;
+    textInputMode        = false;
+    textInputPending     = 0;
+    textInputCurrentPad  = -1;
+    pairFlashStop();
     if (wasActive) Serial.println("RENAMEEND");
 }
 
@@ -1722,6 +1746,27 @@ void processSerialCommands() {
                 textInputEnter();
                 textInputRender();
             }
+            // PAIRFLASH:1 / :0 — toggle the same pad-20/21 LED flash the
+            // rename flow uses, without any letter-cycling state. Sent by
+            // the DAW when channel-entry mode enters/exits so the user gets
+            // the same visual cue that they're in a "typing" mode.
+            else if (serialInputBuffer == "PAIRFLASH:1") {
+                pairFlashStart();
+            }
+            else if (serialInputBuffer == "PAIRFLASH:0") {
+                pairFlashStop();
+            }
+            // EXCLUSIVE:1 / :0 — DAW claims exclusive ownership of every
+            // pad. Firmware turns into a dumb TOUCH/RELEASE forwarder:
+            // no predictive LED toggles, no gesture-to-command translation
+            // (LOOPPLAY, DELETEPAIR, RETURNONSTOP), no local mode dispatch.
+            // Used by DAW modes that reinterpret pads (channel-entry).
+            else if (serialInputBuffer == "EXCLUSIVE:1") {
+                dawExclusiveMode = true;
+            }
+            else if (serialInputBuffer == "EXCLUSIVE:0") {
+                dawExclusiveMode = false;
+            }
             // DISP:1:text / DISP:2:text — DAW-pushed OLED line text. Only
             // takes effect in DESCRIPTIVE mode (diagnostic mode shows raw
             // button numbers only, uniformly for every pad). Also blocked by
@@ -2207,6 +2252,20 @@ void handleTouchPressed(int touchNum) {
         pendingSwitchToDiagOnActivity = false;
         setDisplayMode(false);
     }
+    // DAW-exclusive short-circuit: forward the raw TOUCH and skip every
+    // local behaviour. See comment at dawExclusiveMode declaration.
+    // Still emit the diagnostic "BUTTON N ON" OLED update — that's a
+    // pure display echo, not a local pad behaviour, and losing it makes
+    // the diagnostic mode useless.
+    if (dawExclusiveMode) {
+        Serial.print("TOUCH:");
+        Serial.println(touchNum);
+        if (!displayMode && millis() >= oledLockUntilMs) {
+            snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d ON", touchNum);
+            oledLine2Changed = true;
+        }
+        return;
+    }
     // Combo lock: after 19+14 or 19+15 has fired, every other press is
     // suppressed until both combo pads are physically released. Prevents
     // stray taps while the user still has both fingers down.
@@ -2233,6 +2292,18 @@ void handleTouchPressed(int touchNum) {
 // press windows, replays the deferred pad-19 action, and forwards a
 // RELEASE:N to the DAW for pads that don't need special release handling.
 void handleTouchReleased(int touchNum) {
+    // DAW-exclusive short-circuit: forward the raw RELEASE and skip every
+    // local behaviour. Symmetric to handleTouchPressed — keep the
+    // diagnostic OLED echo so `!displayMode` still shows the taps.
+    if (dawExclusiveMode) {
+        Serial.print("RELEASE:");
+        Serial.println(touchNum);
+        if (!displayMode && millis() >= oledLockUntilMs) {
+            snprintf(oledLine2, sizeof(oledLine2), "BUTTON %d OFF", touchNum);
+            oledLine2Changed = true;
+        }
+        return;
+    }
     if (touchNum == 26) modifierHeld = false;
     // Pad 24 release: only turn off LED 8 outside flash mode. Inside
     // flashMode LED 8 tracks the delete-arm toggle, not the physical hold.
@@ -2243,6 +2314,9 @@ void handleTouchReleased(int touchNum) {
         pad15Held = false;
         // Short tap = toggle loop-edit. Long-press already fired the
         // delete-all gesture (clears pad15PressMs); skip in that case.
+        // (When DAW is in exclusive mode the dispatcher up top has
+        // already returned before reaching this handler, so pad 15 just
+        // forwards RELEASE:15 without touching any of this.)
         if (!pad15LongPressFired && pad15PressMs != 0) {
             if (flashMode) exitFlashMode();
             else           enterFlashMode();
@@ -2394,6 +2468,10 @@ void loop() {
             loopPairDefined   = false;
             recordPairDefined = false;
             if (flashMode) { flashMode = false; flashModeDeleteArmed = false; }
+            // Any DAW-owned exclusive mode was for a session that just
+            // vanished. Clear it so pads regain their local behaviours
+            // (including the "BUTTON N ON" OLED echo in diagnostic mode).
+            dawExclusiveMode = false;
             snprintf(oledLine1, sizeof(oledLine1), "DAW DISCONNECTED");
             snprintf(oledLine2, sizeof(oledLine2), " ");
             oledLine1Changed = true;
@@ -2565,7 +2643,11 @@ void loop() {
     // DAW's red-fill pulse out of phase with the physical LEDs. Cheap:
     // one 20-byte serial write per tick.
     static uint32_t lastRenameSyncMs = 0;
-    if (textInputMode && millis() - lastRenameSyncMs > 150) {
+    // Broadcast phase whenever the pad-20/21 flash is running — both the
+    // rename flow (textInputMode) and DAW-driven channel-entry mode via
+    // PAIRFLASH share the same flag, so keying the sync off it covers
+    // both cases without a separate broadcast path.
+    if (textInputFlashActive && millis() - lastRenameSyncMs > 150) {
         lastRenameSyncMs = millis();
         Serial.print("RENAMESYNC:");
         Serial.println(textInputFlashPhase());
