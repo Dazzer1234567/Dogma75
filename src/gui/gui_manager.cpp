@@ -314,16 +314,22 @@ bool GUIManager::initialize(AudioEngine* audioEngine, SerialController* serialCo
     // Load saved settings
     loadSettings();
 
-    // Auto-load the most recently used session, skipping any whose file has
-    // since been moved or deleted. Replaces a hardcoded path that pointed at
-    // one particular session on one particular machine â€” it did not exist on
-    // the second machine, so every launch started empty and logged a failure.
-    // Falls through to an empty session if the list is empty or nothing in it
-    // still exists.
-    for (const std::string& recent : m_recentSessions) {
-        if (!fileExists(recent)) continue;
-        loadSessionFromFile(recent);
-        break;
+    // Auto-load priority:
+    //   1. m_defaultSessionPath if the user has explicitly pinned one
+    //      (via File > "Save as default") AND the file still exists.
+    //   2. Otherwise the most-recently-used session whose file exists.
+    //   3. Otherwise start empty.
+    bool autoLoaded = false;
+    if (!m_defaultSessionPath.empty() && fileExists(m_defaultSessionPath)) {
+        loadSessionFromFile(m_defaultSessionPath);
+        autoLoaded = true;
+    }
+    if (!autoLoaded) {
+        for (const std::string& recent : m_recentSessions) {
+            if (!fileExists(recent)) continue;
+            loadSessionFromFile(recent);
+            break;
+        }
     }
     retimeArrangement();
 
@@ -1410,6 +1416,11 @@ void GUIManager::renderToolbar() {
         if (m_recentSessions.empty()) ImGui::EndDisabled();
         if (ImGui::MenuItem("Save"))         saveSession();
         if (ImGui::MenuItem("Save As"))      saveSessionAs();
+        if (ImGui::MenuItem("Save as default")) saveAsDefault();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Save the session, then pin it as the one\n"
+                              "that auto-loads on next DAW launch.");
+        }
         // Revert enabled only when a session file is actually open.
         bool canRevert = !m_currentSessionPath.empty();
         if (!canRevert) ImGui::BeginDisabled();
@@ -2724,11 +2735,25 @@ void GUIManager::renderWaveform(float height) {
                 bool liveActive = m_audioEngine->getRenameBuffer(liveBuf, liveCursor);
                 float flashB = m_audioEngine->getLedFlashBrightness();
                 bool cursorOn = (flashB > 0.5f);
+                // Use LAST FRAME's arrangement mapping — the ruler
+                // draws BEFORE the arrangement child, so we can't
+                // observe this frame's arrLast* yet. First frame after
+                // startup falls back to ruler coords (waveW=0 → skip
+                // is impractical, so we just use those close-enough
+                // values one frame). Subsequent frames pixel-align.
+                bool haveArrMap = (m_arrMapWaveW > 0.5f);
+                float  arrOrigX   = haveArrMap ? m_arrMapCursorX : origin.x;
+                float  arrWaveW   = haveArrMap ? m_arrMapWaveW   : width;
+                size_t arrViewSt  = haveArrMap ? m_arrMapViewStart     : viewStart;
+                size_t arrVis     = haveArrMap ? m_arrMapVisibleFrames : visibleFrames;
+                if (arrVis < 1) arrVis = 1;
                 for (int i = 0; i < (int)bookmarks.size(); i++) {
                     const auto& bm = bookmarks[i];
                     if (bm.frame < viewStart || bm.frame >= viewEnd) continue;
-                    double bmSec = (double)bm.frame / sampleRate;
-                    float  bx    = origin.x + (float)((bmSec - startSec) * pxPerSec);
+                    // Exact same formula the arrangement's frameToX uses,
+                    // fed the exact same values → pixel-identical X.
+                    float bx = arrOrigX + ((float)(bm.frame - arrViewSt)
+                                           / (float)arrVis) * arrWaveW;
                     dl->AddTriangleFilled(
                         ImVec2(bx - halfW, topY),
                         ImVec2(bx + halfW, topY),
@@ -3355,6 +3380,11 @@ void GUIManager::renderWaveform(float height) {
         ImVec2 childSize = ImGui::GetWindowSize();
         float overlayTop    = childPos.y;
         float overlayBottom = childPos.y + childSize.y - 3;
+        // Vertical lines (playhead, markers, zero-point) stop just ABOVE
+        // the horizontal loop/rec bar so they don't spill down through
+        // it. The bar draws at overlayBottom with thickness 3 (see
+        // drawSegment below), so verticalLineBottom sits at bar-top.
+        float verticalLineBottom = overlayBottom - 3;
 
         size_t playbackPos = m_audioEngine->getPlaybackPosition();
 
@@ -3378,6 +3408,10 @@ void GUIManager::renderWaveform(float height) {
                    ((float)(frame - arrLastViewStart) / (float)arrLastVisibleFrames) * arrLastWaveW;
         };
 
+        // (Zero-point is drawn AFTER the playhead below — it renders on
+        // top so when they coincide the play line shows through the
+        // dashed gaps.)
+
         // Vertical marker lines + top triangles + labels.
         const char* markerLabels[4] = {"L", "L", "R", "R"};
         for (int m = 0; m < 4; m++) {
@@ -3389,9 +3423,9 @@ void GUIManager::renderWaveform(float height) {
             ImU32 markerColor = (m == 0 || m == 3) ? yellowColor : redColor;
 
             drawList->AddLine(ImVec2(markerX, overlayTop),
-                              ImVec2(markerX, overlayBottom),
+                              ImVec2(markerX, verticalLineBottom),
                               markerColor, 2.0f);
-            storeLineCmd(markerX, overlayTop, markerX, overlayBottom, markerColor, 2.0f);
+            storeLineCmd(markerX, overlayTop, markerX, verticalLineBottom, markerColor, 2.0f);
 
             float arrowTop    = overlayTop + 2;
             float arrowBottom = overlayTop + 14;
@@ -3452,9 +3486,9 @@ void GUIManager::renderWaveform(float height) {
                 const float dashLen = 18.0f;
                 const float gapLen  = 12.0f;
                 float y = overlayTop;
-                while (y < overlayBottom) {
+                while (y < verticalLineBottom) {
                     float y2 = y + dashLen;
-                    if (y2 > overlayBottom) y2 = overlayBottom;
+                    if (y2 > verticalLineBottom) y2 = verticalLineBottom;
                     drawList->AddLine(ImVec2(playbackX, y),
                                       ImVec2(playbackX, y2),
                                       playheadColor, 2.0f);
@@ -3463,9 +3497,31 @@ void GUIManager::renderWaveform(float height) {
                 }
             } else {
                 drawList->AddLine(ImVec2(playbackX, overlayTop),
-                                  ImVec2(playbackX, overlayBottom),
+                                  ImVec2(playbackX, verticalLineBottom),
                                   playheadColor, 2.0f);
-                storeLineCmd(playbackX, overlayTop, playbackX, overlayBottom, playheadColor, 2.0f);
+                storeLineCmd(playbackX, overlayTop, playbackX, verticalLineBottom, playheadColor, 2.0f);
+            }
+        }
+
+        // Zero-point (frame 0): dashed blue vertical, drawn AFTER the
+        // playhead so it renders IN FRONT — when they coincide the play
+        // line shows through the gaps in the dashed blue. Twice as
+        // thick as before so it's visually distinct from the markers.
+        if (arrLastViewStart == 0 && arrLastViewEnd > 0) {
+            float zeroX = frameToX(0);
+            ImU32 zeroColor = IM_COL32(80, 150, 255, 220);
+            const float dashLen = 8.0f;
+            const float gapLen  = 6.0f;
+            const float thick   = 3.0f;
+            float y = overlayTop;
+            while (y < verticalLineBottom) {
+                float y2 = y + dashLen;
+                if (y2 > verticalLineBottom) y2 = verticalLineBottom;
+                drawList->AddLine(ImVec2(zeroX, y),
+                                  ImVec2(zeroX, y2),
+                                  zeroColor, thick);
+                storeLineCmd(zeroX, y, zeroX, y2, zeroColor, thick);
+                y = y2 + gapLen;
             }
         }
 
@@ -3481,11 +3537,47 @@ void GUIManager::renderWaveform(float height) {
                     float sx = frameToX(selFrame);
                     ImU32 white = IM_COL32(255, 255, 255, 255);
                     drawList->AddLine(ImVec2(sx, overlayTop),
-                                      ImVec2(sx, overlayBottom),
+                                      ImVec2(sx, verticalLineBottom),
                                       white, 2.0f);
-                    storeLineCmd(sx, overlayTop, sx, overlayBottom, white, 2.0f);
+                    storeLineCmd(sx, overlayTop, sx, verticalLineBottom, white, 2.0f);
                 }
             }
+        }
+
+        // Zoom-lock indicator — small padlock glyph in the bottom-right
+        // corner of the arrangement child. Drawn last (over everything
+        // else) so it's always visible. Absent when zoom is unlocked.
+        if (m_audioEngine->isZoomLocked()) {
+            // 2× the original — comfortably visible from a couple of
+            // metres. Body 28×22 with an 8-radius shackle above.
+            float bodyW = 28.0f, bodyH = 22.0f;
+            float shackleR = 8.0f;
+            float margin = 12.0f;
+            float bx = childPos.x + childSize.x - bodyW - margin;
+            float by = childPos.y + childSize.y - bodyH - margin - 6.0f;
+            ImU32 lockCol = IM_COL32(255, 200, 60, 230);   // amber
+            ImU32 lockOut = IM_COL32(30,  20,  0, 220);
+            // Body with rounded corners + dark outline.
+            drawList->AddRectFilled(ImVec2(bx, by),
+                                    ImVec2(bx + bodyW, by + bodyH),
+                                    lockCol, 3.0f);
+            drawList->AddRect(ImVec2(bx, by),
+                              ImVec2(bx + bodyW, by + bodyH),
+                              lockOut, 3.0f, 0, 1.5f);
+            // Shackle: upper half arc.
+            ImVec2 arcCentre(bx + bodyW * 0.5f, by);
+            drawList->PathClear();
+            drawList->PathArcTo(arcCentre, shackleR,
+                                (float)M_PI, 2.0f * (float)M_PI, 20);
+            drawList->PathStroke(lockCol, 0, 3.0f);
+            // Keyhole: dark round-top + narrow neck below.
+            float kh_cx = bx + bodyW * 0.5f;
+            float kh_cy = by + bodyH * 0.42f;
+            drawList->AddCircleFilled(ImVec2(kh_cx, kh_cy), 2.8f, lockOut, 12);
+            drawList->AddRectFilled(
+                ImVec2(kh_cx - 1.2f, kh_cy),
+                ImVec2(kh_cx + 1.2f, by + bodyH - 4.0f),
+                lockOut, 0.0f);
         }
 
         // Loop/rec horizontal bars â€” pinned to the bottom edge of the
@@ -3560,6 +3652,13 @@ void GUIManager::renderWaveform(float height) {
     // Capture the wheel-scroll for next frame so the left panel and
     // arrangement view stay in lock-step.
     m_trackScrollY = ImGui::GetScrollY();
+    // Cache the arrangement's frame→X mapping for NEXT frame's bookmark
+    // triangle drawing (which runs BEFORE the arrangement child is
+    // entered and therefore can't observe these values fresh).
+    m_arrMapCursorX       = arrLastCursorX;
+    m_arrMapWaveW         = arrLastWaveW;
+    m_arrMapViewStart     = arrLastViewStart;
+    m_arrMapVisibleFrames = arrLastVisibleFrames;
     ImGui::EndChild();   // arrangementScroll
 
     if (trackCount == 0) {
@@ -4145,6 +4244,10 @@ void GUIManager::saveSettings() {
     file << "  },\n";
     file << "\n";
 
+    // Auto-load session on startup. Set by File > "Save as default".
+    file << "  \"defaultSessionPath\": \"" << jsonEscape(m_defaultSessionPath) << "\",\n";
+    file << "\n";
+
     // Recently-opened sessions, newest first, for File > Recent Projects.
     file << "  \"recentSessions\": [";
     for (size_t i = 0; i < m_recentSessions.size(); i++) {
@@ -4189,6 +4292,18 @@ void GUIManager::saveSettings() {
 
     file.close();
     std::cout << ("Settings saved to " + appPath("settings\\user_settings.json")) << std::endl;
+}
+
+void GUIManager::saveAsDefault() {
+    // Save first (opens Save As if the session has no path yet).
+    saveSession();
+    // If the user cancelled the Save As dialog, m_currentSessionPath
+    // stays empty and there's nothing to pin.
+    if (m_currentSessionPath.empty()) return;
+    m_defaultSessionPath = m_currentSessionPath;
+    saveSettings();
+    dawLog("Save as default: pinned '%s' as startup session",
+           m_defaultSessionPath.c_str());
 }
 
 void GUIManager::saveSession() {
@@ -5029,6 +5144,9 @@ void GUIManager::loadSettings() {
     };
     m_lastAudioDir   = unescape(getString("lastAudioDir"));
     m_lastSessionDir = unescape(getString("lastSessionDir"));
+    // Optional default-session path; empty when the user has never
+    // clicked File > "Save as default".
+    m_defaultSessionPath = unescape(getString("defaultSessionPath"));
 
     // Recent sessions array â€” walk the quoted strings between [ and ].
     // Deliberately does NOT drop entries whose file is missing: a session

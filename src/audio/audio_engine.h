@@ -478,6 +478,11 @@ private:
     bool touchHandlePad12(bool pressed);
     void touchHandlePairInClearMode(int pad);   // pads 20/21/22/23 in clear-mode
     void touchHandlePairPad(int markerIdx);     // pads 20/21/22/23 in normal mode
+    // Pad 13 held + pad 0/4: step through bookmarks in frame order.
+    // direction = +1 (next / rightward) or -1 (previous / leftward).
+    // No wrap — clamps at both ends. On first nav press after a fresh
+    // session, jumps to the bookmark nearest the current playhead.
+    void navigateBookmarks(int direction);
     void* m_stream;
     std::atomic<bool> m_running;
     std::atomic<bool> m_testToneEnabled;
@@ -752,6 +757,31 @@ private:
     // the press.
     std::atomic<bool> m_pad36Held{false};
     std::atomic<bool> m_pad36ComboFired{false};
+    // Pair-pad (20/21/22/23) tap-on-release state. Mirrors pad 36's
+    // pattern: press just arms; release fires touchHandlePairPad ONLY
+    // if the press was seen AND no combo consumed it during the hold.
+    // Indexed 0..3 for pads 20/21/22/23 respectively.
+    std::atomic<bool> m_pairPadPressSeen[4]{};
+    std::atomic<bool> m_pairPadComboFired[4]{};
+
+    // Zoom lock. Held pad 23 + turn E6 toggles the lock. While locked,
+    // E2 zoom is a no-op (E2 pan via pad 24 still works). Persist state
+    // is intentionally in-memory only — the lock always starts OFF on
+    // fresh session/DAW launch to avoid a confused "why can't I zoom".
+    // m_zoomLockToggledThisHold prevents a single pad-23 hold from
+    // toggling multiple times if the user turns E6 several ticks.
+public:
+    bool isZoomLocked() const { return m_zoomLocked.load(); }
+private:
+    std::atomic<bool> m_zoomLocked{false};
+    std::atomic<bool> m_zoomLockToggledThisHold{false};
+    // Wall-clock ms at which pad 23 was last released. Used to
+    // suppress E6 marker-nudge for a short window after — otherwise
+    // any residual encoder motion right after releasing pad 23 (from
+    // the same finger that was mid-turn during the zoom-lock combo)
+    // would accidentally nudge the loop-right marker.
+    std::atomic<int64_t> m_pad23ReleaseMs{0};
+    static constexpr int64_t PAD23_MARKER_LOCKOUT_MS = 500;
     // Loop playback (wrap-around) on/off, toggled by double-tapping pad 15.
     // Defaults true so existing sessions behave exactly as before.
     std::atomic<bool> m_loopPlaybackEnabled{true};
@@ -899,6 +929,11 @@ private:
     // Index of the most-recently-added track (the one awaiting a name from
     // the controller's on-device entry flow). -1 = no pending name.
     std::atomic<int> m_pendingNameTrackIndex{-1};
+    // True when the pending name is for a JUST-CREATED track (pad 12
+    // short-tap add), false for a long-press rename of an existing
+    // track. Determines whether a repeat pad-12 press cancels by also
+    // deleting the fresh track, or just closes the naming dialog.
+    std::atomic<bool> m_pendingTrackIsFreshAdd{false};
 
     // Long-press detection for pad 12. A short press (< 1 s) creates a new
     // track; holding for >= 1 s cancels the add and instead starts a rename

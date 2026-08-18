@@ -407,6 +407,56 @@ void oledFill(uint8_t value) {
 bool muteIndOn = false;
 bool muteIndDirty = true;   // paint on first idle tick so boot state is defined
 
+// --- Zoom-lock indicator ---
+// A 14×12 padlock in the top-right of the OLED. Toggled by the DAW
+// via ZOOMLOCK:1 / :0 whenever the user hits pad 23 + E6. Persistent
+// (repainted after every text-line render, same pattern as MUTEIND).
+bool zoomLockIndOn    = false;
+bool zoomLockIndDirty = true;
+
+// 14-bit rows for the padlock. MSB = leftmost pixel.
+static const uint16_t ZOOM_LOCK_ICON[12] = {
+    0b00001111110000,  // ....######....   shackle top
+    0b00010000001000,  // ...#......#...
+    0b00100000000100,  // ..#........#..
+    0b00100000000100,  // ..#........#..
+    0b11111111111111,  // ##############   body top
+    0b10000000000001,  // #............#
+    0b10000011000001,  // #.....##.....#   keyhole
+    0b10000111100001,  // #....####....#
+    0b10000011000001,  // #.....##.....#
+    0b10000011000001,  // #.....##.....#
+    0b10000000000001,  // #............#
+    0b11111111111111,  // ##############   body bottom
+};
+static const uint8_t  ZOOM_LOCK_ICON_ROWS = 12;
+static const uint8_t  ZOOM_LOCK_ICON_COLS = 14;   // pixels
+
+void oledDrawZoomLockIndicator() {
+    if (!oledFound) return;
+    // Icon is 14 pixels wide → 7 bytes at 2 px/byte. Position it 2
+    // pixels in from the right edge (col 240..253 → byte cols 120..126)
+    // starting at row 4 so it clears the top border.
+    const uint8_t colStartByte = 120;
+    const uint8_t colEndByte   = 126;
+    const uint8_t rowStart     = 4;
+    const uint8_t rowEnd       = rowStart + ZOOM_LOCK_ICON_ROWS - 1;
+    oledSetWindow(colStartByte, colEndByte, rowStart, rowEnd);
+    for (uint8_t r = 0; r < ZOOM_LOCK_ICON_ROWS; r++) {
+        uint16_t bits = zoomLockIndOn ? ZOOM_LOCK_ICON[r] : 0;
+        Wire2.beginTransmission(OLED_ADDR);
+        Wire2.write(0x40);
+        for (uint8_t b = 0; b < 7; b++) {
+            // Each byte covers 2 adjacent pixels; MSB nibble = left.
+            bool left  = (bits >> (13 - 2 * b)) & 1;
+            bool right = (bits >> (12 - 2 * b)) & 1;
+            uint8_t val = (uint8_t)((left ? 0xF0 : 0x00) | (right ? 0x0F : 0x00));
+            Wire2.write(val);
+        }
+        Wire2.endTransmission();
+    }
+}
+
 void oledDrawMuteIndicator() {
     if (!oledFound) return;
     // 2 cols (each = 2 pixels) x 64 rows = 128 bytes. Chunk to stay under
@@ -554,6 +604,11 @@ void oledStep() {
             muteIndDirty = false;
             return;
         }
+        if (zoomLockIndDirty) {
+            oledDrawZoomLockIndicator();
+            zoomLockIndDirty = false;
+            return;
+        }
         const char* src = nullptr;
         if (oledLine1Changed) {
             oledLine1Changed = false;
@@ -621,7 +676,11 @@ void oledStep() {
         oledDrawing = 0;  // finished; next call will latch new work if pending
         // Text render zero'd cols 0-1 across the line's row band, so the
         // left-column mute indicator needs to be redrawn if it was on.
+        // Same for the zoom-lock icon in the top-right corner — line 1
+        // (row 8, spans rows 8-22) overlaps its area (rows 4-15) so a
+        // line-1 render will blank it.
         if (muteIndOn) muteIndDirty = true;
+        if (zoomLockIndOn) zoomLockIndDirty = true;
     }
 }
 
@@ -879,6 +938,13 @@ bool     resetShowActive = false;
 // normal play/stop press-action.
 bool     pad19Held             = false;
 bool     pad19UsedAsModifier   = false;
+// Pad 19 long-press: hold the play button for GOTOSTART_HOLD_MS to jump
+// the playhead to the timeline start and scroll the view there. Timer
+// starts on press, fires once, and marks pad 19 as a modifier so the
+// deferred play/stop on release does NOT also fire.
+uint32_t pad19PressMs          = 0;
+bool     pad19LongPressFired   = false;
+static const uint32_t GOTOSTART_HOLD_MS = 2000;
 
 // 3-quick-blink acknowledgement on the pair whose markers were just
 // deleted. 6 transitions * 50 ms = ~300 ms total, then LEDs go out (the
@@ -1731,6 +1797,16 @@ void processSerialCommands() {
             // MUTEIND:1 / :0 — DAW toggles the far-left OSC-mute indicator
             // bar on the OLED. Just latches state; next idle oledStep()
             // renders it.
+            // ZOOMLOCK:1 / :0 — DAW toggles the persistent top-right
+            // padlock icon. Same repaint pattern as MUTEIND.
+            else if (serialInputBuffer == "ZOOMLOCK:1") {
+                zoomLockIndOn    = true;
+                zoomLockIndDirty = true;
+            }
+            else if (serialInputBuffer == "ZOOMLOCK:0") {
+                zoomLockIndOn    = false;
+                zoomLockIndDirty = true;
+            }
             else if (serialInputBuffer == "MUTEIND:1") {
                 muteIndOn    = true;
                 muteIndDirty = true;
@@ -2219,8 +2295,10 @@ bool handleTouchNormalMode(int touchNum) {
     if (touchNum == 19) {
         // Defer press action to release so holding 19 as a delete-
         // modifier doesn't fire play/stop. firePad19Deferred() replays.
-        pad19Held           = true;
-        pad19UsedAsModifier = false;
+        pad19Held             = true;
+        pad19UsedAsModifier   = false;
+        pad19PressMs          = millis();
+        pad19LongPressFired   = false;
         return true;
     }
     if ((touchNum == 20 || touchNum == 23) && pad19Held) {
@@ -2376,10 +2454,13 @@ void handleTouchReleased(int touchNum) {
     }
     if (touchNum == 19) {
         // Replay deferred press-action if the tap wasn't consumed by a
-        // delete combo. RELEASE:19 is sent from within firePad19Deferred.
+        // delete combo OR the long-press. RELEASE:19 is sent from within
+        // firePad19Deferred.
         bool wasModifier = pad19UsedAsModifier;
-        pad19Held           = false;
-        pad19UsedAsModifier = false;
+        pad19Held             = false;
+        pad19UsedAsModifier   = false;
+        pad19PressMs          = 0;
+        pad19LongPressFired   = false;
         if (!wasModifier) firePad19Deferred();
     } else if (!suppressReleaseSend) {
         Serial.print("RELEASE:");
@@ -2455,6 +2536,19 @@ void loop() {
             // clobbering any diagnostic event after user activity. Also
             // stops the pad-20/21 name-entry flash if it was active.
             if (textInputMode) textInputExit();
+            // Kill every autonomous LED animation. Any of these left
+            // running would re-paint the LEDs on the next loop tick and
+            // undo the wipe below. They can be active WITHOUT
+            // textInputMode being on — channel-entry mode uses
+            // PAIRFLASH:1 to drive textInputFlashActive directly, and
+            // muteFlashActive / deleteAllFade / markerDeleteFlash are
+            // all independent state machines.
+            pairFlashStop();                    // textInputFlashActive → false + LED reset
+            muteFlashActive        = false;
+            deleteAllFadeStartMs   = 0;
+            markerDeleteFlashPair  = 0;
+            markerDeleteFlashCount = 0;
+            markerDeleteFlashOn    = false;
             // Clean-sweep every LED and mirror so the controller doesn't
             // sit with LEDs stuck in the last-known state after the DAW
             // vanishes. The DAW normally sends LED:*:OFF on graceful
@@ -2636,6 +2730,18 @@ void loop() {
         (millis() - pad18PressMs) >= RESET_HOLD_MS) {
         pad18ResetFired = true;
         performReset();
+    }
+
+    // --- Pad 19 long-press: GOTOSTART (2 s hold) ---
+    // Jumps the playhead to frame 0 and scrolls the view there. Marks
+    // pad 19 as a modifier so the release-deferred play/stop is
+    // suppressed — otherwise release would immediately play from 0
+    // which is not what the user asked for.
+    if (pad19Held && !pad19LongPressFired && pad19PressMs != 0 &&
+        (millis() - pad19PressMs) >= GOTOSTART_HOLD_MS) {
+        pad19LongPressFired = true;
+        pad19UsedAsModifier = true;
+        Serial.println("GOTOSTART");
     }
 
     // --- Text-input phase re-sync (every ~150 ms while typing) ---

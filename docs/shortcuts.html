@@ -156,8 +156,9 @@
 <h2 id="s1"><span class="num">1</span>Playback &amp; transport</h2>
 <table>
   <tr><th>Trigger</th><th>Action</th></tr>
-  <tr><td class="trigger"><code>Pad 19</code> tap</td><td>Play / Stop toggle.</td></tr>
+  <tr><td class="trigger"><code>Pad 19</code> tap</td><td>Play / Stop toggle (fires on release).</td></tr>
   <tr><td class="trigger"><span class="kbd">Space</span></td><td>Play / Stop from the DAW window (ignored while a text field is focused).</td></tr>
+  <tr><td class="trigger"><code>Pad 19</code> long-press (≥ 2 s)</td><td><b>Go to start</b> — moves the playhead to frame 0 and scrolls the arrangement view to bring frame 0 to the left. Suppresses the release play/stop.</td></tr>
   <tr><td class="trigger"><code>Pad 19</code> <span class="plus">+</span> <code>Pad 14</code></td><td>Return-to-start-on-stop <b>ON</b>.</td></tr>
   <tr><td class="trigger"><code>Pad 19</code> <span class="plus">+</span> <code>Pad 15</code></td><td>Stop-in-place (return-to-start <b>OFF</b>).</td></tr>
   <tr><td class="trigger"><code>Pad 15</code> double-tap</td><td>Toggle loop-playback wrap-around between loop-L and loop-R markers.</td></tr>
@@ -177,12 +178,13 @@
 <p class="note">Round-trip latency is auto-compensated using the ASIO driver's reported I/O latency plus a small measured fudge — overdubs land sample-perfect.</p>
 
 <h2 id="s3"><span class="num">3</span>Markers (loop / punch)</h2>
+<p class="note">Pads 20/21/22/23 fire on <b>release</b> (like the play button) — so a combo that consumes the press (e.g. pad 36 held + pad 20 for view undo) suppresses the pair-pad's default action.</p>
 <table>
   <tr><th>Trigger</th><th>Action</th></tr>
-  <tr><td class="trigger"><code>Pad 20</code> tap</td><td><b>Loop-L</b> marker: create pair / re-enable / jump playhead to marker (four-state).</td></tr>
-  <tr><td class="trigger"><code>Pad 23</code> tap</td><td><b>Loop-R</b> marker (same four-state).</td></tr>
-  <tr><td class="trigger"><code>Pad 21</code> tap</td><td><b>Punch-L</b> marker (record pair).</td></tr>
-  <tr><td class="trigger"><code>Pad 22</code> tap</td><td><b>Punch-R</b> marker (record pair).</td></tr>
+  <tr><td class="trigger"><code>Pad 20</code> tap-release</td><td><b>Loop-L</b> marker: create pair / re-enable / jump playhead to marker (four-state).</td></tr>
+  <tr><td class="trigger"><code>Pad 23</code> tap-release</td><td><b>Loop-R</b> marker (same four-state).</td></tr>
+  <tr><td class="trigger"><code>Pad 21</code> tap-release</td><td><b>Punch-L</b> marker (record pair).</td></tr>
+  <tr><td class="trigger"><code>Pad 22</code> tap-release</td><td><b>Punch-R</b> marker (record pair).</td></tr>
   <tr><td class="trigger">Double-tap same marker pad (&lt; 400 ms)</td><td>After jumping to the marker, pan the arrangement view so the marker sits under wherever the play line WAS. Zoom unchanged.</td></tr>
   <tr><td class="trigger"><code>E3</code> — <code>E6</code></td><td>Nudge markers 0 – 3 (loop-L, punch-L, punch-R, loop-R) in single-frame precision.</td></tr>
   <tr><td class="trigger"><code>Pad 19</code> held <span class="plus">+</span> <code>Pad 20</code> or <code>23</code></td><td>Delete loop pair.</td></tr>
@@ -193,13 +195,11 @@
 <h2 id="s4"><span class="num">4</span>Bookmarks</h2>
 <table>
   <tr><th>Trigger</th><th>Action</th></tr>
-  <tr><td class="trigger"><code>Pad 13</code> tap</td><td>Add a bookmark at the current playhead + open text-input to name it.</td></tr>
-  <tr><td class="trigger"><code>Pad 13</code> held <span class="plus">+</span> <code>E1</code> turn</td><td>Enter bookmark-scroll mode. First tick jumps to the nearest bookmark; each subsequent tick steps to next/previous.</td></tr>
-  <tr><td class="trigger">In bookmark-scroll mode: <code>E3</code></td><td>Nudge the frame position of the currently-selected bookmark.</td></tr>
-  <tr><td class="trigger">Press <code>Pad 13</code> again</td><td>Exit bookmark-scroll mode.</td></tr>
-  <tr><td class="trigger"><code>Pad 18</code> release while in scroll mode</td><td>Also exits scroll mode.</td></tr>
+  <tr><td class="trigger"><code>Pad 13</code> tap</td><td>Add a bookmark at the current playhead + open text-input to name it. <b>Rejected if within 2 s of an existing bookmark</b> — the OLED briefly shows <code>MARKER SKIPPED (too close)</code>.</td></tr>
+  <tr><td class="trigger"><code>Pad 13</code> held <span class="plus">+</span> <code>Pad 0</code></td><td><b>Next bookmark</b> — jump the playhead to the first bookmark strictly after the current position.</td></tr>
+  <tr><td class="trigger"><code>Pad 13</code> held <span class="plus">+</span> <code>Pad 4</code></td><td><b>Previous bookmark</b> — jump to the last bookmark strictly before the current position.</td></tr>
 </table>
-<p class="note">Bookmark-scroll mode is sticky — it stays active after you release pad 13. Only encoders E1/E2/E3, pad 24, and the exit pads respond while it's on.</p>
+<p class="note">Every nav press MOVES — never "selects where you already are". No wrap; clamps at both ends with a brief <code>(at first) / (at last)</code> OLED banner. The triangle tip is pixel-aligned to the playhead, so navigating lands exactly on the marker.</p>
 
 <h2 id="s5"><span class="num">5</span>Track control</h2>
 <table>
@@ -237,11 +237,13 @@
 <table>
   <tr><th>Trigger</th><th>Action</th></tr>
   <tr><td class="trigger"><code>E1</code></td><td>Silent playhead scrub. If playing, playback pauses and auto-resumes 100 ms after the last encoder tick.</td></tr>
-  <tr><td class="trigger"><code>E2</code></td><td>Zoom timeline (logarithmic, 1 M× max).</td></tr>
-  <tr><td class="trigger"><code>Pad 24</code> held <span class="plus">+</span> <code>E2</code></td><td>Pan the timeline horizontally.</td></tr>
+  <tr><td class="trigger"><code>E2</code></td><td>Zoom timeline (logarithmic, 1 M× max). No-op while <b>zoom lock</b> is active.</td></tr>
+  <tr><td class="trigger"><code>Pad 24</code> held <span class="plus">+</span> <code>E2</code></td><td>Pan the timeline horizontally. Works even while zoom is locked.</td></tr>
   <tr><td class="trigger"><code>Pad 26</code> held <span class="plus">+</span> <code>E3</code></td><td>Scroll timeline view.</td></tr>
   <tr><td class="trigger"><code>Pad 24</code> held <span class="plus">+</span> <code>E6</code></td><td>Audio scrub — plays back at variable speed based on encoder rate. Fast-mode multiplier kicks in above threshold. Clamped to ±8×.</td></tr>
+  <tr><td class="trigger"><code>Pad 23</code> held <span class="plus">+</span> <code>E6</code></td><td><b>Toggle zoom lock.</b> Fires once per pad-23 hold. When locked: E2 zoom is disabled; pan still works. Amber padlock icon in the OLED top-right and in the bottom-right of the arrangement view. Same gesture unlocks.</td></tr>
 </table>
+<p class="note">After a pad 23 + E6 zoom-lock toggle, E6 marker-nudge (for loop-R) is suppressed for 500 ms so residual finger motion coming off the encoder can't accidentally nudge the marker.</p>
 
 <h2 id="s9"><span class="num">9</span>Undo</h2>
 <p class="note">Two independent histories. Content undo doesn't touch the view; view undo doesn't touch recordings.</p>
@@ -251,7 +253,7 @@
   <tr><td class="trigger"><code>Pad 36</code> held <span class="plus">+</span> <code>Pad 20 / 21 / 22 / 23</code></td><td><b>VIEW</b> undo: rewinds the last playhead / marker-position / zoom / view-pan gesture. Leaves tracks and mixer alone.</td></tr>
   <tr><td class="trigger"><code>Pad 26</code> tap (no combo)</td><td>Also fires content undo — alternative to pad 36.</td></tr>
 </table>
-<p class="note">Continuous gestures (scrub, zoom, pan, marker nudge) create ONE view-undo entry per gesture, coalesced against a 500 ms activity window. So a 5-second scrub is walked back in a single pop.</p>
+<p class="note">Continuous gestures (scrub, zoom, pan, marker nudge) create ONE view-undo entry per gesture — snapshotted at the START of the burst and coalesced against a 500 ms activity window. So a 5-second scrub is walked back in a single pop.</p>
 
 <h2 id="s10"><span class="num">10</span>Modifier pads</h2>
 <table>
@@ -262,7 +264,9 @@
   <tr><td class="trigger"><code>Pad 14</code></td><td>Held + <code>Pad 19</code> = return-to-start-on-stop ON.</td></tr>
   <tr><td class="trigger"><code>Pad 15</code></td><td>Held + <code>Pad 19</code> = stop-in-place. Also: short-tap = loop-edit mode; long-press = delete all pairs; double-tap = loop playback.</td></tr>
   <tr><td class="trigger"><code>Pad 12</code></td><td>Held + <code>Pad 0/4</code> = enter channel-entry (see §6). Alone: short-tap = add track, long-press = rename.</td></tr>
-  <tr><td class="trigger"><code>Pad 13</code></td><td>Held + <code>E1</code> = bookmark navigation (see §4).</td></tr>
+  <tr><td class="trigger"><code>Pad 13</code></td><td>Held + <code>Pad 0</code> = next bookmark; held + <code>Pad 4</code> = previous bookmark (see §4). Alone tap = add bookmark.</td></tr>
+  <tr><td class="trigger"><code>Pad 19</code></td><td>Play button doubling as delete-modifier: held + pad 14/15 = return-on-stop; held + pad 20/23 = delete loop pair; held + pad 21/22 = delete record pair. Long-press (≥ 2 s) = go to start.</td></tr>
+  <tr><td class="trigger"><code>Pad 23</code></td><td>Loop-R marker (see §3). Also modifier: held + <code>E6</code> = toggle zoom lock (see §8).</td></tr>
   <tr><td class="trigger"><code>Pad 36</code></td><td>Undo pad. Tap alone = content undo; held + pad 20/21/22/23 = view undo (see §9).</td></tr>
 </table>
 
@@ -270,8 +274,8 @@
 <table>
   <tr><th>Mode</th><th>Enter / Exit</th></tr>
   <tr><td class="trigger"><b>Clear-markers</b> (loop-edit)</td><td><b>Enter:</b> Pad 15 short tap. <b>Exit:</b> Pad 15 tap again, or any marker encoder move.<br>Pad 24 tap = arm delete (LED 8 solid); pad 20/23 = delete loop pair; pad 21/22 = delete record pair.</td></tr>
-  <tr><td class="trigger"><b>Bookmark-scroll</b></td><td><b>Enter:</b> Pad 13 held + E1 turn. <b>Exit:</b> Pad 13 tap, or Pad 18 release.</td></tr>
-  <tr><td class="trigger"><b>Channel entry</b> <span class="tag">exclusive</span></td><td><b>Enter:</b> Pad 12 held + pad 0/4. <b>Exit:</b> Pad 21 (commit) or any other non-numeric pad (cancel). See §6.</td></tr>
+  <tr><td class="trigger"><b>Zoom lock</b></td><td><b>Toggle:</b> Pad 23 held + E6 turn (once per hold). When locked, E2 zoom is a no-op; padlock icon shows in OLED top-right and arrangement bottom-right. Persists in-memory only — always OFF on fresh DAW launch.</td></tr>
+  <tr><td class="trigger"><b>Channel entry</b> <span class="tag">exclusive</span></td><td><b>Enter:</b> Pad 12 held + pad 0/4. <b>Exit:</b> Pad 21 (commit) or Pad 20 (advance to right channel — see §6). Firmware enters DAW-exclusive mode: all local pad behaviours (LOOPPLAY, DELETEPAIR, predictive LEDs) are suppressed for the duration.</td></tr>
   <tr><td class="trigger"><b>Text-input (rename)</b></td><td><b>Enter:</b> Pad 12 long-press or Pad 13 tap. <b>Exit:</b> Pad 21 (commit) or timeout on DAW disconnect. See §5.</td></tr>
   <tr><td class="trigger"><b>Diagnostic display</b></td><td>Default at boot. OLED shows raw pad and encoder events. All pad/encoder input is inert on the DAW side.</td></tr>
   <tr><td class="trigger"><b>Descriptive display</b></td><td>OLED shows DAW-pushed text.<br><b>Toggle:</b> Pad 3 held + Pad 23. Refused if DAW isn't sending heartbeats.</td></tr>
@@ -284,7 +288,8 @@
   <tr><td class="trigger"><span class="kbd">Space</span></td><td>Play / Stop toggle (ignored while a text field is focused).</td></tr>
   <tr><td class="trigger"><span class="kbd">A</span></td><td>Open a "Load WAV" file dialog for the selected track.</td></tr>
   <tr><td class="trigger"><span class="kbd">Ctrl</span> <span class="plus">+</span> <span class="kbd">A</span></td><td>Clear audio from the selected track (the track strip stays; only the audio is removed). Snapshotted for undo.</td></tr>
-  <tr><td class="trigger">Toolbar → <b>File</b></td><td>Open session · Recent Projects · Save · Save As · Revert · New session.</td></tr>
+  <tr><td class="trigger">Toolbar → <b>File</b></td><td>Open session · Recent Projects · Save · Save As · <b>Save as default</b> · Revert · New session.</td></tr>
+  <tr><td class="trigger">File → <b>Save as default</b></td><td>Saves the session (prompts Save As if it doesn't have a path yet) AND pins its path in <code>settings/user_settings.json</code> as the one auto-loaded on next DAW launch.</td></tr>
   <tr><td class="trigger">Toolbar → <b>?</b></td><td>Open this reference document.</td></tr>
   <tr><td class="trigger">Double-click a track name</td><td>Rename inline (GUI-side).</td></tr>
 </table>

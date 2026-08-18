@@ -1676,6 +1676,7 @@ void AudioEngine::handleTrackNameFromController(const std::string& name) {
         return;
     }
     int idx = m_pendingNameTrackIndex.exchange(-1);
+    m_pendingTrackIsFreshAdd.store(false);
     if (idx < 0) return;
     Track* t = getTrack(idx);
     if (!t) return;
@@ -1800,97 +1801,8 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
     }
 
     if (encoder == 1) {
-        // Pad-13 + E1: walk through markers in frame order (left-to-right
-        // on the timeline), clamped at both ends, no wrap. Show the
-        // current marker's name on the OLED and ask the GUI to reposition
-        // the view so the marker sits 15% from the left. Requires 200
-        // encoder ticks per step so a nudge doesn't skip several markers.
-        // Once entered (via encoder move during a pad-13 hold), scroll
-        // mode STAYS ACTIVE after pad 13 is released â€” the user exits
-        // by pressing pad 13 again.
-        if (m_pad13Held.load() || m_bookmarkScrollMode.load()) {
-            // (View-undo snapshot handled by the per-encoder burst check.)
-            m_pad13UsedAsModifier.store(true);
-            m_bookmarkScrollMode.store(true);
-            // Snapshot bookmarks with their ORIGINAL indices so E3 can
-            // later move the selected marker by original index (stable
-            // across frame reshuffles).
-            struct SortEntry { int origIdx; size_t frame; std::string name; };
-            std::vector<SortEntry> sorted;
-            {
-                std::lock_guard<std::mutex> lock(m_bookmarksMutex);
-                sorted.reserve(m_bookmarkFrames.size());
-                for (size_t i = 0; i < m_bookmarkFrames.size(); i++) {
-                    sorted.push_back({(int)i,
-                                       m_bookmarkFrames[i].frame,
-                                       m_bookmarkFrames[i].name});
-                }
-            }
-            if (sorted.empty()) {
-                oledShowForce("MARKER:", "(no markers)");
-                return;
-            }
-            std::sort(sorted.begin(), sorted.end(),
-                      [](const SortEntry& a, const SortEntry& b) {
-                          return a.frame < b.frame;
-                      });
-            // Find the sort-list position for the current selection (by
-            // original index). -1 = no selection yet.
-            int curSortPos = -1;
-            if (m_bookmarkNavIdx >= 0) {
-                for (int i = 0; i < (int)sorted.size(); i++) {
-                    if (sorted[i].origIdx == m_bookmarkNavIdx) { curSortPos = i; break; }
-                }
-            }
-            // First encoder tick of a nav session: jump to the marker
-            // closest to the playhead REGARDLESS of turn direction. Any
-            // delta on this entry-turn is consumed by the entry itself
-            // (doesn't count toward the next 400-tick step).
-            if (curSortPos < 0) {
-                size_t playPos = m_playbackPosition.load();
-                int closest = 0;
-                size_t bestDist = (size_t)-1;
-                for (int i = 0; i < (int)sorted.size(); i++) {
-                    size_t d = (sorted[i].frame > playPos)
-                             ? sorted[i].frame - playPos
-                             : playPos - sorted[i].frame;
-                    if (d < bestDist) { bestDist = d; closest = i; }
-                }
-                m_bookmarkNavIdx   = sorted[closest].origIdx;
-                m_bookmarkNavAccum = 0;
-                const auto& bm = sorted[closest];
-                const char* name = bm.name.empty() ? "(unnamed)" : bm.name.c_str();
-                oledShowForce("MARKER:", name);
-                m_playbackPosition.store(bm.frame);
-                m_requestedJumpFrame.store((int64_t)bm.frame);
-                dawLog("bookmark nav (entry) â†’ orig=%d frame=%zu name='%s'",
-                       m_bookmarkNavIdx, bm.frame, name);
-                return;
-            }
-            // Subsequent turns: accumulate to 400 ticks per step.
-            long prev = m_bookmarkNavAccum;
-            if ((prev > 0 && delta < 0) || (prev < 0 && delta > 0)) {
-                m_bookmarkNavAccum = 0;
-            }
-            m_bookmarkNavAccum += delta;
-            const long ticksPerStep = 400;
-            if (std::abs(m_bookmarkNavAccum) < ticksPerStep) return;
-            int step = (m_bookmarkNavAccum > 0) ? 1 : -1;
-            m_bookmarkNavAccum = 0;
-            int nextSort = curSortPos + step;
-            if (nextSort < 0) nextSort = 0;
-            if (nextSort >= (int)sorted.size()) nextSort = (int)sorted.size() - 1;
-            if (nextSort == curSortPos) return;
-            m_bookmarkNavIdx = sorted[nextSort].origIdx;
-            const auto& bm = sorted[nextSort];
-            const char* name = bm.name.empty() ? "(unnamed)" : bm.name.c_str();
-            oledShowForce("MARKER:", name);
-            m_playbackPosition.store(bm.frame);
-            m_requestedJumpFrame.store((int64_t)bm.frame);
-            dawLog("bookmark nav â†’ orig=%d frame=%zu name='%s'",
-                   m_bookmarkNavIdx, bm.frame, name);
-            return;
-        }
+        // (Pad-13 + E1 bookmark navigation was retired — replaced by
+        // pad-13 + pad 0/4 combos in the touch dispatcher.)
         // E1: Playhead scrub. (View-undo snapshot already handled by the
         // per-encoder burst check at the top of this handler.)
         // If we're playing, pause and arm the resume timer so playback
@@ -1948,6 +1860,12 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
                        delta, scrollAmount, visibleFrames, getPlaybackPosition(), (int)isPlaying());
             }
         } else {
+            // E2 zoom, unless the user has locked the zoom via pad 23 +
+            // E6. Pan (pad 24 + E2 above) still works while locked —
+            // the lock is deliberately zoom-only.
+            if (m_zoomLocked.load()) {
+                return;
+            }
             // E2 zoom is 20% faster per encoder tick â€” the base was
             // 1.0005^delta; scaling the exponent by 1.2 gives the same
             // per-tick zoom step 20% larger without changing anything
@@ -2008,6 +1926,30 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             m_viewScrollDelta.fetch_add(scrollAmount);
         }
     }
+    else if (encoder == 6 && m_pairPadPressSeen[3].load()) {
+        // Pad 23 held + E6: toggle zoom-lock. Fires ONCE per pad-23
+        // hold — the "hasToggled" guard resets on pad-23 release, so a
+        // subsequent hold-and-turn flips it back. Marks the pair pad's
+        // combo-fired flag so pad 23 release doesn't ALSO fire its
+        // marker-jump action.
+        m_pairPadComboFired[3].store(true);
+        if (!m_zoomLockToggledThisHold.exchange(true)) {
+            bool nowLocked = !m_zoomLocked.load();
+            m_zoomLocked.store(nowLocked);
+            oledShow(nowLocked ? "ZOOM: LOCKED" : "ZOOM: UNLOCKED", " ");
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs + 1500);
+            // Persistent OLED indicator (top-right padlock) — outlives
+            // the 1.5 s text banner above so the user always sees the
+            // current lock state at a glance.
+            if (m_serialController) {
+                m_serialController->sendMessage(nowLocked ? "ZOOMLOCK:1" : "ZOOMLOCK:0");
+            }
+            dawLog("Zoom lock %s", nowLocked ? "ON" : "OFF");
+        }
+        return;
+    }
     else if (encoder == 6 && m_panModifierHeld.load()) {
         // Pad 24 + E6: audio scrub. Rate is set DIRECTLY from the encoder
         // delta on every tick â€” no accumulator, no coast. When the user
@@ -2040,6 +1982,17 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         // them at the pair's default viewport fraction on first use).
         int markerIdx = encoder - 3;
         if (!isMarkerEnabled(markerIdx)) return;
+        // Post-lock-toggle debounce for E6 → marker 3 (loop-R). Pad 23
+        // shares the encoder with the zoom-lock combo, and residual E6
+        // motion in the moments right after pad 23 release would
+        // otherwise nudge loop-R by accident.
+        if (encoder == 6) {
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - m_pad23ReleaseMs.load() < PAD23_MARKER_LOCKOUT_MS) {
+                return;
+            }
+        }
 
         // Use the shared timeline extent (falls back to audio length when
         // GUI hasn't pushed a value) so markers can still be nudged in an
@@ -2137,6 +2090,22 @@ bool AudioEngine::touchHandleDeletePairSentinel(int pad) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         m_oledRevertAtMs.store(nowMs + 1500);
         dawLog("Loop playback %s", now ? "ON" : "OFF");
+        return true;
+    }
+    // Sentinel 205 = pad 19 long-press. Jump the playhead to frame 0
+    // AND ask the GUI to scroll the arrangement view so frame 0 sits
+    // near the left edge. Uses the requested-jump channel (same one
+    // bookmark nav uses) with anchor -1 so the GUI takes the default
+    // "put target at 15 % from the left" repositioning.
+    if (pad == 205) {
+        setPlaybackPosition(0);
+        m_playStartPosition.store(0);
+        m_requestedJumpFrame.store(0);
+        oledShow("GO TO START", " ");
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_oledRevertAtMs.store(nowMs + 1000);
+        dawLog("Pad 19 long-press: go to start");
         return true;
     }
     // Sentinel pads 200/201 arrive from SerialController when the
@@ -2246,6 +2215,29 @@ bool AudioEngine::touchHandlePad12(bool pressed) {
             m_modifierHeld.store(false);
             return true;
         }
+        // Cancel-on-repeat: pressing pad 12 while a track-name entry is
+        // still open aborts that entry. For a freshly-added track the
+        // track itself is also removed; for a long-press rename the
+        // existing track is left alone. Marks the press "consumed" so
+        // the release doesn't fire another add-track on top.
+        if (m_pendingNameTrackIndex.load() >= 0) {
+            int cancelIdx = m_pendingNameTrackIndex.exchange(-1);
+            bool wasFresh = m_pendingTrackIsFreshAdd.exchange(false);
+            if (wasFresh && cancelIdx >= 0 && cancelIdx < (int)m_tracks.size()) {
+                m_pendingDeleteTrackRequest.store(true);
+                setSelectedTrack(cancelIdx);   // deleteTrack acts on the selected
+                oledShow("ADD CANCELLED", " ");
+            } else {
+                oledShow("RENAME CANCELLED", " ");
+            }
+            int64_t nowMs2 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs2 + 1000);
+            if (m_serialController) m_serialController->sendMessage("CANCELMODES");
+            m_pad12LongPressFired.store(true);   // suppress add-track on release
+            m_pad12PressTimeMs.store(0);
+            return true;
+        }
         m_pad12PressTimeMs.store(nowMs);
         m_pad12LongPressFired.store(false);
     } else {
@@ -2324,6 +2316,69 @@ void AudioEngine::touchHandlePairInClearMode(int pad) {
                             : (recDef                     ? "REC: OFF"  : "REC: NONE");
         oledShowForce(loopTxt, recTxt);
     }
+}
+
+void AudioEngine::navigateBookmarks(int direction) {
+    // Playhead-relative navigation — every press MOVES, never "selects
+    // where you already are". The first press finds the strictly
+    // next/previous bookmark from the current playhead, regardless of
+    // whether the playhead happens to sit on a marker.
+    struct SortEntry { int origIdx; size_t frame; std::string name; };
+    std::vector<SortEntry> sorted;
+    {
+        std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+        sorted.reserve(m_bookmarkFrames.size());
+        for (size_t i = 0; i < m_bookmarkFrames.size(); i++) {
+            sorted.push_back({(int)i,
+                              m_bookmarkFrames[i].frame,
+                              m_bookmarkFrames[i].name});
+        }
+    }
+    if (sorted.empty()) {
+        oledShowForce("MARKER:", "(no markers)");
+        return;
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const SortEntry& a, const SortEntry& b) {
+                  return a.frame < b.frame;
+              });
+
+    size_t playPos = m_playbackPosition.load();
+    int target = -1;
+    if (direction > 0) {
+        // NEXT: first bookmark whose frame is strictly AFTER playhead.
+        for (int i = 0; i < (int)sorted.size(); i++) {
+            if (sorted[i].frame > playPos) { target = i; break; }
+        }
+        if (target < 0) {
+            oledShowForce("MARKER:", "(at last)");
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs + 800);
+            return;
+        }
+    } else {
+        // PREVIOUS: last bookmark whose frame is strictly BEFORE playhead.
+        for (int i = (int)sorted.size() - 1; i >= 0; i--) {
+            if (sorted[i].frame < playPos) { target = i; break; }
+        }
+        if (target < 0) {
+            oledShowForce("MARKER:", "(at first)");
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs + 800);
+            return;
+        }
+    }
+
+    m_bookmarkNavIdx = sorted[target].origIdx;
+    const auto& bm = sorted[target];
+    const char* name = bm.name.empty() ? "(unnamed)" : bm.name.c_str();
+    oledShowForce("MARKER:", name);
+    m_playbackPosition.store(bm.frame);
+    m_requestedJumpFrame.store((int64_t)bm.frame);
+    dawLog("bookmark nav → frame=%zu name='%s' dir=%d",
+           bm.frame, name, direction);
 }
 
 void AudioEngine::touchHandlePairPad(int markerIdx) {
@@ -2608,6 +2663,16 @@ void AudioEngine::cancelChannelEntry() {
         m_channelEntryRightBuf.clear();
         m_channelEntryOnRight = false;
     }
+    // Physical pad 12 was probably released mid-entry (the user's
+    // finger had to move to the number pads), but the release event
+    // was SWALLOWED by the entry-mode dispatcher. Left uncleared,
+    // m_pad12Held stays true and the next tap of pad 0/4 misfires
+    // straight back into entry mode. Reset the modifier flags so the
+    // combo has to be started fresh — same for the long-press timer,
+    // which would otherwise keep timing out toward "rename".
+    m_pad12Held.store(false);
+    m_pad12PressTimeMs.store(0);
+    m_pad12LongPressFired.store(false);
     if (m_serialController) {
         m_serialController->sendMessage("PAIRFLASH:0");
         m_serialController->sendMessage("EXCLUSIVE:0");
@@ -2837,12 +2902,52 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         return;
     }
     // Pad 36 held + pad 20/21/22/23 press → VIEW undo. Marks combo
-    // fired so pad 36's own release doesn't ALSO fire a content undo.
+    // fired on BOTH sides so neither pad's release triggers its default
+    // action: pad 36 skips content undo; pair pad skips touchHandlePairPad.
     if (pressed && m_pad36Held.load() &&
         (pad == 20 || pad == 21 || pad == 22 || pad == 23)) {
         m_pad36ComboFired.store(true);
+        m_pairPadComboFired[pad - 20].store(true);
+        m_pairPadPressSeen[pad - 20].store(true);
         undoPopView();
         m_pendingUndoOled.store(true);
+        return;
+    }
+
+    // Pair pads (20/21/22/23) — fire on RELEASE (matches pad 19's
+    // deferred-play feel). Press just arms the state; release fires
+    // touchHandlePairPad UNLESS a combo consumed the press.
+    // Skipped in clear-mode (that path still fires on press since
+    // pair toggles there are visually paired with pad-24 arm-flash).
+    // Skipped in channel-entry mode (the entry-mode block above already
+    // handles pads 20/21 for switch-side / commit).
+    if ((pad == 20 || pad == 21 || pad == 22 || pad == 23) &&
+        !m_clearMode.load()) {
+        int idx = pad - 20;
+        if (pressed) {
+            m_pairPadPressSeen[idx].store(true);
+            m_pairPadComboFired[idx].store(false);
+            // Pad 23 doubles as the zoom-lock modifier. Reset the
+            // per-hold guard on each fresh press so a subsequent
+            // hold-and-turn can toggle it again.
+            if (pad == 23) m_zoomLockToggledThisHold.store(false);
+        } else {
+            bool sawPress   = m_pairPadPressSeen[idx].exchange(false);
+            bool comboFired = m_pairPadComboFired[idx].exchange(false);
+            if (sawPress && !comboFired) {
+                touchHandlePairPad(idx);
+            }
+            // Pad 23 doubles as the zoom-lock modifier. Stamp its
+            // release time so E6 marker-nudge (which also targets
+            // marker 3 = loop-R) can gate out the moments right after
+            // release to avoid the same finger accidentally nudging
+            // the marker as it comes off the encoder.
+            if (pad == 23) {
+                m_pad23ReleaseMs.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+            }
+        }
         return;
     }
 
@@ -2891,6 +2996,27 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     //   * tap-release alone         â†’ append a new marker at playhead +
     //                                   open the text-input naming flow
     if (pad == 13 && pressed) {
+        // Cancel-on-repeat: pressing pad 13 while a bookmark-name entry
+        // is open aborts the entry AND removes the just-added bookmark.
+        // Suppresses the release-add via m_pad13UsedAsModifier so the
+        // cancel press doesn't drop yet another bookmark.
+        if (m_pendingNameBookmarkIndex.load() >= 0) {
+            int cancelIdx = m_pendingNameBookmarkIndex.exchange(-1);
+            {
+                std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+                if (cancelIdx >= 0 && cancelIdx < (int)m_bookmarkFrames.size()) {
+                    m_bookmarkFrames.erase(m_bookmarkFrames.begin() + cancelIdx);
+                }
+            }
+            m_pad13UsedAsModifier.store(true);   // no add on release
+            oledShow("MARKER CANCELLED", " ");
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_oledRevertAtMs.store(nowMs + 1000);
+            if (m_serialController) m_serialController->sendMessage("CANCELMODES");
+            markSessionDirty();
+            return;
+        }
         if (m_bookmarkScrollMode.load()) {
             // Sticky scroll-mode: this press ONLY exits the mode. No hold,
             // no marker on release. Modifier flag ensures the release
@@ -2919,9 +3045,26 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         }
         if (wasModifier) return;   // nav-only or exit-press release, no marker
         size_t frame = (size_t)m_playbackPosition.load();
+        // Spacing rule: refuse to add a marker within 2 seconds of any
+        // existing one. Rescues the user from an accidental double-tap
+        // and from placing markers too close to be useful for nav.
+        size_t minSpacingFrames = (size_t)(m_sampleRate * 2.0);
         int bmIdx = -1;
         {
             std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+            for (const auto& bm : m_bookmarkFrames) {
+                size_t d = (bm.frame > frame) ? bm.frame - frame
+                                              : frame - bm.frame;
+                if (d < minSpacingFrames) {
+                    oledShowForce("MARKER SKIPPED", "(too close)");
+                    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    m_oledRevertAtMs.store(nowMs + 1500);
+                    dawLog("bookmark add rejected: within 2 s of an existing marker "
+                           "(playhead=%zu closest=%zu)", frame, bm.frame);
+                    return;
+                }
+            }
             m_bookmarkFrames.push_back({frame, std::string()});
             bmIdx = (int)m_bookmarkFrames.size() - 1;
         }
@@ -2957,16 +3100,23 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
     // (14+19 / 15+19 return-on-stop combos are retired â€” firmware now
     // handles 19+14 / 19+15 end-to-end and sends RETURNONSTOP:1/0.)
 
-    // Marker pads in clear-mode: toggle pair. In normal mode: pair-aware
-    // create / restore / jump (touchHandlePairPad).
+    // Marker pads in clear-mode: toggle pair on PRESS (visual pairing
+    // with pad-24 arm-flash matters here — no release-defer). Normal-
+    // mode pair-pad handling has moved above the `if (!pressed) return`
+    // gate so it can fire on RELEASE.
     if (m_clearMode.load()) {
         touchHandlePairInClearMode(pad);
         return;
     }
-    if (pad == 20) { touchHandlePairPad(0); return; }
-    if (pad == 21) { touchHandlePairPad(1); return; }
-    if (pad == 22) { touchHandlePairPad(2); return; }
-    if (pad == 23) { touchHandlePairPad(3); return; }
+
+    // Pad 13 held + pad 0/4: step through bookmarks in frame order.
+    // Pad 0 = NEXT, pad 4 = PREVIOUS (per user spec). Marks pad 13 as
+    // a modifier so its release doesn't drop a fresh bookmark.
+    if ((pad == 0 || pad == 4) && m_pad13Held.load()) {
+        m_pad13UsedAsModifier.store(true);
+        navigateBookmarks(pad == 0 ? +1 : -1);
+        return;
+    }
 
     // Track selection: pad 0 = previous, pad 4 = next, clamped.
     if (pad == 0 || pad == 4) {
@@ -3230,8 +3380,11 @@ void AudioEngine::updateController() {
         oledShowForce(line1, " ");
         // Enter text-input mode on line 2 with an empty starting buffer.
         m_serialController->sendMessage("TEXTIN:");
-        // Remember which track the incoming NAME:... belongs to.
+        // Remember which track the incoming NAME:... belongs to. This
+        // is a FRESH add, so a repeat pad-12 press should cancel by
+        // also deleting the just-added track.
         m_pendingNameTrackIndex.store(newIndex);
+        m_pendingTrackIsFreshAdd.store(true);
     }
 
     // --- Pad 12 long-press: detect & fire rename entry ---
@@ -3269,6 +3422,9 @@ void AudioEngine::updateController() {
             // existing name will come later.
             m_serialController->sendMessage("TEXTIN:");
             m_pendingNameTrackIndex.store(idx);
+            // Long-press rename of an EXISTING track — cancel should
+            // not delete the track, just close the naming dialog.
+            m_pendingTrackIsFreshAdd.store(false);
         }
         // If no track was selected, silently ignore the rename request.
     }

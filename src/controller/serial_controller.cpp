@@ -642,6 +642,13 @@ void SerialController::processLine(const std::string& line) {
         if (m_touchCallback) m_touchCallback(204, true);
         return;
     }
+    // GOTOSTART â€” pad 19 long-press (>= 2 s). Sentinel 205 = move
+    // playhead to frame 0 and scroll the arrangement view so the start
+    // is visible on the left.
+    if (line == "GOTOSTART") {
+        if (m_touchCallback) m_touchCallback(205, true);
+        return;
+    }
     // RESYNC â€” firmware wants us to re-push authoritative state
     // (mode, OLED, all LEDs, PAIRDEFs). Sent after the pad-18 hard reset.
     if (line == "RESYNC") {

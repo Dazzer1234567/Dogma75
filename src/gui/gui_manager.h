@@ -109,6 +109,10 @@ private:
     // Recent Projects submenu. Persisted to user_settings.json.
     std::vector<std::string>     m_recentSessions;
     static constexpr size_t      MAX_RECENT_SESSIONS = 10;
+    // Path of the session to auto-load on startup. Set by File > "Save
+    // as default"; empty = fall back to the built-in demo session.
+    // Persisted to user_settings.json as "defaultSessionPath".
+    std::string                  m_defaultSessionPath;
     // Push a path to the front of the MRU list (de-duplicating) and
     // persist. Called whenever a session is successfully loaded or saved.
     void addRecentSession(const std::string& path);
@@ -117,6 +121,18 @@ private:
     // apply and read this so they stay in lock-step when the user has
     // more tracks than fit on screen.
     float m_trackScrollY = 0.0f;
+
+    // Cached arrangement-child frame-to-X mapping from the last render.
+    // Used by the bookmark triangle drawing (drawn BEFORE the arrangement
+    // child this frame) so the triangle tip lines up pixel-exactly with
+    // the playhead when nav lands on it — computing the mapping fresh
+    // for the ruler misses the child's scrollbar / padding differences.
+    // First-frame fallback: 0/0/0/1 → bookmarks skip until a real value
+    // has been captured on the previous render.
+    float  m_arrMapCursorX       = 0.0f;
+    float  m_arrMapWaveW         = 0.0f;
+    size_t m_arrMapViewStart     = 0;
+    size_t m_arrMapVisibleFrames = 1;
 
     // Smoothed per-track meter values, parallel-ish to AudioEngine's
     // track list. Each frame we pull the audio thread's atomic peak,
@@ -280,6 +296,10 @@ private:
     void saveSession();
     void saveSessionAs();
     void saveSessionToPath(const std::string& filename);
+    // Save the session and also pin its path in user_settings.json as
+    // the one auto-loaded on next DAW launch. Reuses the current path
+    // when one exists; otherwise prompts via Save As.
+    void saveAsDefault();
     // Load a session file written by saveSession(). Replaces the current
     // set of tracks and re-loads each track's audio from its stored path.
     void openSession();                                        // shows file dialog
