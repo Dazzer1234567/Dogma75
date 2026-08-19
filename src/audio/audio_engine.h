@@ -156,6 +156,11 @@ public:
     // exists so the track UI can offer an input-pair dropdown that gets
     // persisted per-track for future record wiring.
     int getNumInputStereoPairs() const { return m_maxInputChannels / 2; }
+    // Per-input user-editable names (routing page). Empty string until
+    // the user sets one; the routing UI falls back to "Input N" for
+    // any name that's blank.
+    const std::string& getInputName(int chan) const;
+    void setInputName(int chan, const std::string& name);
 
     // Track management
     int addTrack(const std::string& name = "");
@@ -536,6 +541,7 @@ private:
     unsigned int m_bufferSize;
     int m_maxOutputChannels;
     int m_maxInputChannels = 0;
+    mutable std::vector<std::string> m_inputNames;
 
     // Device info
     std::string m_deviceName;
@@ -606,6 +612,11 @@ private:
     // Index of the bookmark whose name the controller is currently
     // typing. -1 when we're not naming a bookmark.
     std::atomic<int>       m_pendingNameBookmarkIndex{-1};
+    // True when the pending name is for a JUST-CREATED bookmark (pad
+    // 13 tap), false for a long-press rename of an existing one. Determines
+    // whether a repeat pad-13 press cancels by ALSO deleting the fresh
+    // bookmark, or just closes the naming dialog.
+    std::atomic<bool>      m_pendingBookmarkIsFreshAdd{false};
     // Pad-13 as modifier: while held, encoder 1 walks through markers
     // instead of scrubbing. Modifier flag suppresses the "release adds
     // a new bookmark" behaviour when the hold was actually used to
@@ -614,6 +625,16 @@ private:
     // and pad 13's next press exits nav mode (without adding a marker).
     std::atomic<bool>      m_pad13Held{false};
     std::atomic<bool>      m_pad13UsedAsModifier{false};
+    // Long-press on pad 13 (2 s hold) opens a rename flow for the
+    // bookmark at the exact playhead frame — mirrors pad 12's
+    // add-vs-rename split. Timer starts on press, cleared on any nav
+    // use of the hold (pad 0/4 combo) so a modifier hold doesn't
+    // fire rename underneath it.
+    std::atomic<int64_t>   m_pad13PressTimeMs{0};
+    std::atomic<bool>      m_pad13LongPressFired{false};
+    // Queued from the reader thread's long-press detection; consumed by
+    // updateController on the main thread to open the bookmark rename.
+    std::atomic<bool>      m_pendingBookmarkRenameRequest{false};
     std::atomic<bool>      m_bookmarkScrollMode{false};
     // Selection while navigating: index into m_bookmarkFrames (original
     // insertion order). Reset to -1 outside navigation sessions. Encoder
@@ -782,6 +803,11 @@ private:
     // would accidentally nudge the loop-right marker.
     std::atomic<int64_t> m_pad23ReleaseMs{0};
     static constexpr int64_t PAD23_MARKER_LOCKOUT_MS = 500;
+    // Same idea for pad 22 (held while turning E5 moves a bookmark).
+    // Prevents E5 from nudging marker 2 (punch-R) for a brief window
+    // after pad 22 release.
+    std::atomic<int64_t> m_pad22ReleaseMs{0};
+    static constexpr int64_t PAD22_MARKER_LOCKOUT_MS = 500;
     // Loop playback (wrap-around) on/off, toggled by double-tapping pad 15.
     // Defaults true so existing sessions behave exactly as before.
     std::atomic<bool> m_loopPlaybackEnabled{true};
@@ -944,7 +970,11 @@ private:
     std::atomic<int64_t> m_pad12PressTimeMs{0};
     std::atomic<bool>    m_pad12LongPressFired{false};
     std::atomic<bool>    m_pad12Held{false};
-    static constexpr int64_t RENAME_HOLD_MS = 1000;
+    // Hold duration to enter rename mode. Used for BOTH:
+    //   • pad 12 (long-press → rename selected track)
+    //   • pad 13 (long-press with playhead on a bookmark → rename it)
+    // Kept unified so the two feel identical.
+    static constexpr int64_t RENAME_HOLD_MS = 1300;
 
     // ---- Channel-entry mode ----
     // Hold pad 12 + tap pad 0 → enter INPUT channel entry (pad 4 → OUTPUT).

@@ -25,6 +25,7 @@
 
 #ifdef IMGUI_FOUND
 #include <imgui.h>
+#include <imgui_internal.h>     // GetActiveID for immediate mouse-down colouring
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_opengl3.h>
 #endif
@@ -1244,9 +1245,16 @@ void GUIManager::processFrame() {
     float transportBarHeight = m_bloomEnabled ? 80.0f : 50.0f;
     float contentHeight = ImGui::GetContentRegionAvail().y - transportBarHeight - 10;
 
-    renderTrackPanel(trackPanelWidth, contentHeight);
-    ImGui::SameLine();
-    renderWaveform(contentHeight);
+    if (m_routingPageActive) {
+        // Full-width routing page in place of the arrangement + track
+        // panel. Transport bar still shows at the bottom so playback
+        // control isn't lost while patching.
+        renderRoutingPage();
+    } else {
+        renderTrackPanel(trackPanelWidth, contentHeight);
+        ImGui::SameLine();
+        renderWaveform(contentHeight);
+    }
 
     renderTransportBar();
     renderVelocityCurveEditor();
@@ -1763,11 +1771,31 @@ void GUIManager::renderToolbar() {
         }
     }
 
-    // Help / Fullscreen / Close buttons (right-aligned).
-    // Three 30 px buttons + 2 gaps + a little slack = ~120 px block.
+    // Routing / Help / Fullscreen / Close buttons (right-aligned).
+    // Four 30 px buttons + 3 gaps + a little slack = ~150 px block.
     ImGui::SameLine();
-    float rightButtonsX = io.DisplaySize.x - 120;
+    float rightButtonsX = io.DisplaySize.x - 155;
     ImGui::SetCursorPosX(rightButtonsX);
+
+    // "⇄" — toggles the routing (patchbay) page. Highlighted while
+    // active so it reads as a toggle, not a one-shot action.
+    {
+        bool routing = m_routingPageActive;
+        if (routing) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                  ImVec4(0.25f, 0.60f, 0.95f, 1.0f));
+        }
+        if (ImGui::Button("R", ImVec2(30, 0))) {
+            m_routingPageActive = !m_routingPageActive;
+        }
+        if (routing) ImGui::PopStyleColor(2);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Toggle input-to-track routing view");
+    }
+    ImGui::SameLine();
 
     // "?" — opens the shortcuts / reference document in the user's
     // default browser. The file lives at docs/shortcuts.html; appPath
@@ -3460,12 +3488,13 @@ void GUIManager::renderWaveform(float height) {
         }
 
         // Playhead â€” same fixed vertical span as the markers. If it
-        // lands on top of an enabled loop/punch marker (within a couple
-        // of pixels â€” screen-space, not frame-space, since one pixel
-        // covers many frames when zoomed out), switch to dashed so the
-        // marker's yellow/red bar shows through the gaps and you can
-        // tell they're stacked instead of losing the marker under the
-        // solid green line.
+        // lands on top of an enabled loop/punch marker OR a bookmark
+        // (within a couple of pixels â€” screen-space, not frame-space,
+        // since one pixel covers many frames when zoomed out), switch
+        // to dashed so the underlying marker colour (yellow/red for
+        // loop/punch, white for bookmark) shows through the gaps and
+        // you can tell they're stacked instead of the marker being
+        // lost under the solid green line.
         if (playbackPos >= arrLastViewStart && playbackPos < arrLastViewEnd) {
             float playbackX = frameToX(playbackPos);
             bool overMarker = false;
@@ -3476,6 +3505,20 @@ void GUIManager::renderWaveform(float height) {
                 if (std::fabs(frameToX(mp) - playbackX) < 3.0f) {
                     overMarker = true;
                     break;
+                }
+            }
+            // Bookmarks: same visibility test — the triangle sits
+            // above the arrangement rather than crossing the playhead,
+            // but the intent is the same: dashed play line reveals the
+            // white bookmark bar/tip so you know they're stacked.
+            if (!overMarker) {
+                auto bms = m_audioEngine->getBookmarks();
+                for (const auto& bm : bms) {
+                    if (bm.frame < arrLastViewStart || bm.frame >= arrLastViewEnd) continue;
+                    if (std::fabs(frameToX(bm.frame) - playbackX) < 3.0f) {
+                        overMarker = true;
+                        break;
+                    }
                 }
             }
             if (overMarker) {
@@ -3668,6 +3711,624 @@ void GUIManager::renderWaveform(float height) {
         ImGui::TextColored(hintColor, "Add a track and load audio to see waveforms here");
     }
 
+    ImGui::EndChild();
+#endif
+}
+
+// ==================== ROUTING PAGE (patchbay) ====================
+//
+// Three vertical panels: inputs on the left, node canvas in the
+// middle, tracks on the right. Drag an item from either side into
+// the middle to spawn a node. Click-drag from an OUT port on an
+// input node to an IN port on a track node to lay a cable. Middle
+// panel scrolls if the node cloud grows past its bounds.
+//
+// UI-only mockup for now — nothing here affects the recording
+// pipeline yet. The RoutingNode / RoutingCable lists persist across
+// frames but not sessions.
+void GUIManager::renderRoutingPage() {
+#ifdef IMGUI_FOUND
+    if (!m_audioEngine) return;
+    float transportBarHeight = m_bloomEnabled ? 80.0f : 50.0f;
+    float contentH = ImGui::GetContentRegionAvail().y - transportBarHeight - 10;
+    if (contentH < 100.0f) contentH = 100.0f;
+
+    float totalW = ImGui::GetContentRegionAvail().x;
+    const float SPLIT_W = 6.0f;
+    const float MIN_SIDE = 80.0f;
+    const float MIN_MID  = 120.0f;
+    // Keep sides within legal range for current total width.
+    if (m_routingLeftW  < MIN_SIDE) m_routingLeftW  = MIN_SIDE;
+    if (m_routingRightW < MIN_SIDE) m_routingRightW = MIN_SIDE;
+    float maxSideSum = totalW - MIN_MID - 2 * SPLIT_W;
+    if (m_routingLeftW + m_routingRightW > maxSideSum) {
+        float excess = (m_routingLeftW + m_routingRightW) - maxSideSum;
+        m_routingLeftW  -= excess * 0.5f;
+        m_routingRightW -= excess * 0.5f;
+        if (m_routingLeftW  < MIN_SIDE) m_routingLeftW  = MIN_SIDE;
+        if (m_routingRightW < MIN_SIDE) m_routingRightW = MIN_SIDE;
+    }
+    float middleW = totalW - m_routingLeftW - m_routingRightW - 2 * SPLIT_W;
+    if (middleW < MIN_MID) middleW = MIN_MID;
+
+    auto drawVSplitter = [&](const char* id, float* width, bool rightSide) {
+        ImGui::InvisibleButton(id, ImVec2(SPLIT_W, contentH));
+        bool hovered = ImGui::IsItemHovered();
+        bool active  = ImGui::IsItemActive();
+        if (hovered || active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (active) {
+            float dx = ImGui::GetIO().MouseDelta.x;
+            *width += rightSide ? -dx : dx;
+        }
+        ImU32 col = active   ? IM_COL32(120, 160, 220, 255)
+                  : hovered  ? IM_COL32( 90, 110, 150, 255)
+                             : IM_COL32( 55,  60,  70, 255);
+        ImDrawList* d = ImGui::GetWindowDrawList();
+        d->AddRectFilled(ImGui::GetItemRectMin(),
+                         ImGui::GetItemRectMax(), col);
+    };
+
+    // ---- LEFT: inputs ------------------------------------------------
+    ImGui::BeginChild("routingInputs", ImVec2(m_routingLeftW, contentH), true);
+    ImGui::TextUnformatted("INPUTS");
+    ImGui::Separator();
+    int numInputs = m_audioEngine->getNumInputStereoPairs() * 2;
+    // Peek any active ROUTING_NODE payload so we can highlight the row
+    // that's currently being dragged (orange for the whole drag; reverts
+    // on release).
+    const ImGuiPayload* peekL = ImGui::GetDragDropPayload();
+    const int* peekPL = (peekL && peekL->IsDataType("ROUTING_NODE") &&
+                        peekL->DataSize == (int)sizeof(int) * 2)
+                        ? (const int*)peekL->Data : nullptr;
+    const ImU32 dragOrange = IM_COL32(240, 140, 40, 255);
+    ImGuiID activeId = ImGui::GetActiveID();
+    const float labelW = 68.0f;    // "Input NN" grabber column
+    const float rowH   = ImGui::GetFrameHeight();
+    for (int ch = 0; ch < numInputs; ch++) {
+        ImGui::PushID(ch);
+        char lbl[32];
+        snprintf(lbl, sizeof(lbl), "Input %d", ch + 1);
+        bool isDragging = (peekPL && peekPL[0] == 0 && peekPL[1] == ch);
+        bool isMouseDown = (activeId != 0 && activeId == ImGui::GetID(lbl));
+        bool showOrange  = isMouseDown || isDragging;
+        if (showOrange) ImGui::PushStyleColor(ImGuiCol_Text, dragOrange);
+        // Match Selectable's height to the InputText frame height and
+        // vertically-centre its text so the "Input N" label lines up
+        // pixel-for-pixel with the name field's caret line.
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+        ImGui::Selectable(lbl, false, 0, ImVec2(labelW, rowH));
+        ImGui::PopStyleVar();
+        if (showOrange) ImGui::PopStyleColor();
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID |
+                                       ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
+            int payload[2] = { 0, ch };   // 0 = Input kind
+            ImGui::SetDragDropPayload("ROUTING_NODE", payload, sizeof(payload));
+            ImGui::EndDragDropSource();
+        }
+        ImGui::SameLine(0, 4);
+        // Name field — force a fully-opaque blue frame fill so an
+        // empty box is still clearly visible (theme's default FrameBg
+        // is translucent, which reads as "no fill" over the routing
+        // child's dark bg). Matches the track-properties frame tone.
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.06f, 0.12f, 0.22f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.18f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0.14f, 0.22f, 0.36f, 1.0f));
+        char nameBuf[64];
+        const std::string& curName = m_audioEngine->getInputName(ch);
+        snprintf(nameBuf, sizeof(nameBuf), "%s", curName.c_str());
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputText("##inName", nameBuf, sizeof(nameBuf))) {
+            m_audioEngine->setInputName(ch, std::string(nameBuf));
+        }
+        ImGui::PopStyleColor(3);
+        // 1-pixel separator between rows.
+        {
+            ImDrawList* sd = ImGui::GetWindowDrawList();
+            ImVec2 mn = ImGui::GetCursorScreenPos();
+            float aw  = ImGui::GetContentRegionAvail().x;
+            sd->AddLine(mn, ImVec2(mn.x + aw, mn.y),
+                        IM_COL32(70, 72, 78, 255), 1.0f);
+            ImGui::Dummy(ImVec2(1, 2));
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::SameLine(0, 0);
+    drawVSplitter("routingSplitL", &m_routingLeftW, false);
+    ImGui::SameLine(0, 0);
+
+    // ---- MIDDLE: node canvas ----------------------------------------
+    ImGui::BeginChild("routingCanvas", ImVec2(middleW, contentH), true);
+    {
+        ImVec2 canvasPos = ImGui::GetCursorScreenPos();
+        ImVec2 canvasSz  = ImGui::GetContentRegionAvail();
+        if (canvasSz.x < 50) canvasSz.x = 50;
+        if (canvasSz.y < 50) canvasSz.y = 50;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        // Faint background so the canvas reads as a separate zone.
+        dl->AddRectFilled(canvasPos,
+                          ImVec2(canvasPos.x + canvasSz.x,
+                                 canvasPos.y + canvasSz.y),
+                          IM_COL32(20, 22, 28, 255));
+
+        // InvisibleButton so the canvas can accept drops and hover.
+        ImGui::InvisibleButton("routingCanvasArea", canvasSz);
+        bool canvasHovered = ImGui::IsItemHovered();
+
+        // Drop target: create a node at the drop position.
+        if (ImGui::BeginDragDropTarget()) {
+            const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ROUTING_NODE");
+            if (p && p->DataSize == (int)sizeof(int) * 2) {
+                const int* pl = (const int*)p->Data;
+                RoutingNode n;
+                n.kind = (pl[0] == 0) ? RoutingNode::Kind::Input
+                                      : RoutingNode::Kind::Track;
+                n.channelOrTrack = pl[1];
+                ImVec2 mp = ImGui::GetMousePos();
+                n.posX = mp.x - canvasPos.x;
+                n.posY = mp.y - canvasPos.y;
+                m_routingNodes.push_back(n);
+            }
+            ImGui::EndDragDropTarget();
+        }
+
+        // How many input ports does this track node have? Mirrors the
+        // track's OUTPUT config: mono output → 1 port, stereo → 2.
+        // Recording pipeline (once wired) will use the same count as
+        // the number of L/R sides on the destination.
+        auto trackNodePortCount = [&](int nodeIdx) -> int {
+            if (nodeIdx < 0 || nodeIdx >= (int)m_routingNodes.size()) return 2;
+            const RoutingNode& n = m_routingNodes[nodeIdx];
+            if (n.kind != RoutingNode::Kind::Track) return 1;
+            const Track* t = m_audioEngine->getTrack(n.channelOrTrack);
+            if (!t) return 2;
+            return t->outputMono ? 1 : 2;
+        };
+        // Label for a track node's input port at `side`. Uses the
+        // track's OUTPUT channel numbers so "the track that lives at
+        // channels 2 and 8" reads as 2/8 on BOTH its input and output.
+        auto trackNodePortLabel = [&](int nodeIdx, int side, char* buf, size_t bufSz) {
+            const RoutingNode& n = m_routingNodes[nodeIdx];
+            const Track* t = m_audioEngine->getTrack(n.channelOrTrack);
+            if (!t) { snprintf(buf, bufSz, "-"); return; }
+            if (t->outputMono) {
+                snprintf(buf, bufSz, "%d", t->outputMonoChan + 1);
+            } else {
+                int ch = (side == 0) ? t->outputLeftChan : t->outputRightChan;
+                snprintf(buf, bufSz, "%d", ch + 1);
+            }
+        };
+
+        // ---- Layout helpers (dynamic-height track nodes) ----
+        // A track node grows vertically to fit its cable stack. Each
+        // side (L/R on stereo, single on mono) is a "region" — a
+        // vertical column of blobs, one per connected cable, plus one
+        // hollow placeholder when empty so there's always something to
+        // drop onto.
+        const float NODE_W          = 110.0f;
+        const float INPUT_NODE_H    = 44.0f;
+        const float HEADER_H        = 20.0f;
+        const float DIVIDER_H       = 1.0f;
+        const float REGION_PAD_TOP  = 14.0f;
+        const float REGION_PAD_BOT  = 8.0f;
+        const float BLOB_STEP       = 14.0f;
+        const float REGION_MIN_H    = 32.0f;
+        struct RegionRect { float startY, endY; int cableCount; };
+        struct TrackLayout { float totalH; int numRegions; RegionRect regs[2]; };
+        auto computeTrackLayout = [&](int nodeIdx) -> TrackLayout {
+            TrackLayout L{};
+            L.numRegions = trackNodePortCount(nodeIdx);
+            int perSide[2] = {0, 0};
+            for (const auto& c : m_routingCables) {
+                if (c.dstNode == nodeIdx && c.dstSide >= 0 && c.dstSide < 2)
+                    perSide[c.dstSide]++;
+            }
+            // Symmetric geometry: both regions get the SAME height, sized
+            // for whichever side has more cables (min one blob). Keeps
+            // the divider dead-centre and mirrors L/R visually.
+            int maxDisplay = 1;
+            for (int s = 0; s < L.numRegions; s++)
+                if (perSide[s] > maxDisplay) maxDisplay = perSide[s];
+            float regH = REGION_PAD_TOP + maxDisplay * BLOB_STEP + REGION_PAD_BOT;
+            if (regH < REGION_MIN_H) regH = REGION_MIN_H;
+            float y = HEADER_H;
+            for (int s = 0; s < L.numRegions; s++) {
+                L.regs[s].startY = y;
+                L.regs[s].endY = y + regH;
+                L.regs[s].cableCount = perSide[s];
+                y = L.regs[s].endY;
+                if (s + 1 < L.numRegions) y += DIVIDER_H;
+            }
+            L.totalH = y;
+            return L;
+        };
+        auto nodeRect = [&](int nodeIdx) -> std::pair<ImVec2, ImVec2> {
+            const RoutingNode& n = m_routingNodes[nodeIdx];
+            float cx = canvasPos.x + n.posX;
+            float cy = canvasPos.y + n.posY;
+            float h  = (n.kind == RoutingNode::Kind::Input)
+                     ? INPUT_NODE_H : computeTrackLayout(nodeIdx).totalH;
+            return { ImVec2(cx - NODE_W * 0.5f, cy - h * 0.5f),
+                     ImVec2(cx + NODE_W * 0.5f, cy + h * 0.5f) };
+        };
+        auto inputOutPortPos = [&](int nodeIdx) -> ImVec2 {
+            auto r = nodeRect(nodeIdx);
+            return ImVec2(r.second.x, (r.first.y + r.second.y) * 0.5f);
+        };
+        auto trackBlobPos = [&](int nodeIdx, int side, int slot) -> ImVec2 {
+            TrackLayout L = computeTrackLayout(nodeIdx);
+            auto r = nodeRect(nodeIdx);
+            return ImVec2(r.first.x,
+                          r.first.y + L.regs[side].startY + REGION_PAD_TOP
+                                    + slot * BLOB_STEP);
+        };
+        // Slot index per cable (in insertion order, per destination region).
+        std::vector<int> cableSlot(m_routingCables.size(), 0);
+        for (int ci = 0; ci < (int)m_routingCables.size(); ci++) {
+            const auto& c = m_routingCables[ci];
+            int slot = 0;
+            for (int cj = 0; cj < ci; cj++) {
+                const auto& p = m_routingCables[cj];
+                if (p.dstNode == c.dstNode && p.dstSide == c.dstSide) slot++;
+            }
+            cableSlot[ci] = slot;
+        }
+
+        // ---- Cables (behind nodes) ----
+        for (int ci = 0; ci < (int)m_routingCables.size(); ci++) {
+            const auto& cbl = m_routingCables[ci];
+            if (cbl.srcNode < 0 || cbl.srcNode >= (int)m_routingNodes.size()) continue;
+            if (cbl.dstNode < 0 || cbl.dstNode >= (int)m_routingNodes.size()) continue;
+            ImVec2 a = inputOutPortPos(cbl.srcNode);
+            ImVec2 b = trackBlobPos(cbl.dstNode, cbl.dstSide, cableSlot[ci]);
+            float dx = std::fabs(b.x - a.x) * 0.5f;
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(230, 200, 80, 220), 2.5f, 24);
+        }
+        // In-progress cable body (arrowhead drawn after node loop).
+        if (m_routingDragFromNode >= 0 &&
+            m_routingDragFromNode < (int)m_routingNodes.size()) {
+            ImVec2 a = inputOutPortPos(m_routingDragFromNode);
+            ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
+            float dx = std::fabs(b.x - a.x) * 0.5f;
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(230, 200, 80, 180), 2.0f, 24);
+        }
+
+        // ---- Draw nodes + detect hover ----
+        int  hoveredOutputNode = -1;    // input node whose out port is under mouse
+        int  hoveredBlobCable  = -1;    // cable whose blob is under mouse
+        int  hoveredRegionNode = -1;    // track node whose region contains mouse
+        int  hoveredRegionSide = 0;
+        ImVec2 mouse = ImGui::GetMousePos();
+        bool dragging = (m_routingDragFromNode >= 0);
+        const ImU32 portOrange       = IM_COL32(240, 200,  60, 255);
+        const ImU32 portBlue         = IM_COL32( 90, 170, 255, 255);
+        const ImU32 portOrangeHollow = IM_COL32(240, 200,  60, 110);
+
+        for (int i = 0; i < (int)m_routingNodes.size(); i++) {
+            const RoutingNode& n = m_routingNodes[i];
+            auto r  = nodeRect(i);
+            ImVec2 tl = r.first, br = r.second;
+            ImU32 fill = (n.kind == RoutingNode::Kind::Input)
+                       ? IM_COL32(45, 80, 130, 240)
+                       : IM_COL32(120, 55, 55, 240);
+            dl->AddRectFilled(tl, br, fill, 6.0f);
+            dl->AddRect(tl, br, IM_COL32(200, 200, 200, 180), 6.0f, 0, 1.5f);
+
+            if (n.kind == RoutingNode::Kind::Input) {
+                char lbl[32];
+                snprintf(lbl, sizeof(lbl), "Input %d", n.channelOrTrack + 1);
+                ImVec2 ts = ImGui::CalcTextSize(lbl);
+                dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f,
+                                   (tl.y+br.y)*0.5f - ts.y*0.5f),
+                            IM_COL32_WHITE, lbl);
+                ImVec2 p = inputOutPortPos(i);
+                bool hoveredHere = canvasHovered &&
+                    std::fabs(mouse.x - p.x) < 8 && std::fabs(mouse.y - p.y) < 8;
+                dl->AddCircleFilled(p, 5.0f,
+                    (dragging && hoveredHere) ? portBlue : portOrange, 12);
+                if (hoveredHere) hoveredOutputNode = i;
+                continue;
+            }
+
+            // Track node: header + one or two regions with stacked blobs.
+            const Track* t = m_audioEngine->getTrack(n.channelOrTrack);
+            char titleLbl[64];
+            snprintf(titleLbl, sizeof(titleLbl), "%s",
+                     t ? t->name.c_str() : "(track)");
+            ImVec2 ts = ImGui::CalcTextSize(titleLbl);
+            dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f, tl.y + 4),
+                        IM_COL32_WHITE, titleLbl);
+
+            TrackLayout L = computeTrackLayout(i);
+            for (int s = 0; s < L.numRegions; s++) {
+                float regTop = tl.y + L.regs[s].startY;
+                float regBot = tl.y + L.regs[s].endY;
+                if (s > 0) {
+                    dl->AddLine(ImVec2(tl.x + 4, regTop - 0.5f),
+                                ImVec2(br.x - 4, regTop - 0.5f),
+                                IM_COL32(200, 200, 200, 140), 1.0f);
+                }
+                // Region port label (top-right of region).
+                char portLbl[16];
+                trackNodePortLabel(i, s, portLbl, sizeof(portLbl));
+                char full[24];
+                snprintf(full, sizeof(full), "In %s", portLbl);
+                ImVec2 pts = ImGui::CalcTextSize(full);
+                dl->AddText(ImVec2(br.x - pts.x - 6, regTop + 3),
+                            IM_COL32(220, 220, 220, 220), full);
+                bool mouseInRegion = canvasHovered &&
+                    mouse.x >= tl.x && mouse.x <= br.x &&
+                    mouse.y >= regTop && mouse.y <= regBot;
+                int displayCount = (L.regs[s].cableCount > 0)
+                                 ? L.regs[s].cableCount : 1;
+                for (int slot = 0; slot < displayCount; slot++) {
+                    ImVec2 p = trackBlobPos(i, s, slot);
+                    int cableIdx = -1;
+                    for (int ci = 0; ci < (int)m_routingCables.size(); ci++) {
+                        const auto& c = m_routingCables[ci];
+                        if (c.dstNode == i && c.dstSide == s &&
+                            cableSlot[ci] == slot) {
+                            cableIdx = ci;
+                            break;
+                        }
+                    }
+                    bool blobHovered = canvasHovered &&
+                        std::fabs(mouse.x - p.x) < 8 &&
+                        std::fabs(mouse.y - p.y) < 8;
+                    if (blobHovered && cableIdx >= 0) hoveredBlobCable = cableIdx;
+                    if (cableIdx >= 0) {
+                        dl->AddCircleFilled(p, 5.0f,
+                            (dragging && blobHovered) ? portBlue : portOrange, 12);
+                    } else if (dragging && mouseInRegion) {
+                        // Empty placeholder while dragging over the
+                        // region — solid blue so it reads as "drop
+                        // here" (matches an existing-blob hover).
+                        dl->AddCircleFilled(p, 5.0f, portBlue, 12);
+                    } else {
+                        // Idle empty placeholder — hollow orange.
+                        dl->AddCircle(p, 5.0f, portOrangeHollow, 12, 1.5f);
+                    }
+                }
+                if (mouseInRegion) {
+                    hoveredRegionNode = i;
+                    hoveredRegionSide = s;
+                }
+            }
+        }
+
+        // Drag-drop ghost: peek at any in-flight ROUTING_NODE payload
+        // and draw a greyscale preview of the node exactly where the
+        // cursor is. On drop the real node lands centred on the same
+        // cursor position, so "what you see" is "what you get" — no
+        // shift between preview and placed node.
+        {
+            const ImGuiPayload* peek = ImGui::GetDragDropPayload();
+            if (peek && peek->IsDataType("ROUTING_NODE") &&
+                peek->DataSize == (int)sizeof(int) * 2) {
+                // Foreground drawlist so the ghost renders ON TOP of
+                // every window — visible whether the cursor is over
+                // the middle canvas, the input list on the left, or
+                // the track list on the right.
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                const int* pl = (const int*)peek->Data;
+                int prevKind = pl[0];   // 0 = Input, 1 = Track
+                int prevIdx  = pl[1];
+                float w = NODE_W;
+                float h = INPUT_NODE_H;
+                int numRegions = 1;
+                const Track* pt = nullptr;
+                if (prevKind == 1) {
+                    pt = m_audioEngine->getTrack(prevIdx);
+                    numRegions = (pt && pt->outputMono) ? 1 : 2;
+                    float regH = REGION_PAD_TOP + BLOB_STEP + REGION_PAD_BOT;
+                    if (regH < REGION_MIN_H) regH = REGION_MIN_H;
+                    h = HEADER_H + numRegions * regH
+                              + (numRegions - 1) * DIVIDER_H;
+                }
+                ImVec2 gtl(mouse.x - w * 0.5f, mouse.y - h * 0.5f);
+                ImVec2 gbr(mouse.x + w * 0.5f, mouse.y + h * 0.5f);
+                ImU32 gFill = (prevKind == 0)
+                            ? IM_COL32( 85,  85,  85, 220)
+                            : IM_COL32(110, 110, 110, 220);
+                ImU32 gEdge = IM_COL32(190, 190, 190, 200);
+                ImU32 gText = IM_COL32(215, 215, 215, 230);
+                ImU32 gPort = IM_COL32(180, 180, 180, 210);
+                fg->AddRectFilled(gtl, gbr, gFill, 6.0f);
+                fg->AddRect(gtl, gbr, gEdge, 6.0f, 0, 1.5f);
+                char lbl[64];
+                if (prevKind == 0) {
+                    snprintf(lbl, sizeof(lbl), "Input %d", prevIdx + 1);
+                    ImVec2 ts = ImGui::CalcTextSize(lbl);
+                    fg->AddText(ImVec2((gtl.x+gbr.x)*0.5f - ts.x*0.5f,
+                                       (gtl.y+gbr.y)*0.5f - ts.y*0.5f),
+                                gText, lbl);
+                    fg->AddCircleFilled(ImVec2(gbr.x,
+                                               (gtl.y+gbr.y)*0.5f),
+                                        5.0f, gPort, 12);
+                } else {
+                    snprintf(lbl, sizeof(lbl), "%s",
+                             pt ? pt->name.c_str() : "(track)");
+                    ImVec2 ts = ImGui::CalcTextSize(lbl);
+                    fg->AddText(ImVec2((gtl.x+gbr.x)*0.5f - ts.x*0.5f,
+                                       gtl.y + 4),
+                                gText, lbl);
+                    float regH = REGION_PAD_TOP + BLOB_STEP + REGION_PAD_BOT;
+                    if (regH < REGION_MIN_H) regH = REGION_MIN_H;
+                    for (int s = 0; s < numRegions; s++) {
+                        float regTop = gtl.y + HEADER_H + s * (regH + DIVIDER_H);
+                        if (s > 0) {
+                            fg->AddLine(ImVec2(gtl.x + 4, regTop - 0.5f),
+                                        ImVec2(gbr.x - 4, regTop - 0.5f),
+                                        IM_COL32(200,200,200,140), 1.0f);
+                        }
+                        if (pt) {
+                            char portLbl[24];
+                            int ch = pt->outputMono
+                                     ? pt->outputMonoChan
+                                     : (s == 0 ? pt->outputLeftChan
+                                               : pt->outputRightChan);
+                            snprintf(portLbl, sizeof(portLbl), "In %d", ch + 1);
+                            ImVec2 pts = ImGui::CalcTextSize(portLbl);
+                            fg->AddText(ImVec2(gbr.x - pts.x - 6, regTop + 3),
+                                        gText, portLbl);
+                        }
+                        ImVec2 blob(gtl.x, regTop + REGION_PAD_TOP);
+                        fg->AddCircle(blob, 5.0f, gPort, 12, 1.5f);
+                    }
+                }
+            }
+        }
+
+        // Arrowhead — hidden when mouse is over any drop target
+        // (existing blob or region), since those already highlight blue.
+        bool overDropTarget = (hoveredBlobCable >= 0) || (hoveredRegionNode >= 0);
+        if (dragging && !overDropTarget) {
+            const float ah = 5.0f, al = 8.0f;
+            ImU32 tipCol = IM_COL32(240, 170, 40, 230);
+            dl->AddTriangleFilled(
+                ImVec2(m_routingDragCursorX,      m_routingDragCursorY),
+                ImVec2(m_routingDragCursorX - al, m_routingDragCursorY - ah),
+                ImVec2(m_routingDragCursorX - al, m_routingDragCursorY + ah),
+                tipCol);
+        }
+
+        // ---- Node-move interaction ----
+        auto nodeBodyAt = [&](float mx, float my) -> int {
+            for (int i = (int)m_routingNodes.size() - 1; i >= 0; i--) {
+                auto r = nodeRect(i);
+                if (mx >= r.first.x && mx <= r.second.x &&
+                    my >= r.first.y && my <= r.second.y) return i;
+            }
+            return -1;
+        };
+        if (m_routingMoveNode < 0 && m_routingDragFromNode < 0 &&
+            canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            hoveredOutputNode < 0 && hoveredBlobCable < 0) {
+            int bodyIdx = nodeBodyAt(mouse.x, mouse.y);
+            if (bodyIdx >= 0) {
+                m_routingMoveNode = bodyIdx;
+                const RoutingNode& n = m_routingNodes[bodyIdx];
+                float cx = canvasPos.x + n.posX;
+                float cy = canvasPos.y + n.posY;
+                m_routingMoveOffsetX = mouse.x - cx;
+                m_routingMoveOffsetY = mouse.y - cy;
+            }
+        }
+        if (m_routingMoveNode >= 0 &&
+            m_routingMoveNode < (int)m_routingNodes.size()) {
+            RoutingNode& n = m_routingNodes[m_routingMoveNode];
+            n.posX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
+            n.posY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                m_routingMoveNode = -1;
+            }
+        }
+
+        // ---- Cable-drag interaction ----
+        // Click priority: OUT port > existing blob (pickup) > else falls
+        // through to node-move (handled above).
+        if (m_routingDragFromNode < 0 && m_routingMoveNode < 0 &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (hoveredOutputNode >= 0) {
+                m_routingDragFromNode = hoveredOutputNode;
+            } else if (hoveredBlobCable >= 0) {
+                m_routingDragFromNode = m_routingCables[hoveredBlobCable].srcNode;
+                m_routingCables.erase(m_routingCables.begin() + hoveredBlobCable);
+            }
+        }
+        if (m_routingDragFromNode >= 0) {
+            m_routingDragCursorX = mouse.x;
+            m_routingDragCursorY = mouse.y;
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                // Drop resolution:
+                //   • over any part of a region (existing blob OR empty
+                //     space) → add a new cable to that region. Multiple
+                //     cables per side are allowed, so an already-occupied
+                //     blob doesn't block a second connection landing
+                //     alongside it — it lands as the next blob in the
+                //     stack.
+                //   • elsewhere → discard
+                int dropNode = -1, dropSide = 0;
+                if (hoveredBlobCable >= 0) {
+                    dropNode = m_routingCables[hoveredBlobCable].dstNode;
+                    dropSide = m_routingCables[hoveredBlobCable].dstSide;
+                } else if (hoveredRegionNode >= 0) {
+                    dropNode = hoveredRegionNode;
+                    dropSide = hoveredRegionSide;
+                }
+                if (dropNode >= 0) {
+                    RoutingCable cbl;
+                    cbl.srcNode = m_routingDragFromNode;
+                    cbl.dstNode = dropNode;
+                    cbl.dstSide = dropSide;
+                    m_routingCables.push_back(cbl);
+                }
+                m_routingDragFromNode = -1;
+            }
+        }
+
+        // Right-click on a node deletes it (and any cables touching it).
+        if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            for (int i = (int)m_routingNodes.size() - 1; i >= 0; i--) {
+                auto r = nodeRect(i);
+                if (mouse.x >= r.first.x && mouse.x <= r.second.x &&
+                    mouse.y >= r.first.y && mouse.y <= r.second.y) {
+                    m_routingNodes.erase(m_routingNodes.begin() + i);
+                    // Fix up cable refs — drop cables touching this node,
+                    // decrement indices > i.
+                    m_routingCables.erase(std::remove_if(
+                        m_routingCables.begin(), m_routingCables.end(),
+                        [i](const RoutingCable& c) {
+                            return c.srcNode == i || c.dstNode == i;
+                        }),
+                        m_routingCables.end());
+                    for (auto& c : m_routingCables) {
+                        if (c.srcNode > i) c.srcNode--;
+                        if (c.dstNode > i) c.dstNode--;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::SameLine(0, 0);
+    drawVSplitter("routingSplitR", &m_routingRightW, true);
+    ImGui::SameLine(0, 0);
+
+    // ---- RIGHT: tracks -----------------------------------------------
+    ImGui::BeginChild("routingTracks", ImVec2(m_routingRightW, contentH), true);
+    ImGui::TextUnformatted("TRACKS");
+    ImGui::Separator();
+    int nTracks = m_audioEngine->getTrackCount();
+    const ImGuiPayload* peekR = ImGui::GetDragDropPayload();
+    const int* peekPR = (peekR && peekR->IsDataType("ROUTING_NODE") &&
+                        peekR->DataSize == (int)sizeof(int) * 2)
+                        ? (const int*)peekR->Data : nullptr;
+    const ImU32 dragOrangeR = IM_COL32(240, 140, 40, 255);
+    ImGuiID activeIdR = ImGui::GetActiveID();
+    for (int i = 0; i < nTracks; i++) {
+        const Track* t = m_audioEngine->getTrack(i);
+        char lbl[64];
+        snprintf(lbl, sizeof(lbl), "%d  %s", i + 1,
+                 t ? t->name.c_str() : "(track)");
+        bool isDragging = (peekPR && peekPR[0] == 1 && peekPR[1] == i);
+        bool isMouseDown = (activeIdR != 0 && activeIdR == ImGui::GetID(lbl));
+        bool showOrange  = isMouseDown || isDragging;
+        if (showOrange) ImGui::PushStyleColor(ImGuiCol_Text, dragOrangeR);
+        ImGui::Selectable(lbl, false, 0, ImVec2(0, 22));
+        if (showOrange) ImGui::PopStyleColor();
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID |
+                                       ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
+            int payload[2] = { 1, i };   // 1 = Track kind
+            ImGui::SetDragDropPayload("ROUTING_NODE", payload, sizeof(payload));
+            ImGui::EndDragDropSource();
+        }
+    }
     ImGui::EndChild();
 #endif
 }

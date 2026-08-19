@@ -1664,6 +1664,7 @@ void AudioEngine::handleTrackNameFromController(const std::string& name) {
     // Bookmark naming takes precedence â€” a pending bookmark index means
     // pad 13 just requested TEXTIN and we now have the completed name.
     int bmIdx = m_pendingNameBookmarkIndex.exchange(-1);
+    m_pendingBookmarkIsFreshAdd.store(false);
     if (bmIdx >= 0) {
         {
             std::lock_guard<std::mutex> lock(m_bookmarksMutex);
@@ -1976,6 +1977,43 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         m_lastAudioScrubMs.store(nowSec);
         return;
     }
+    else if (encoder == 5 && m_pairPadPressSeen[2].load()) {
+        // Pad 22 held + E5: move the bookmark that sits at the exact
+        // playhead frame. Playhead follows the bookmark so the user
+        // can see what they're dragging. Suppresses the pair-pad
+        // combo-fire flag so pad 22's release doesn't also fire its
+        // marker-jump action. If NO bookmark is at the playhead, this
+        // is a no-op — user has to nav (pad 13 + pad 0/4) to a
+        // bookmark first, which lands the playhead exactly on it.
+        m_pairPadComboFired[2].store(true);
+        size_t playPos = m_playbackPosition.load();
+        size_t totalFrames = getTimelineFrames();
+        if (totalFrames == 0) return;
+        float zoom = getWaveformZoom();
+        size_t visibleFrames = (size_t)(totalFrames / zoom);
+        if (visibleFrames < 100) visibleFrames = 100;
+        // Same finer 1/9600-of-visible per-tick sensitivity as the
+        // marker-nudge branch, so both feel identical.
+        size_t stepSize = (size_t)((double)visibleFrames / 9600.0 * std::abs(delta));
+        if (stepSize < 1) stepSize = 1;
+        long signedStep = (delta > 0) ? (long)stepSize : -(long)stepSize;
+        int  targetIdx = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+            for (size_t i = 0; i < m_bookmarkFrames.size(); i++) {
+                if (m_bookmarkFrames[i].frame == playPos) { targetIdx = (int)i; break; }
+            }
+            if (targetIdx < 0) return;   // no bookmark at playhead — silent
+            long newFrame = (long)m_bookmarkFrames[targetIdx].frame + signedStep;
+            if (newFrame < 0) newFrame = 0;
+            if ((size_t)newFrame > totalFrames) newFrame = (long)totalFrames;
+            m_bookmarkFrames[targetIdx].frame = (size_t)newFrame;
+            m_playbackPosition.store((size_t)newFrame);
+        }
+        m_requestedJumpFrame.store((int64_t)m_playbackPosition.load());
+        markSessionDirty();
+        return;
+    }
     else if (encoder >= 3 && encoder <= 6) {
         // E3-E6: adjust markers 0-3. A disabled/hidden marker is inert here â€”
         // markers can only be created via clear-mode restore (which places
@@ -1990,6 +2028,15 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
             int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             if (nowMs - m_pad23ReleaseMs.load() < PAD23_MARKER_LOCKOUT_MS) {
+                return;
+            }
+        }
+        // Same debounce for E5 → marker 2 (punch-R), which pairs with
+        // pad 22's held-turn move-bookmark combo above.
+        if (encoder == 5) {
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - m_pad22ReleaseMs.load() < PAD22_MARKER_LOCKOUT_MS) {
                 return;
             }
         }
@@ -2947,6 +2994,14 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count());
             }
+            // Pad 22 doubles as the move-bookmark modifier (held + E5).
+            // Same debounce so E5 doesn't nudge marker 2 as the finger
+            // comes off.
+            if (pad == 22) {
+                m_pad22ReleaseMs.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+            }
         }
         return;
     }
@@ -3002,14 +3057,19 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         // cancel press doesn't drop yet another bookmark.
         if (m_pendingNameBookmarkIndex.load() >= 0) {
             int cancelIdx = m_pendingNameBookmarkIndex.exchange(-1);
-            {
+            bool wasFresh = m_pendingBookmarkIsFreshAdd.exchange(false);
+            if (wasFresh) {
                 std::lock_guard<std::mutex> lock(m_bookmarksMutex);
                 if (cancelIdx >= 0 && cancelIdx < (int)m_bookmarkFrames.size()) {
                     m_bookmarkFrames.erase(m_bookmarkFrames.begin() + cancelIdx);
                 }
+                oledShow("MARKER CANCELLED", " ");
+            } else {
+                oledShow("RENAME CANCELLED", " ");
             }
             m_pad13UsedAsModifier.store(true);   // no add on release
-            oledShow("MARKER CANCELLED", " ");
+            m_pad13LongPressFired.store(false);  // suppress rename re-fire too
+            m_pad13PressTimeMs.store(0);
             int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             m_oledRevertAtMs.store(nowMs + 1000);
@@ -3031,11 +3091,21 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         }
         m_pad13Held.store(true);
         m_pad13UsedAsModifier.store(false);
+        // Arm the long-press timer (updateController polls it).
+        m_pad13PressTimeMs.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        m_pad13LongPressFired.store(false);
         return;
     }
     if (pad == 13 && !pressed) {
         bool wasModifier = m_pad13UsedAsModifier.exchange(false);
+        bool longPressed = m_pad13LongPressFired.exchange(false);
         m_pad13Held.store(false);
+        m_pad13PressTimeMs.store(0);
+        // A long-press already fired the rename flow — release must not
+        // ALSO add a fresh bookmark on top.
+        if (longPressed) return;
         // Only reset the nav state when we are NOT staying in scroll
         // mode â€” scroll mode keeps its selection between encoder events
         // after the physical pad has been released.
@@ -3070,6 +3140,7 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         }
         if (m_pendingNameTrackIndex.load() < 0) {
             m_pendingNameBookmarkIndex.store(bmIdx);
+            m_pendingBookmarkIsFreshAdd.store(true);   // cancel = delete
             // Prompt line on the OLED, same pattern as add-track. Line 2
             // will be replaced by the flashing cursor once TEXTIN: is
             // received on the firmware side.
@@ -3111,9 +3182,12 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
 
     // Pad 13 held + pad 0/4: step through bookmarks in frame order.
     // Pad 0 = NEXT, pad 4 = PREVIOUS (per user spec). Marks pad 13 as
-    // a modifier so its release doesn't drop a fresh bookmark.
+    // a modifier so its release doesn't drop a fresh bookmark. Also
+    // clears the long-press timer so the hold can't fire a bookmark
+    // rename underneath a nav gesture.
     if ((pad == 0 || pad == 4) && m_pad13Held.load()) {
         m_pad13UsedAsModifier.store(true);
+        m_pad13PressTimeMs.store(0);
         navigateBookmarks(pad == 0 ? +1 : -1);
         return;
     }
@@ -3400,6 +3474,21 @@ void AudioEngine::updateController() {
             }
         }
     }
+    // --- Pad 13 long-press: rename bookmark under the playhead ---
+    // Same RENAME_HOLD_MS as pad 12 → the two rename gestures feel
+    // identical. Silent no-op if no bookmark is under the playhead.
+    // The release-add is suppressed via m_pad13LongPressFired.
+    {
+        int64_t pressedAt = m_pad13PressTimeMs.load();
+        if (pressedAt != 0 && !m_pad13LongPressFired.load()) {
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - pressedAt >= RENAME_HOLD_MS) {
+                m_pad13LongPressFired.store(true);
+                m_pendingBookmarkRenameRequest.store(true);
+            }
+        }
+    }
     if (m_pendingDeleteTrackRequest.exchange(false)) {
         int idx = getSelectedTrack();
         int n = getTrackCount();
@@ -3427,6 +3516,29 @@ void AudioEngine::updateController() {
             m_pendingTrackIsFreshAdd.store(false);
         }
         // If no track was selected, silently ignore the rename request.
+    }
+    if (m_pendingBookmarkRenameRequest.exchange(false)) {
+        // Find the bookmark at the exact playhead frame — that's the
+        // one the user wants to rename. Silent no-op if none.
+        size_t playPos = m_playbackPosition.load();
+        int foundIdx = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_bookmarksMutex);
+            for (size_t i = 0; i < m_bookmarkFrames.size(); i++) {
+                if (m_bookmarkFrames[i].frame == playPos) {
+                    foundIdx = (int)i;
+                    break;
+                }
+            }
+        }
+        if (foundIdx >= 0) {
+            oledShowForce("MARKER RENAME,NAME:", " ");
+            if (m_serialController) m_serialController->sendMessage("TEXTIN:");
+            m_pendingNameBookmarkIndex.store(foundIdx);
+            // Rename of an EXISTING bookmark — cancel should just close
+            // the dialog, not delete the marker.
+            m_pendingBookmarkIsFreshAdd.store(false);
+        }
     }
 
     // Audio-scrub timeout: if E6 (pad 24 held) hasn't fired in a while, stop
@@ -4378,6 +4490,19 @@ Track* AudioEngine::getTrack(int trackIndex) {
 const Track* AudioEngine::getTrack(int trackIndex) const {
     if (trackIndex < 0 || trackIndex >= static_cast<int>(m_tracks.size())) return nullptr;
     return &m_tracks[trackIndex];
+}
+
+const std::string& AudioEngine::getInputName(int chan) const {
+    static const std::string kEmpty;
+    if (chan < 0) return kEmpty;
+    if ((int)m_inputNames.size() <= chan) m_inputNames.resize(chan + 1);
+    return m_inputNames[chan];
+}
+
+void AudioEngine::setInputName(int chan, const std::string& name) {
+    if (chan < 0) return;
+    if ((int)m_inputNames.size() <= chan) m_inputNames.resize(chan + 1);
+    m_inputNames[chan] = name;
 }
 
 float AudioEngine::getTrackMeter(int trackIndex) const {

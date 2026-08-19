@@ -122,6 +122,46 @@ private:
     // more tracks than fit on screen.
     float m_trackScrollY = 0.0f;
 
+    // ---- Routing page ----
+    // Patchbay-style view: physical inputs on the left, tracks on the
+    // right, node graph in the middle for connecting arbitrary inputs
+    // to any track's L or R side. Toggled from a toolbar button.
+    // Recording pipeline is NOT wired to this yet — mockup only.
+    bool m_routingPageActive = false;
+    // Node model — inputs/tracks dragged into the middle become nodes,
+    // connections are stored as cables. Both persist across frames but
+    // NOT across sessions yet (that's part of the wire-up pass).
+    struct RoutingNode {
+        enum class Kind { Input, Track };
+        Kind   kind;
+        int    channelOrTrack = 0;   // input channel (0-based) or track index
+        float  posX = 0.0f;          // centre in middle-canvas coords
+        float  posY = 0.0f;
+    };
+    struct RoutingCable {
+        // Src is always an input node; dst is always a track node.
+        int  srcNode = -1;
+        int  dstNode = -1;
+        int  dstSide = 0;            // 0 = L, 1 = R (0 for mono tracks)
+    };
+    std::vector<RoutingNode>  m_routingNodes;
+    std::vector<RoutingCable> m_routingCables;
+    // In-progress cable drag state (from a node's output port to a
+    // pending destination). -1 = not dragging.
+    int   m_routingDragFromNode  = -1;
+    float m_routingDragCursorX   = 0.0f;
+    float m_routingDragCursorY   = 0.0f;
+    // Node-move drag: left-click on a node's body (not on a port) and
+    // drag to reposition. Cables auto-follow because they're drawn from
+    // node.posX/posY every frame. -1 = not currently dragging any node.
+    int   m_routingMoveNode      = -1;
+    float m_routingMoveOffsetX   = 0.0f;   // click point → node centre
+    float m_routingMoveOffsetY   = 0.0f;
+    // Panel widths (draggable splitters between the three columns).
+    float m_routingLeftW         = 180.0f;
+    float m_routingRightW        = 180.0f;
+    void renderRoutingPage();
+
     // Cached arrangement-child frame-to-X mapping from the last render.
     // Used by the bookmark triangle drawing (drawn BEFORE the arrangement
     // child this frame) so the triangle tip lines up pixel-exactly with

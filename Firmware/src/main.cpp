@@ -916,7 +916,7 @@ bool dawExclusiveMode = false;
 // (deferred until release so the two behaviours can share the pad); a
 // hold of DELETE_ALL_HOLD_MS wipes both marker pairs and runs a
 // 1-second fade-out on LEDs 4/5/6/7 as the acknowledgement.
-static const uint32_t DELETE_ALL_HOLD_MS   = 1000;
+static const uint32_t DELETE_ALL_HOLD_MS   = 1300;   // standardised with DAW's RENAME_HOLD_MS
 static const uint32_t DELETE_ALL_FADE_MS   = 1000;
 uint32_t pad15PressMs        = 0;
 bool     pad15LongPressFired = false;
@@ -926,7 +926,7 @@ uint32_t deleteAllFadeStartMs = 0;   // 0 = idle; else fade in progress
 // "RESET" for as long as pad 18 stays held; on release, LEDs are
 // repainted from the mirrors (which the DAW has been updating during the
 // hold via RESYNC-triggered pushes) and the OLED lock lifts.
-static const uint32_t RESET_HOLD_MS = 3000;
+static const uint32_t RESET_HOLD_MS = 1300;   // standardised with DAW's RENAME_HOLD_MS
 uint32_t pad18PressMs    = 0;
 bool     pad18ResetFired = false;
 bool     resetShowActive = false;
@@ -944,7 +944,7 @@ bool     pad19UsedAsModifier   = false;
 // deferred play/stop on release does NOT also fire.
 uint32_t pad19PressMs          = 0;
 bool     pad19LongPressFired   = false;
-static const uint32_t GOTOSTART_HOLD_MS = 2000;
+static const uint32_t GOTOSTART_HOLD_MS = 1300;   // standardised with DAW's RENAME_HOLD_MS
 
 // 3-quick-blink acknowledgement on the pair whose markers were just
 // deleted. 6 transitions * 50 ms = ~300 ms total, then LEDs go out (the
