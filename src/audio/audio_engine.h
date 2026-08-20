@@ -161,6 +161,26 @@ public:
     // any name that's blank.
     const std::string& getInputName(int chan) const;
     void setInputName(int chan, const std::string& name);
+    // Per-output user-editable names (routing page). Same shape as
+    // input names: empty until set, UI falls back to "Output N".
+    const std::string& getOutputName(int chan) const;
+    void setOutputName(int chan, const std::string& name);
+
+    // ---- Routing (patchbay) — per-track ----
+    // Each Track owns its own routing graph (see Track::routingNodes /
+    // routingInputCables / routingOutputCables). Audio callback and UI
+    // both touch these; access is guarded by m_routingMutex.
+    struct RoutingLock { std::unique_lock<std::mutex> lk; };
+    RoutingLock lockRouting() const;
+    // Resolves the track's input-cable node refs to hardware channels,
+    // in stem order. Empty when the track has no input cables.
+    void trackInputChannels(int trackIdx, std::vector<int>& outChans) const;
+    // Per-stem hardware output list — one entry per output cable.
+    struct StemOutputRoute { int stemIdx; int hwChan; };
+    void trackOutputRoutes(int trackIdx,
+                           std::vector<StemOutputRoute>& outRoutes) const;
+    // True if the track has any routing cabling at all.
+    bool trackHasRouting(int trackIdx) const;
 
     // Track management
     int addTrack(const std::string& name = "");
@@ -173,6 +193,18 @@ public:
     // inputMonitor is on, playback output otherwise. Callers apply
     // their own decay/smoothing when displaying.
     float getTrackMeter(int trackIndex) const;
+    // Instantaneous peak level (0..1) for a hardware input channel.
+    // Returns 0 for out-of-range or when no input stream is active.
+    float getInputMeter(int chan) const {
+        if (chan < 0 || chan >= (int)m_inputMeters.size()) return 0.0f;
+        const auto& m = m_inputMeters[chan];
+        return m ? m->load() : 0.0f;
+    }
+    float getInputMeterRMS(int chan) const {
+        if (chan < 0 || chan >= (int)m_inputMetersRMS.size()) return 0.0f;
+        const auto& m = m_inputMetersRMS[chan];
+        return m ? m->load() : 0.0f;
+    }
     int getSelectedTrack() const { return m_selectedTrack; }
     void setSelectedTrack(int trackIndex) { m_selectedTrack = trackIndex; }
     bool loadTrackAudio(int trackIndex, const std::string& filepath);
@@ -542,6 +574,10 @@ private:
     int m_maxOutputChannels;
     int m_maxInputChannels = 0;
     mutable std::vector<std::string> m_inputNames;
+    mutable std::vector<std::string> m_outputNames;
+    // Guards read/write access to Track::routingNodes / routingInputCables
+    // / routingOutputCables from both the UI thread and the audio thread.
+    mutable std::mutex        m_routingMutex;
 
     // Device info
     std::string m_deviceName;
@@ -585,6 +621,11 @@ private:
     // the GUI. Stored via unique_ptr because atomic<float> is neither
     // copyable nor movable, so a bare vector wouldn't support push_back.
     std::vector<std::unique_ptr<std::atomic<float>>> m_trackMeters;
+    // Per-input-channel instantaneous peaks + per-buffer RMS —
+    // populated each buffer in the audio callback, read by the routing
+    // page for its meters (peak marker + RMS bar respectively).
+    std::vector<std::unique_ptr<std::atomic<float>>> m_inputMeters;
+    std::vector<std::unique_ptr<std::atomic<float>>> m_inputMetersRMS;
 
     std::atomic<bool>  m_recordActive{false};   // callback captures while true
     // If the record pair (markers 1 & 2) is enabled when a take begins,

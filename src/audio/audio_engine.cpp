@@ -317,7 +317,25 @@ void AudioEngine::play() {
                 if (!t.armed) continue;
                 RecordSlot* slot = m_recordSlots[i].get();
                 if (!slot) continue;
-                int captureChans = t.inputMono ? 1 : 2;
+                // Channel count for the record slot. Routed tracks
+                // capture one channel per input cable (stem). Non-routed
+                // tracks use their legacy input combo.
+                int captureChans;
+                std::vector<int> routedInputs;
+                trackInputChannels((int)i, routedInputs);
+                bool routedRec = !routedInputs.empty();
+                if (routedRec) {
+                    captureChans = (int)routedInputs.size();
+                    // If the cable count / channel layout changed from
+                    // the previous take, wipe audioData — the new take
+                    // fully replaces the old one.
+                    if (t.channels != captureChans) {
+                        t.audioData.clear();
+                        t.channels = captureChans;
+                    }
+                } else {
+                    captureChans = t.inputMono ? 1 : 2;
+                }
                 {
                     std::unique_lock<std::mutex> lock(slot->mutex);
                     slot->buffer.clear();
@@ -3721,6 +3739,16 @@ bool AudioEngine::startAudio(int deviceId) {
     m_hostApiName = hostApiInfo->name;
     m_maxOutputChannels = deviceInfo->maxOutputChannels;
     m_maxInputChannels  = deviceInfo->maxInputChannels;
+    // Per-input peak meters — one atomic per input channel, read by
+    // the routing page for its per-input level bars.
+    m_inputMeters.clear();
+    m_inputMetersRMS.clear();
+    m_inputMeters.reserve(m_maxInputChannels);
+    m_inputMetersRMS.reserve(m_maxInputChannels);
+    for (int ic = 0; ic < m_maxInputChannels; ic++) {
+        m_inputMeters.emplace_back(std::make_unique<std::atomic<float>>(0.0f));
+        m_inputMetersRMS.emplace_back(std::make_unique<std::atomic<float>>(0.0f));
+    }
 
     outputParameters.channelCount = deviceInfo->maxOutputChannels;
     outputParameters.sampleFormat = paFloat32;
@@ -3834,6 +3862,28 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
     // the meter reflects the samples actually rendered THIS callback.
     const size_t bufStartPlayPos = m_playbackPosition.load();
 
+    // Per-input peak meters — cheap sweep of the input buffer, one
+    // atomic store per channel. Read by the routing page for its
+    // level bars.
+    if (in != nullptr && m_maxInputChannels > 0 &&
+        (int)m_inputMeters.size() >= m_maxInputChannels &&
+        (int)m_inputMetersRMS.size() >= m_maxInputChannels &&
+        framesPerBuffer > 0) {
+        float invN = 1.0f / (float)framesPerBuffer;
+        for (int ic = 0; ic < m_maxInputChannels; ic++) {
+            float peak = 0.0f;
+            float sumSq = 0.0f;
+            for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                float s = in[f * m_maxInputChannels + ic];
+                float a = std::fabs(s);
+                if (a > peak) peak = a;
+                sumSq += s * s;
+            }
+            m_inputMeters[ic]->store(peak);
+            m_inputMetersRMS[ic]->store(std::sqrt(sumSq * invN));
+        }
+    }
+
     // ---- Record capture ----
     // While m_recordActive, for each armed track with a valid input
     // channel/pair on this device, append input samples to the track's
@@ -3875,7 +3925,26 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             if (!slot || slot->channels == 0) continue;
             std::unique_lock<std::mutex> lock(slot->mutex, std::try_to_lock);
             if (!lock.owns_lock()) continue;
-            if (slot->channels == 1) {
+            std::vector<int> stemInChans;
+            trackInputChannels((int)ti, stemInChans);
+            bool useRouting = !stemInChans.empty();
+            if (useRouting) {
+                // Stem-preserving capture: one channel per input cable,
+                // in the exact order the routing UI shows on the track
+                // node's input side. audioData becomes N-channel.
+                int N = (int)stemInChans.size();
+                if (N != slot->channels) continue;
+                for (unsigned long f = startF; f < framesPerBuffer; f++) {
+                    size_t pos = basePos + f;
+                    if (gated && (pos < gateStart || pos >= gateEnd)) continue;
+                    for (int c = 0; c < N; c++) {
+                        int ch = stemInChans[c];
+                        float v = (ch >= 0 && ch < m_maxInputChannels)
+                                  ? in[f * m_maxInputChannels + ch] : 0.0f;
+                        slot->buffer.push_back(v);
+                    }
+                }
+            } else if (slot->channels == 1) {
                 int ch = t.inputMonoChan;
                 if (ch < 0 || ch >= m_maxInputChannels) continue;
                 for (unsigned long f = startF; f < framesPerBuffer; f++) {
@@ -4011,37 +4080,53 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     size_t trackFrames = track.getTotalFrames();
                     if (pos1 >= trackFrames) continue;
 
-                    float left0 = track.getSample(pos0, 0);
-                    float left1 = track.getSample(pos1, 0);
-                    float leftSample = (left0 + frac * (left1 - left0)) * track.volume;
-
-                    float rightSample;
-                    if (track.channels > 1) {
-                        float right0 = track.getSample(pos0, 1);
-                        float right1 = track.getSample(pos1, 1);
-                        rightSample = (right0 + frac * (right1 - right0)) * track.volume;
+                    // Scrub mirrors the playback branch: routed tracks
+                    // use their per-stem output cables; non-routed use
+                    // the legacy L/R output distribution.
+                    bool routedOut = !track.routingOutputCables.empty();
+                    if (routedOut) {
+                        float g = track.volume;
+                        for (const auto& oc : track.routingOutputCables) {
+                            if (oc.outputNodeIdx < 0 ||
+                                oc.outputNodeIdx >= (int)track.routingNodes.size()) continue;
+                            const auto& on = track.routingNodes[oc.outputNodeIdx];
+                            if (on.kind != Track::RoutingNode::Kind::Output) continue;
+                            int hw = on.channelOrTrack;
+                            if (hw < 0 || hw >= m_maxOutputChannels) continue;
+                            if (oc.stemIdx < 0 || oc.stemIdx >= track.channels) continue;
+                            float a = track.getSample(pos0, oc.stemIdx);
+                            float b = track.getSample(pos1, oc.stemIdx);
+                            out[i * m_maxOutputChannels + hw] +=
+                                (a + frac * (b - a)) * g;
+                        }
                     } else {
-                        rightSample = leftSample;
-                    }
-
-                    float panLeft = (track.pan <= 0) ? 1.0f : (1.0f - track.pan);
-                    float panRight = (track.pan >= 0) ? 1.0f : (1.0f + track.pan);
-                    leftSample *= panLeft;
-                    rightSample *= panRight;
-
-                    if (track.outputMono) {
-                        int c = track.outputMonoChan;
-                        if (c >= 0 && c < m_maxOutputChannels)
-                            out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
-                    } else {
-                        // Independent L/R channel indices — supports non-adjacent
-                        // stereo output like L=ch1 R=ch7. outputPair is legacy on-disk only.
-                        int trackLeftChan  = track.outputLeftChan;
-                        int trackRightChan = track.outputRightChan;
-                        if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
-                            out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
-                        if (trackRightChan >= 0 && trackRightChan < m_maxOutputChannels)
-                            out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                        float left0 = track.getSample(pos0, 0);
+                        float left1 = track.getSample(pos1, 0);
+                        float leftSample = (left0 + frac * (left1 - left0)) * track.volume;
+                        float rightSample;
+                        if (track.channels > 1) {
+                            float right0 = track.getSample(pos0, 1);
+                            float right1 = track.getSample(pos1, 1);
+                            rightSample = (right0 + frac * (right1 - right0)) * track.volume;
+                        } else {
+                            rightSample = leftSample;
+                        }
+                        float panLeft = (track.pan <= 0) ? 1.0f : (1.0f - track.pan);
+                        float panRight = (track.pan >= 0) ? 1.0f : (1.0f + track.pan);
+                        leftSample *= panLeft;
+                        rightSample *= panRight;
+                        if (track.outputMono) {
+                            int c = track.outputMonoChan;
+                            if (c >= 0 && c < m_maxOutputChannels)
+                                out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
+                        } else {
+                            int trackLeftChan  = track.outputLeftChan;
+                            int trackRightChan = track.outputRightChan;
+                            if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
+                                out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
+                            if (trackRightChan >= 0 && trackRightChan < m_maxOutputChannels)
+                                out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                        }
                     }
                 }
 
@@ -4159,28 +4244,66 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     size_t trackFrames = track.getTotalFrames();
                     if (playPos >= trackFrames) continue;
 
-                    float leftSample = track.getSample(playPos, 0) * track.volume;
-                    float rightSample = (track.channels > 1) ?
-                        track.getSample(playPos, 1) * track.volume : leftSample;
-
-                    float panLeft = (track.pan <= 0) ? 1.0f : (1.0f - track.pan);
-                    float panRight = (track.pan >= 0) ? 1.0f : (1.0f + track.pan);
-                    leftSample  *= panLeft  * m_playFadeGain;
-                    rightSample *= panRight * m_playFadeGain;
-
-                    if (track.outputMono) {
-                        int c = track.outputMonoChan;
-                        if (c >= 0 && c < m_maxOutputChannels)
-                            out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
+                    // Routed playback branches by output mode:
+                    //   MULTI  → per-stem output cables sum into their
+                    //            cabled hardware channels.
+                    //   MONO   → all stems summed to a mono mix, that
+                    //            single signal duplicated to each cabled
+                    //            Output.
+                    // Falls back to the legacy L/R distribution when
+                    // routing has no cables configured for the mode.
+                    bool routedMulti = (track.routingOutputMode == 0) &&
+                                       !track.routingOutputCables.empty();
+                    bool routedMono  = (track.routingOutputMode == 2) &&
+                                       !track.routingMonoOutputs.empty();
+                    if (routedMulti) {
+                        float g = track.volume * m_playFadeGain;
+                        for (const auto& oc : track.routingOutputCables) {
+                            if (oc.outputNodeIdx < 0 ||
+                                oc.outputNodeIdx >= (int)track.routingNodes.size()) continue;
+                            const auto& on = track.routingNodes[oc.outputNodeIdx];
+                            if (on.kind != Track::RoutingNode::Kind::Output) continue;
+                            int hw = on.channelOrTrack;
+                            if (hw < 0 || hw >= m_maxOutputChannels) continue;
+                            if (oc.stemIdx < 0 || oc.stemIdx >= track.channels) continue;
+                            out[i * m_maxOutputChannels + hw] +=
+                                track.getSample(playPos, oc.stemIdx) * g;
+                        }
+                    } else if (routedMono) {
+                        float g = track.volume * m_playFadeGain;
+                        float mono = 0.0f;
+                        int nC = track.channels;
+                        for (int c = 0; c < nC; c++) mono += track.getSample(playPos, c);
+                        if (nC > 0) mono /= (float)nC;
+                        for (int outNodeIdx : track.routingMonoOutputs) {
+                            if (outNodeIdx < 0 ||
+                                outNodeIdx >= (int)track.routingNodes.size()) continue;
+                            const auto& on = track.routingNodes[outNodeIdx];
+                            if (on.kind != Track::RoutingNode::Kind::Output) continue;
+                            int hw = on.channelOrTrack;
+                            if (hw < 0 || hw >= m_maxOutputChannels) continue;
+                            out[i * m_maxOutputChannels + hw] += mono * g;
+                        }
                     } else {
-                        // Independent L/R channel indices — supports non-adjacent
-                        // stereo output like L=ch1 R=ch7. outputPair is legacy on-disk only.
-                        int trackLeftChan  = track.outputLeftChan;
-                        int trackRightChan = track.outputRightChan;
-                        if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
-                            out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
-                        if (trackRightChan >= 0 && trackRightChan < m_maxOutputChannels)
-                            out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                        float leftSample  = track.getSample(playPos, 0) * track.volume;
+                        float rightSample = (track.channels > 1) ?
+                            track.getSample(playPos, 1) * track.volume : leftSample;
+                        float panLeft = (track.pan <= 0) ? 1.0f : (1.0f - track.pan);
+                        float panRight = (track.pan >= 0) ? 1.0f : (1.0f + track.pan);
+                        leftSample  *= panLeft  * m_playFadeGain;
+                        rightSample *= panRight * m_playFadeGain;
+                        if (track.outputMono) {
+                            int c = track.outputMonoChan;
+                            if (c >= 0 && c < m_maxOutputChannels)
+                                out[i * m_maxOutputChannels + c] += (leftSample + rightSample) * 0.5f;
+                        } else {
+                            int trackLeftChan  = track.outputLeftChan;
+                            int trackRightChan = track.outputRightChan;
+                            if (trackLeftChan >= 0 && trackLeftChan < m_maxOutputChannels)
+                                out[i * m_maxOutputChannels + trackLeftChan] += leftSample;
+                            if (trackRightChan >= 0 && trackRightChan < m_maxOutputChannels)
+                                out[i * m_maxOutputChannels + trackRightChan] += rightSample;
+                        }
                     }
                 }
 
@@ -4257,7 +4380,20 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             float peak = 0.0f;
 
             if (t.inputMonitor && in != nullptr && m_maxInputChannels > 0) {
-                if (t.inputMono) {
+                std::vector<int> mChans;
+                trackInputChannels((int)ti, mChans);
+                bool useRouting = !mChans.empty();
+                if (useRouting) {
+                    // Meter the loudest cabled input — matches what
+                    // the record path would actually capture.
+                    for (unsigned long f = 0; f < framesPerBuffer; f++) {
+                        for (int ch : mChans) {
+                            if (ch < 0 || ch >= m_maxInputChannels) continue;
+                            float a = std::fabs(in[f * m_maxInputChannels + ch]);
+                            if (a > peak) peak = a;
+                        }
+                    }
+                } else if (t.inputMono) {
                     int ch = t.inputMonoChan;
                     if (ch >= 0 && ch < m_maxInputChannels) {
                         for (unsigned long f = 0; f < framesPerBuffer; f++) {
@@ -4503,6 +4639,68 @@ void AudioEngine::setInputName(int chan, const std::string& name) {
     if (chan < 0) return;
     if ((int)m_inputNames.size() <= chan) m_inputNames.resize(chan + 1);
     m_inputNames[chan] = name;
+}
+
+const std::string& AudioEngine::getOutputName(int chan) const {
+    static const std::string kEmpty;
+    if (chan < 0) return kEmpty;
+    if ((int)m_outputNames.size() <= chan) m_outputNames.resize(chan + 1);
+    return m_outputNames[chan];
+}
+
+void AudioEngine::setOutputName(int chan, const std::string& name) {
+    if (chan < 0) return;
+    if ((int)m_outputNames.size() <= chan) m_outputNames.resize(chan + 1);
+    m_outputNames[chan] = name;
+}
+
+AudioEngine::RoutingLock AudioEngine::lockRouting() const {
+    RoutingLock r;
+    r.lk = std::unique_lock<std::mutex>(m_routingMutex);
+    return r;
+}
+
+bool AudioEngine::trackHasRouting(int trackIdx) const {
+    std::lock_guard<std::mutex> g(m_routingMutex);
+    const Track* t = getTrack(trackIdx);
+    return t && t->hasRouting();
+}
+
+void AudioEngine::trackInputChannels(int trackIdx,
+                                     std::vector<int>& outChans) const {
+    outChans.clear();
+    std::lock_guard<std::mutex> g(m_routingMutex);
+    const Track* t = getTrack(trackIdx);
+    if (!t) return;
+    outChans.reserve(t->routingInputCables.size());
+    for (int nodeIdx : t->routingInputCables) {
+        if (nodeIdx < 0 || nodeIdx >= (int)t->routingNodes.size()) {
+            outChans.push_back(-1);
+            continue;
+        }
+        const auto& n = t->routingNodes[nodeIdx];
+        outChans.push_back(n.kind == Track::RoutingNode::Kind::Input
+                           ? n.channelOrTrack : -1);
+    }
+}
+
+void AudioEngine::trackOutputRoutes(int trackIdx,
+                                    std::vector<StemOutputRoute>& out) const {
+    out.clear();
+    std::lock_guard<std::mutex> g(m_routingMutex);
+    const Track* t = getTrack(trackIdx);
+    if (!t) return;
+    out.reserve(t->routingOutputCables.size());
+    for (const auto& oc : t->routingOutputCables) {
+        if (oc.outputNodeIdx < 0 ||
+            oc.outputNodeIdx >= (int)t->routingNodes.size()) continue;
+        const auto& n = t->routingNodes[oc.outputNodeIdx];
+        if (n.kind != Track::RoutingNode::Kind::Output) continue;
+        StemOutputRoute r;
+        r.stemIdx = oc.stemIdx;
+        r.hwChan  = n.channelOrTrack;
+        out.push_back(r);
+    }
 }
 
 float AudioEngine::getTrackMeter(int trackIndex) const {

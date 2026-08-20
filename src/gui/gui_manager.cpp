@@ -2097,13 +2097,31 @@ void GUIManager::renderTrackPanel(float width, float height) {
 
             ImGui::BeginChild("trackBlock", ImVec2(-1, perTrackBlockH),
                               false, ImGuiWindowFlags_NoScrollbar);
+            // Dark-orange 5-px bar down the far left of any track that
+            // has been dragged into the routing patchbay — sits just
+            // outside the trackBlock's WindowPadding so it butts right
+            // up against the panel's inner edge (the blue accent
+            // line). Drawn on the foreground drawlist so the child's
+            // clip rect doesn't hide it.
+            bool trackRouted = m_audioEngine->trackHasRouting(i);
+            if (trackRouted) {
+                ImVec2 blkPos = ImGui::GetWindowPos();
+                ImVec2 blkSz  = ImGui::GetWindowSize();
+                float  padX   = ImGui::GetStyle().WindowPadding.x;
+                ImDrawList* dlBar = ImGui::GetForegroundDrawList();
+                dlBar->AddRectFilled(
+                    ImVec2(blkPos.x - padX,     blkPos.y),
+                    ImVec2(blkPos.x - padX + 5, blkPos.y + blkSz.y),
+                    IM_COL32(160, 75, 15, 255));    // dark orange
+            }
 
             // --- Track name row ---
             if (editingTrackName == i) {
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##name", nameBuffer, sizeof(nameBuffer),
                                      ImGuiInputTextFlags_EnterReturnsTrue |
-                                     ImGuiInputTextFlags_AutoSelectAll)) {
+                                     ImGuiInputTextFlags_AutoSelectAll |
+                                     ImGuiInputTextFlags_CharsUppercase)) {
                     m_audioEngine->undoSnapshot();
                     track->name = nameBuffer;
                     m_audioEngine->markSessionDirty();
@@ -2276,7 +2294,29 @@ void GUIManager::renderTrackPanel(float width, float height) {
                     1.0f);
             };
 
-            if (numInputPairs > 0) {
+            if (trackRouted) {
+                // Routing patchbay owns this track — replace BOTH the
+                // input and output combos with a single full-width
+                // "routing" pill. All channel routing lives on the
+                // routing page while this is active.
+                float fullW = ImGui::GetContentRegionAvail().x;
+                ImVec2 pos = ImGui::GetCursorScreenPos();
+                float h    = ImGui::GetFrameHeight();
+                ImDrawList* dlPill = ImGui::GetWindowDrawList();
+                ImU32 pillFill = IM_COL32(35, 40, 48, 255);
+                ImU32 pillEdge = IM_COL32(240, 140, 40, 255);
+                ImU32 pillText = IM_COL32(240, 140, 40, 255);
+                dlPill->AddRectFilled(pos, ImVec2(pos.x + fullW, pos.y + h),
+                                      pillFill, ImGui::GetStyle().FrameRounding);
+                dlPill->AddRect(pos, ImVec2(pos.x + fullW, pos.y + h),
+                                pillEdge, ImGui::GetStyle().FrameRounding);
+                const char* lbl = "routing";
+                ImVec2 ts  = ImGui::CalcTextSize(lbl);
+                dlPill->AddText(ImVec2(pos.x + (fullW - ts.x) * 0.5f,
+                                       pos.y + (h - ts.y) * 0.5f),
+                                pillText, lbl);
+                ImGui::Dummy(ImVec2(fullW, h));
+            } else if (numInputPairs > 0) {
                 // Stereo takes the actual L/R channel indices (e.g. "I = 1-2"
                 // or non-adjacent "I = 1&7"); mono takes an absolute channel
                 // index (e.g. "I = 1"). Whichever is active drives the label.
@@ -2360,7 +2400,10 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 }  // end else (input dropdown vs entry pulse)
             }
 
-            if (numPairs > 0) {
+            if (numPairs > 0 && !trackRouted) {
+                // Output combo hidden when routing owns this track —
+                // the full-width "routing" pill above already covers
+                // both input and output for the routed track.
                 // Mono routes to a single output channel; stereo routes to
                 // a stereo pair. Preview label mirrors whichever is active.
                 char outLabel[32];
@@ -3723,15 +3766,39 @@ void GUIManager::renderWaveform(float height) {
 // input node to an IN port on a track node to lay a cable. Middle
 // panel scrolls if the node cloud grows past its bounds.
 //
-// UI-only mockup for now — nothing here affects the recording
-// pipeline yet. The RoutingNode / RoutingCable lists persist across
-// frames but not sessions.
+// Wired into recording: audio thread reads the same node/cable lists
+// (via AudioEngine::lockRouting) to route input samples to armed tracks.
 void GUIManager::renderRoutingPage() {
 #ifdef IMGUI_FOUND
     if (!m_audioEngine) return;
     float transportBarHeight = m_bloomEnabled ? 80.0f : 50.0f;
     float contentH = ImGui::GetContentRegionAvail().y - transportBarHeight - 10;
     if (contentH < 100.0f) contentH = 100.0f;
+    // Hold the routing lock for the entire render frame — audio thread
+    // takes the same mutex briefly per buffer, so contention is minimal.
+    auto _routingLk = m_audioEngine->lockRouting();
+    // Which track's routing are we editing? The whole page is per-track:
+    // the selected track's node is pinned in the canvas, its own
+    // routingNodes/routingInputCables/routingOutputCables are what we
+    // read and mutate.
+    using RoutingNode = Track::RoutingNode;
+    using OutputCable = Track::OutputCable;
+    int selIdx = m_audioEngine->getSelectedTrack();
+    Track* selTrack = (selIdx >= 0 && selIdx < m_audioEngine->getTrackCount())
+                    ? m_audioEngine->getTrack(selIdx) : nullptr;
+    // Reset canvas selection when the user switches tracks — selection
+    // indices point into THIS track's routingNodes and would otherwise
+    // reference the wrong graph.
+    if (m_routingSelectionTrack != selIdx) {
+        m_routingSelectedNodes.clear();
+        m_routingRubberActive = false;
+        m_routingSelectionTrack = selIdx;
+    }
+    // Per-frame captured row rects for the input + output panels — used
+    // by the rubber-band commit at the end of this function to test
+    // which channel rows fell under the drag rectangle.
+    struct PanelRowRect { int ch; ImVec2 mn, mx; };
+    std::vector<PanelRowRect> inputRowRects, outputRowRects;
 
     float totalW = ImGui::GetContentRegionAvail().x;
     const float SPLIT_W = 6.0f;
@@ -3750,6 +3817,74 @@ void GUIManager::renderRoutingPage() {
     }
     float middleW = totalW - m_routingLeftW - m_routingRightW - 2 * SPLIT_W;
     if (middleW < MIN_MID) middleW = MIN_MID;
+
+    // Meter-drawing helper — paints a dark navy background, a three-
+    // zone (green/yellow/red) RMS bar, and a thin bright peak-hold
+    // marker into the given rect. Also runs the per-input smoothing
+    // ballistics (RMS release ~100ms, peak hold 1.5s then linear
+    // decay ~600ms). Call this BEFORE the InputText widget so the
+    // meter sits behind the text.
+    auto drawInputMeter = [&](ImDrawList* mdl, ImVec2 fpos, float boxW, float boxH, int chan) {
+        // Dark navy background (always drawn).
+        mdl->AddRectFilled(fpos, ImVec2(fpos.x + boxW, fpos.y + boxH),
+                           IM_COL32(15, 30, 55, 255), 3.0f);
+        if (chan < 0) return;
+        if ((int)m_inputPeakHold.size() <= chan) {
+            m_inputPeakHold.resize(chan + 1, 0.0f);
+            m_inputPeakHoldMs.resize(chan + 1, 0.0f);
+            m_inputRMSSm.resize(chan + 1, 0.0f);
+        }
+        float instant = m_audioEngine->getInputMeter(chan);
+        float rms     = m_audioEngine->getInputMeterRMS(chan);
+        float dt      = ImGui::GetIO().DeltaTime;
+        // Peak hold + linear decay.
+        if (instant >= m_inputPeakHold[chan]) {
+            m_inputPeakHold[chan]   = instant;
+            m_inputPeakHoldMs[chan] = 1500.0f;
+        } else if (m_inputPeakHoldMs[chan] > 0.0f) {
+            m_inputPeakHoldMs[chan] -= dt * 1000.0f;
+        } else {
+            m_inputPeakHold[chan] -= dt * 1.67f;
+            if (m_inputPeakHold[chan] < 0.0f) m_inputPeakHold[chan] = 0.0f;
+        }
+        // RMS: instant attack, exponential release (~100ms tau).
+        if (rms > m_inputRMSSm[chan]) {
+            m_inputRMSSm[chan] = rms;
+        } else {
+            float a = dt / 0.1f;
+            if (a > 1.0f) a = 1.0f;
+            m_inputRMSSm[chan] += (rms - m_inputRMSSm[chan]) * a;
+        }
+        auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; };
+        float rmsD  = clamp01(m_inputRMSSm[chan]);
+        float peakD = clamp01(m_inputPeakHold[chan]);
+        // Three-zone RMS bar.
+        float boxL = fpos.x, boxT = fpos.y, boxB = fpos.y + boxH;
+        float rmsW = boxW * rmsD;
+        float yZ   = boxW * 0.70f;
+        float rZ   = boxW * 0.90f;
+        float gEnd = rmsW < yZ ? rmsW : yZ;
+        float yEnd = rmsW < rZ ? rmsW : rZ;
+        float rEnd = rmsW;
+        mdl->AddRectFilled(ImVec2(boxL, boxT),
+                           ImVec2(boxL + gEnd, boxB),
+                           IM_COL32(60, 190, 100, 150), 3.0f);
+        if (yEnd > yZ)
+            mdl->AddRectFilled(ImVec2(boxL + yZ, boxT),
+                               ImVec2(boxL + yEnd, boxB),
+                               IM_COL32(220, 200, 60, 170), 0.0f);
+        if (rEnd > rZ)
+            mdl->AddRectFilled(ImVec2(boxL + rZ, boxT),
+                               ImVec2(boxL + rEnd, boxB),
+                               IM_COL32(230, 80, 70, 190), 0.0f);
+        // Peak-hold marker — thin vertical line.
+        if (peakD > 0.005f) {
+            float px = boxL + boxW * peakD;
+            mdl->AddRectFilled(ImVec2(px - 1.0f, boxT),
+                               ImVec2(px + 1.0f, boxB),
+                               IM_COL32(240, 150, 40, 240));
+        }
+    };
 
     auto drawVSplitter = [&](const char* id, float* width, bool rightSide) {
         ImGui::InvisibleButton(id, ImVec2(SPLIT_W, contentH));
@@ -3791,14 +3926,41 @@ void GUIManager::renderRoutingPage() {
         bool isDragging = (peekPL && peekPL[0] == 0 && peekPL[1] == ch);
         bool isMouseDown = (activeId != 0 && activeId == ImGui::GetID(lbl));
         bool showOrange  = isMouseDown || isDragging;
+        bool isSelected  = std::find(m_routingSelectedInputs.begin(),
+                                     m_routingSelectedInputs.end(), ch)
+                           != m_routingSelectedInputs.end();
         if (showOrange) ImGui::PushStyleColor(ImGuiCol_Text, dragOrange);
-        // Match Selectable's height to the InputText frame height and
-        // vertically-centre its text so the "Input N" label lines up
-        // pixel-for-pixel with the name field's caret line.
         ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
         ImGui::Selectable(lbl, false, 0, ImVec2(labelW, rowH));
         ImGui::PopStyleVar();
         if (showOrange) ImGui::PopStyleColor();
+        ImVec2 rowMin = ImGui::GetItemRectMin();
+        // Click without drag → update selection (plain / Ctrl / Shift).
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            ImGuiIO& io = ImGui::GetIO();
+            if (io.KeyShift && m_routingLastInputClicked >= 0) {
+                int a = std::min(m_routingLastInputClicked, ch);
+                int b = std::max(m_routingLastInputClicked, ch);
+                m_routingSelectedInputs.clear();
+                for (int c = a; c <= b; c++) m_routingSelectedInputs.push_back(c);
+            } else if (io.KeyCtrl) {
+                auto it = std::find(m_routingSelectedInputs.begin(),
+                                    m_routingSelectedInputs.end(), ch);
+                if (it != m_routingSelectedInputs.end())
+                    m_routingSelectedInputs.erase(it);
+                else
+                    m_routingSelectedInputs.push_back(ch);
+            } else {
+                // If the clicked row is already in the multi-selection,
+                // KEEP the selection intact — clicking a selected row
+                // is how the user grabs the whole group to drag.
+                bool alreadyIn = std::find(m_routingSelectedInputs.begin(),
+                                           m_routingSelectedInputs.end(), ch)
+                                 != m_routingSelectedInputs.end();
+                if (!alreadyIn) m_routingSelectedInputs = { ch };
+            }
+            m_routingLastInputClicked = ch;
+        }
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID |
                                        ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
             int payload[2] = { 0, ch };   // 0 = Input kind
@@ -3810,17 +3972,47 @@ void GUIManager::renderRoutingPage() {
         // empty box is still clearly visible (theme's default FrameBg
         // is translucent, which reads as "no fill" over the routing
         // child's dark bg). Matches the track-properties frame tone.
-        ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.06f, 0.12f, 0.22f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.18f, 0.30f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0.14f, 0.22f, 0.36f, 1.0f));
         char nameBuf[64];
         const std::string& curName = m_audioEngine->getInputName(ch);
         snprintf(nameBuf, sizeof(nameBuf), "%s", curName.c_str());
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::InputText("##inName", nameBuf, sizeof(nameBuf))) {
+        // Draw the frame background + a live level bar BEFORE the
+        // InputText, then render the InputText with a fully-transparent
+        // FrameBg so the underlying bar shows through — text sits on top.
+        float boxWi = ImGui::GetContentRegionAvail().x;
+        float txtWi = ImGui::CalcTextSize(nameBuf).x;
+        ImVec2 padOi = ImGui::GetStyle().FramePadding;
+        float lpad = (boxWi - txtWi) * 0.5f;
+        if (lpad < padOi.x) lpad = padOi.x;
+        {
+            ImVec2 fpos = ImGui::GetCursorScreenPos();
+            float fH   = ImGui::GetFrameHeight();
+            drawInputMeter(ImGui::GetWindowDrawList(), fpos, boxWi, fH, ch);
+        }
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.18f, 0.30f, 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0.14f, 0.22f, 0.36f, 0.45f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(lpad, padOi.y));
+        ImGui::SetNextItemWidth(boxWi);
+        if (ImGui::InputText("##inName", nameBuf, sizeof(nameBuf),
+                             ImGuiInputTextFlags_CharsUppercase)) {
             m_audioEngine->setInputName(ch, std::string(nameBuf));
         }
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor(3);
+        // Capture the full row rect (from Selectable left through
+        // InputText right) — used by rubber-band commit + highlight.
+        ImVec2 rowMax = ImGui::GetItemRectMax();
+        PanelRowRect rr;
+        rr.ch = ch;
+        rr.mn = rowMin;
+        rr.mx = ImVec2(rowMax.x, std::max(rowMin.y, rowMax.y));
+        inputRowRects.push_back(rr);
+        if (isSelected) {
+            ImDrawList* sd = ImGui::GetWindowDrawList();
+            sd->AddRect(ImVec2(rr.mn.x - 1, rr.mn.y - 1),
+                        ImVec2(rr.mx.x + 1, rr.mx.y + 1),
+                        IM_COL32(240, 140, 40, 220), 2.0f, 0, 1.5f);
+        }
         // 1-pixel separator between rows.
         {
             ImDrawList* sd = ImGui::GetWindowDrawList();
@@ -3839,458 +4031,1153 @@ void GUIManager::renderRoutingPage() {
 
     // ---- MIDDLE: node canvas ----------------------------------------
     ImGui::BeginChild("routingCanvas", ImVec2(middleW, contentH), true);
-    {
+    if (!selTrack) {
+        ImVec2 av = ImGui::GetContentRegionAvail();
+        const char* msg = "Select a track to open its routing.";
+        ImVec2 ts = ImGui::CalcTextSize(msg);
+        ImGui::SetCursorPos(ImVec2((av.x - ts.x) * 0.5f,
+                                   (av.y - ts.y) * 0.5f));
+        ImGui::TextDisabled("%s", msg);
+    } else {
+        // Aliases into this track's routing state.
+        std::vector<RoutingNode>& nodes        = selTrack->routingNodes;
+        std::vector<int>&         inputCables  = selTrack->routingInputCables;
+        std::vector<OutputCable>& outputCables = selTrack->routingOutputCables;
+
+        // ---- Mode-select buttons at the top of the canvas ----
+        // Toggle the track's output-side configuration. Each mode keeps
+        // its own cable list, so switching preserves state.
+        {
+            const ImVec2 btnSz(110.0f, 32.0f);
+            const float  btnGap = 24.0f;
+            float totalW = btnSz.x * 3.0f + btnGap * 2.0f;
+            float avail  = ImGui::GetContentRegionAvail().x;
+            float leftX  = ImGui::GetCursorPosX() + std::max(0.0f, (avail - totalW) * 0.5f);
+            ImGui::SetCursorPosX(leftX);
+            auto modeBtn = [&](const char* lbl, int mode) {
+                bool active = (selTrack->routingOutputMode == mode);
+                if (active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.60f, 0.95f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.30f, 0.65f, 1.00f, 1.0f));
+                }
+                if (ImGui::Button(lbl, btnSz)) selTrack->routingOutputMode = mode;
+                if (active) ImGui::PopStyleColor(3);
+            };
+            modeBtn("MULTI",  0);
+            ImGui::SameLine(0, btnGap);
+            modeBtn("STEREO", 1);
+            ImGui::SameLine(0, btnGap);
+            modeBtn("MONO",   2);
+        }
+
         ImVec2 canvasPos = ImGui::GetCursorScreenPos();
         ImVec2 canvasSz  = ImGui::GetContentRegionAvail();
         if (canvasSz.x < 50) canvasSz.x = 50;
         if (canvasSz.y < 50) canvasSz.y = 50;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        // Faint background so the canvas reads as a separate zone.
         dl->AddRectFilled(canvasPos,
                           ImVec2(canvasPos.x + canvasSz.x,
                                  canvasPos.y + canvasSz.y),
                           IM_COL32(20, 22, 28, 255));
-
-        // InvisibleButton so the canvas can accept drops and hover.
         ImGui::InvisibleButton("routingCanvasArea", canvasSz);
-        bool canvasHovered = ImGui::IsItemHovered();
 
-        // Drop target: create a node at the drop position.
+        // First-time positioning of the track node — centre of canvas.
+        if (selTrack->routingTrackNodeX == 0.0f &&
+            selTrack->routingTrackNodeY == 0.0f) {
+            selTrack->routingTrackNodeX = canvasSz.x * 0.5f;
+            selTrack->routingTrackNodeY = canvasSz.y * 0.5f;
+        }
+
+        // Drop target for Input/Output pills from the side panels.
+        // If the user grabbed a channel that's part of a panel multi-
+        // selection, drop the WHOLE selection as a vertical stack from
+        // the drop point down — a shortcut for creating many nodes at
+        // once. The newly-created nodes become the canvas selection.
         if (ImGui::BeginDragDropTarget()) {
             const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ROUTING_NODE");
             if (p && p->DataSize == (int)sizeof(int) * 2) {
                 const int* pl = (const int*)p->Data;
-                RoutingNode n;
-                n.kind = (pl[0] == 0) ? RoutingNode::Kind::Input
-                                      : RoutingNode::Kind::Track;
-                n.channelOrTrack = pl[1];
+                int kind = pl[0];   // 0 = Input, 1 = Output
+                int ch   = pl[1];
+                std::vector<int>& sel = (kind == 0)
+                    ? m_routingSelectedInputs : m_routingSelectedOutputs;
+                std::vector<int> chansToPlace;
+                if (sel.size() > 1 &&
+                    std::find(sel.begin(), sel.end(), ch) != sel.end()) {
+                    chansToPlace = sel;
+                    std::sort(chansToPlace.begin(), chansToPlace.end());
+                } else {
+                    chansToPlace = { ch };
+                }
                 ImVec2 mp = ImGui::GetMousePos();
-                n.posX = mp.x - canvasPos.x;
-                n.posY = mp.y - canvasPos.y;
-                m_routingNodes.push_back(n);
+                m_routingSelectedNodes.clear();
+                const float V_STACK = 108.0f;   // double previous spacing
+                for (size_t i = 0; i < chansToPlace.size(); i++) {
+                    RoutingNode n;
+                    n.kind = (kind == 0) ? RoutingNode::Kind::Input
+                                         : RoutingNode::Kind::Output;
+                    n.channelOrTrack = chansToPlace[i];
+                    n.posX = mp.x - canvasPos.x;
+                    n.posY = (mp.y - canvasPos.y) + (float)i * V_STACK;
+                    nodes.push_back(n);
+                    m_routingSelectedNodes.push_back((int)nodes.size() - 1);
+                }
             }
             ImGui::EndDragDropTarget();
         }
 
-        // How many input ports does this track node have? Mirrors the
-        // track's OUTPUT config: mono output → 1 port, stereo → 2.
-        // Recording pipeline (once wired) will use the same count as
-        // the number of L/R sides on the destination.
-        auto trackNodePortCount = [&](int nodeIdx) -> int {
-            if (nodeIdx < 0 || nodeIdx >= (int)m_routingNodes.size()) return 2;
-            const RoutingNode& n = m_routingNodes[nodeIdx];
-            if (n.kind != RoutingNode::Kind::Track) return 1;
-            const Track* t = m_audioEngine->getTrack(n.channelOrTrack);
-            if (!t) return 2;
-            return t->outputMono ? 1 : 2;
-        };
-        // Label for a track node's input port at `side`. Uses the
-        // track's OUTPUT channel numbers so "the track that lives at
-        // channels 2 and 8" reads as 2/8 on BOTH its input and output.
-        auto trackNodePortLabel = [&](int nodeIdx, int side, char* buf, size_t bufSz) {
-            const RoutingNode& n = m_routingNodes[nodeIdx];
-            const Track* t = m_audioEngine->getTrack(n.channelOrTrack);
-            if (!t) { snprintf(buf, bufSz, "-"); return; }
-            if (t->outputMono) {
-                snprintf(buf, bufSz, "%d", t->outputMonoChan + 1);
-            } else {
-                int ch = (side == 0) ? t->outputLeftChan : t->outputRightChan;
-                snprintf(buf, bufSz, "%d", ch + 1);
-            }
-        };
-
-        // ---- Layout helpers (dynamic-height track nodes) ----
-        // A track node grows vertically to fit its cable stack. Each
-        // side (L/R on stereo, single on mono) is a "region" — a
-        // vertical column of blobs, one per connected cable, plus one
-        // hollow placeholder when empty so there's always something to
-        // drop onto.
-        const float NODE_W          = 110.0f;
-        const float INPUT_NODE_H    = 44.0f;
+        // ---- Layout constants ----
+        const float NODE_W          = 170.0f;
+        const float SIDE_NODE_H     = 44.0f;
+        // Side-node (Input/Output) internal layout: fixed-width label
+        // column on one side + text-box-styled name field on the other.
+        const float SIDE_INNER_PAD  = 6.0f;
+        const float SIDE_LABEL_W    = 60.0f;
+        const float SIDE_BLOB_PAD   = 10.0f;
         const float HEADER_H        = 20.0f;
-        const float DIVIDER_H       = 1.0f;
         const float REGION_PAD_TOP  = 14.0f;
         const float REGION_PAD_BOT  = 8.0f;
-        const float BLOB_STEP       = 14.0f;
+        const float BLOB_STEP       = 55.0f;   // +30% row height
         const float REGION_MIN_H    = 32.0f;
-        struct RegionRect { float startY, endY; int cableCount; };
-        struct TrackLayout { float totalH; int numRegions; RegionRect regs[2]; };
-        auto computeTrackLayout = [&](int nodeIdx) -> TrackLayout {
-            TrackLayout L{};
-            L.numRegions = trackNodePortCount(nodeIdx);
-            int perSide[2] = {0, 0};
-            for (const auto& c : m_routingCables) {
-                if (c.dstNode == nodeIdx && c.dstSide >= 0 && c.dstSide < 2)
-                    perSide[c.dstSide]++;
-            }
-            // Symmetric geometry: both regions get the SAME height, sized
-            // for whichever side has more cables (min one blob). Keeps
-            // the divider dead-centre and mirrors L/R visually.
-            int maxDisplay = 1;
-            for (int s = 0; s < L.numRegions; s++)
-                if (perSide[s] > maxDisplay) maxDisplay = perSide[s];
-            float regH = REGION_PAD_TOP + maxDisplay * BLOB_STEP + REGION_PAD_BOT;
-            if (regH < REGION_MIN_H) regH = REGION_MIN_H;
-            float y = HEADER_H;
-            for (int s = 0; s < L.numRegions; s++) {
-                L.regs[s].startY = y;
-                L.regs[s].endY = y + regH;
-                L.regs[s].cableCount = perSide[s];
-                y = L.regs[s].endY;
-                if (s + 1 < L.numRegions) y += DIVIDER_H;
-            }
-            L.totalH = y;
-            return L;
-        };
-        auto nodeRect = [&](int nodeIdx) -> std::pair<ImVec2, ImVec2> {
-            const RoutingNode& n = m_routingNodes[nodeIdx];
-            float cx = canvasPos.x + n.posX;
-            float cy = canvasPos.y + n.posY;
-            float h  = (n.kind == RoutingNode::Kind::Input)
-                     ? INPUT_NODE_H : computeTrackLayout(nodeIdx).totalH;
-            return { ImVec2(cx - NODE_W * 0.5f, cy - h * 0.5f),
-                     ImVec2(cx + NODE_W * 0.5f, cy + h * 0.5f) };
-        };
-        auto inputOutPortPos = [&](int nodeIdx) -> ImVec2 {
-            auto r = nodeRect(nodeIdx);
-            return ImVec2(r.second.x, (r.first.y + r.second.y) * 0.5f);
-        };
-        auto trackBlobPos = [&](int nodeIdx, int side, int slot) -> ImVec2 {
-            TrackLayout L = computeTrackLayout(nodeIdx);
-            auto r = nodeRect(nodeIdx);
-            return ImVec2(r.first.x,
-                          r.first.y + L.regs[side].startY + REGION_PAD_TOP
-                                    + slot * BLOB_STEP);
-        };
-        // Slot index per cable (in insertion order, per destination region).
-        std::vector<int> cableSlot(m_routingCables.size(), 0);
-        for (int ci = 0; ci < (int)m_routingCables.size(); ci++) {
-            const auto& c = m_routingCables[ci];
-            int slot = 0;
-            for (int cj = 0; cj < ci; cj++) {
-                const auto& p = m_routingCables[cj];
-                if (p.dstNode == c.dstNode && p.dstSide == c.dstSide) slot++;
-            }
-            cableSlot[ci] = slot;
-        }
-
-        // ---- Cables (behind nodes) ----
-        for (int ci = 0; ci < (int)m_routingCables.size(); ci++) {
-            const auto& cbl = m_routingCables[ci];
-            if (cbl.srcNode < 0 || cbl.srcNode >= (int)m_routingNodes.size()) continue;
-            if (cbl.dstNode < 0 || cbl.dstNode >= (int)m_routingNodes.size()) continue;
-            ImVec2 a = inputOutPortPos(cbl.srcNode);
-            ImVec2 b = trackBlobPos(cbl.dstNode, cbl.dstSide, cableSlot[ci]);
-            float dx = std::fabs(b.x - a.x) * 0.5f;
-            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
-                                  ImVec2(b.x - dx, b.y), b,
-                                  IM_COL32(230, 200, 80, 220), 2.5f, 24);
-        }
-        // In-progress cable body (arrowhead drawn after node loop).
-        if (m_routingDragFromNode >= 0 &&
-            m_routingDragFromNode < (int)m_routingNodes.size()) {
-            ImVec2 a = inputOutPortPos(m_routingDragFromNode);
-            ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
-            float dx = std::fabs(b.x - a.x) * 0.5f;
-            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
-                                  ImVec2(b.x - dx, b.y), b,
-                                  IM_COL32(230, 200, 80, 180), 2.0f, 24);
-        }
-
-        // ---- Draw nodes + detect hover ----
-        int  hoveredOutputNode = -1;    // input node whose out port is under mouse
-        int  hoveredBlobCable  = -1;    // cable whose blob is under mouse
-        int  hoveredRegionNode = -1;    // track node whose region contains mouse
-        int  hoveredRegionSide = 0;
-        ImVec2 mouse = ImGui::GetMousePos();
-        bool dragging = (m_routingDragFromNode >= 0);
         const ImU32 portOrange       = IM_COL32(240, 200,  60, 255);
         const ImU32 portBlue         = IM_COL32( 90, 170, 255, 255);
         const ImU32 portOrangeHollow = IM_COL32(240, 200,  60, 110);
 
-        for (int i = 0; i < (int)m_routingNodes.size(); i++) {
-            const RoutingNode& n = m_routingNodes[i];
-            auto r  = nodeRect(i);
+        // How many cables land on a given Output node — Output nodes
+        // grow like the old track's input side did (stack of blobs).
+        auto cablesToOutput = [&](int outputNodeIdx) -> int {
+            int c = 0;
+            for (const auto& oc : outputCables)
+                if (oc.outputNodeIdx == outputNodeIdx) c++;
+            return c;
+        };
+
+        // Stem count = number of input cables. Both sides of the track
+        // node get this many blobs (input-side blobs match inputCables
+        // by index; output-side blobs = the stem indices for output
+        // cabling).
+        int stemN = (int)inputCables.size();
+        // Always keep one extra row on the input side for the hollow
+        // "next connection" placeholder — the node grows by one BLOB_STEP
+        // each time a stem is added.
+        int rowsDisplay = stemN + 1;
+        float trackH = HEADER_H + REGION_PAD_TOP + rowsDisplay * BLOB_STEP + REGION_PAD_BOT;
+        if (trackH < REGION_MIN_H + HEADER_H) trackH = REGION_MIN_H + HEADER_H;
+
+        // Both Input and Output nodes use the same compact card — same
+        // width, same height, text centred. Only the blob position
+        // differs (Input has one on the right, Output has one on the
+        // left). Multiple cables landing on the same Output node all
+        // terminate at that single blob (they sum).
+        auto sideNodeRect = [&](int nodeIdx) -> std::pair<ImVec2, ImVec2> {
+            const RoutingNode& n = nodes[nodeIdx];
+            float cx = canvasPos.x + n.posX;
+            float cy = canvasPos.y + n.posY;
+            return { ImVec2(cx - NODE_W * 0.5f, cy - SIDE_NODE_H * 0.5f),
+                     ImVec2(cx + NODE_W * 0.5f, cy + SIDE_NODE_H * 0.5f) };
+        };
+        auto inputNodeOutPortPos = [&](int nodeIdx) -> ImVec2 {
+            auto r = sideNodeRect(nodeIdx);
+            return ImVec2(r.second.x, (r.first.y + r.second.y) * 0.5f);
+        };
+        auto outputNodeInPortPos = [&](int nodeIdx) -> ImVec2 {
+            auto r = sideNodeRect(nodeIdx);
+            return ImVec2(r.first.x, (r.first.y + r.second.y) * 0.5f);
+        };
+        auto trackNodeRect = [&]() -> std::pair<ImVec2, ImVec2> {
+            float cx = canvasPos.x + selTrack->routingTrackNodeX;
+            float cy = canvasPos.y + selTrack->routingTrackNodeY;
+            return { ImVec2(cx - NODE_W * 0.5f, cy - trackH * 0.5f),
+                     ImVec2(cx + NODE_W * 0.5f, cy + trackH * 0.5f) };
+        };
+        auto trackInputBlobPos = [&](int stem) -> ImVec2 {
+            auto r = trackNodeRect();
+            return ImVec2(r.first.x,
+                          r.first.y + HEADER_H + REGION_PAD_TOP + stem * BLOB_STEP);
+        };
+        auto trackOutputBlobPos = [&](int stem) -> ImVec2 {
+            auto r = trackNodeRect();
+            return ImVec2(r.second.x,
+                          r.first.y + HEADER_H + REGION_PAD_TOP + stem * BLOB_STEP);
+        };
+
+        // Which output-side mode is active for this track. Only MULTI
+        // draws/uses routingOutputCables; MONO uses routingMonoOutputs
+        // and displays a Mono Mixer node between stems and outputs.
+        bool modeMulti = (selTrack->routingOutputMode == 0);
+        bool modeMono  = (selTrack->routingOutputMode == 2);
+        // Default-position the mono mixer to the right of the track
+        // node the first time this mode is entered.
+        if (modeMono && selTrack->routingMixerX == 0.0f &&
+            selTrack->routingMixerY == 0.0f) {
+            selTrack->routingMixerX = selTrack->routingTrackNodeX + 220.0f;
+            selTrack->routingMixerY = selTrack->routingTrackNodeY;
+        }
+        // Mixer node uses the same height and row-Y layout as the
+        // track so its input blobs line up horizontally with the
+        // stems' output blobs — cables run straight across.
+        auto mixerRect = [&]() -> std::pair<ImVec2, ImVec2> {
+            float cx = canvasPos.x + selTrack->routingMixerX;
+            float cy = canvasPos.y + selTrack->routingMixerY;
+            return { ImVec2(cx - NODE_W * 0.5f, cy - trackH * 0.5f),
+                     ImVec2(cx + NODE_W * 0.5f, cy + trackH * 0.5f) };
+        };
+        auto mixerInPos = [&](int stem) -> ImVec2 {
+            auto r = mixerRect();
+            return ImVec2(r.first.x,
+                          r.first.y + HEADER_H + REGION_PAD_TOP + stem * BLOB_STEP);
+        };
+        auto mixerOutPos = [&]() -> ImVec2 {
+            auto r = mixerRect();
+            return ImVec2(r.second.x, (r.first.y + r.second.y) * 0.5f);
+        };
+
+        // Stem flow-trace lambda — for each stem row: either draw a
+        // compact per-channel waveform (once audio has been captured
+        // into that channel of the track), or fall back to a dotted
+        // orange trace. Placeholder row (s == stemN) always gets the
+        // dimmer dashed line.
+        auto drawStemTraces = [&]() {
+            const ImU32 traceCol     = IM_COL32(240, 170, 50, 220);
+            const ImU32 tracePlaceCol = IM_COL32(240, 170, 50, 110);
+            const ImU32 wfCol         = IM_COL32(240, 170, 50, 220);
+            const float dashLen  = 3.0f;
+            const float gapLen   = 3.0f;
+            size_t totalFrames = selTrack->getTotalFrames();
+            int    audioChans  = selTrack->channels;
+            for (int s = 0; s <= stemN; s++) {
+                ImVec2 a = trackInputBlobPos(s);
+                ImVec2 b = trackOutputBlobPos(s);
+                bool hasWave = (s < stemN) && (s < audioChans) &&
+                               (totalFrames > 0);
+                if (hasWave) {
+                    // Down-sampled envelope: 1 vertical line per pixel
+                    // column across the node, sparse-sampled to keep
+                    // the per-frame cost trivial.
+                    float halfMax = BLOB_STEP * 0.80f;   // 2× waveform gain
+                    int nB = (int)(b.x - a.x);
+                    if (nB < 1) nB = 1;
+                    for (int bx = 0; bx < nB; bx++) {
+                        size_t sf = (totalFrames * (size_t)bx) / (size_t)nB;
+                        size_t ef = (totalFrames * (size_t)(bx + 1)) / (size_t)nB;
+                        if (ef <= sf) ef = sf + 1;
+                        int step = (int)((ef - sf) / 8);
+                        if (step < 1) step = 1;
+                        float lo = 0.0f, hi = 0.0f;
+                        for (size_t f = sf; f < ef; f += step) {
+                            float v = selTrack->getSample(f, s);
+                            if (v < lo) lo = v;
+                            if (v > hi) hi = v;
+                        }
+                        float x = a.x + (float)bx;
+                        float y1 = a.y + lo * halfMax;
+                        float y2 = a.y + hi * halfMax;
+                        if (y2 - y1 < 1.0f) { y1 -= 0.5f; y2 += 0.5f; }
+                        dl->AddLine(ImVec2(x, y1), ImVec2(x, y2), wfCol, 1.0f);
+                    }
+                } else {
+                    ImU32 col = (s < stemN) ? traceCol : tracePlaceCol;
+                    float x = a.x;
+                    while (x < b.x) {
+                        float x2 = x + dashLen;
+                        if (x2 > b.x) x2 = b.x;
+                        dl->AddLine(ImVec2(x, a.y), ImVec2(x2, a.y),
+                                    col, 1.5f);
+                        x = x2 + gapLen;
+                    }
+                }
+            }
+        };
+
+        // ---- Cables (behind nodes) ----
+        // Input cables: Input node's out port → track's stem input blob.
+        for (int si = 0; si < stemN; si++) {
+            int inNode = inputCables[si];
+            if (inNode < 0 || inNode >= (int)nodes.size()) continue;
+            if (nodes[inNode].kind != RoutingNode::Kind::Input) continue;
+            ImVec2 a = inputNodeOutPortPos(inNode);
+            ImVec2 b = trackInputBlobPos(si);
+            float dx = (b.x - a.x) * 0.5f;   // signed — mirrors on back-drags
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(230, 200, 80, 220), 2.5f, 24);
+        }
+        // Output cables (MULTI mode only): track's stem output blob →
+        // Output node's single blob. Multiple cables landing on the
+        // same output all terminate at the one blob (they sum).
+        if (modeMulti) {
+            for (int oi = 0; oi < (int)outputCables.size(); oi++) {
+                const auto& oc = outputCables[oi];
+                if (oc.outputNodeIdx < 0 || oc.outputNodeIdx >= (int)nodes.size()) continue;
+                if (nodes[oc.outputNodeIdx].kind != RoutingNode::Kind::Output) continue;
+                if (oc.stemIdx < 0 || oc.stemIdx >= stemN) continue;
+                ImVec2 a = trackOutputBlobPos(oc.stemIdx);
+                ImVec2 b = outputNodeInPortPos(oc.outputNodeIdx);
+                float dx = (b.x - a.x) * 0.5f;
+                dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                      ImVec2(b.x - dx, b.y), b,
+                                      IM_COL32(160, 220, 130, 220), 2.5f, 24);
+            }
+        }
+        // MONO mode: one cable per stem from the stem's output blob
+        // to its own dedicated blob on the mixer (same yellow style
+        // as input cables), plus user-created mono cables from the
+        // mixer output → Output nodes (green like other output cables).
+        if (modeMono) {
+            ImVec2 mOut = mixerOutPos();
+            for (int s = 0; s < stemN; s++) {
+                ImVec2 a = trackOutputBlobPos(s);
+                ImVec2 b = mixerInPos(s);
+                float dx = (b.x - a.x) * 0.5f;
+                dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                      ImVec2(b.x - dx, b.y), b,
+                                      IM_COL32(230, 200, 80, 220), 2.5f, 24);
+            }
+            for (int outNodeIdx : selTrack->routingMonoOutputs) {
+                if (outNodeIdx < 0 || outNodeIdx >= (int)nodes.size()) continue;
+                if (nodes[outNodeIdx].kind != RoutingNode::Kind::Output) continue;
+                ImVec2 b = outputNodeInPortPos(outNodeIdx);
+                float dx = (b.x - mOut.x) * 0.5f;
+                dl->AddBezierCubic(mOut, ImVec2(mOut.x + dx, mOut.y),
+                                        ImVec2(b.x - dx, b.y), b,
+                                        IM_COL32(160, 220, 130, 220), 2.5f, 24);
+            }
+        }
+        // In-progress input cable (dragging from an Input node).
+        if (m_routingDragFromNode >= 0 &&
+            m_routingDragFromNode < (int)nodes.size()) {
+            ImVec2 a = inputNodeOutPortPos(m_routingDragFromNode);
+            ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
+            float dx = (b.x - a.x) * 0.5f;   // signed — mirrors on back-drags
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(230, 200, 80, 180), 2.0f, 24);
+        }
+        // In-progress output cable (dragging from a track output port,
+        // including the placeholder at stemN).
+        if (m_routingDragFromStem >= 0 && m_routingDragFromStem <= stemN) {
+            ImVec2 a = trackOutputBlobPos(m_routingDragFromStem);
+            ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
+            float dx = (b.x - a.x) * 0.5f;   // signed — mirrors on back-drags
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(160, 220, 130, 180), 2.0f, 24);
+        }
+        // In-progress reverse-input cable (dragging FROM a track input
+        // placeholder blob toward an Input node).
+        if (m_routingRevInputDrag >= 0 && m_routingRevInputDrag <= stemN) {
+            ImVec2 a = trackInputBlobPos(m_routingRevInputDrag);
+            ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
+            float dx = (b.x - a.x) * 0.5f;   // signed — mirrors on back-drags
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(230, 200, 80, 180), 2.0f, 24);
+        }
+        // In-progress reverse-output cable (dragging FROM an Output
+        // node's blob toward a track output blob).
+        if (m_routingRevOutputDrag >= 0 &&
+            m_routingRevOutputDrag < (int)nodes.size()) {
+            ImVec2 a = outputNodeInPortPos(m_routingRevOutputDrag);
+            ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
+            float dx = (b.x - a.x) * 0.5f;   // signed — mirrors on back-drags
+            dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                  ImVec2(b.x - dx, b.y), b,
+                                  IM_COL32(160, 220, 130, 180), 2.0f, 24);
+        }
+
+        // ---- Draw nodes + detect hover ----
+        int   hoveredInputNodeOut = -1;   // hover on an Input node's out port
+        int   hoveredTrackInStem  = -1;   // hover on track's stem input blob (has a cable)
+        int   hoveredTrackInEmpty = -1;   // hover on empty input blob (placeholder or -1 stem)
+        int   hoveredTrackOutStem = -1;   // hover on track's stem output blob
+        int   hoveredOutputNode   = -1;   // hover on Output node's region (any blob)
+        int   hoveredOutputBlob   = -1;   // hover on Output blob AND blob has a cable (pickup)
+        int   hoveredOutputDrop   = -1;   // hover on Output blob regardless of state (drop)
+        int   hoveredOutputRev    = -1;   // hover on unconnected Output blob (rev-drag start)
+        bool  hoveredMixerOut     = false;   // MONO mode: hover on mixer's OUT blob
+        bool  mouseOverNodeText   = false;   // mouse is over any node's InputText (blocks node-select)
+        bool  overTrackInputRegion  = false;
+        bool  overTrackOutputRegion = false;
+        ImVec2 mouse = ImGui::GetMousePos();
+        bool canvasMouseIn =
+            mouse.x >= canvasPos.x && mouse.x < canvasPos.x + canvasSz.x &&
+            mouse.y >= canvasPos.y && mouse.y < canvasPos.y + canvasSz.y;
+        bool draggingInput  = (m_routingDragFromNode >= 0);
+        bool draggingOutput = (m_routingDragFromStem >= 0);
+        bool draggingRevIn  = (m_routingRevInputDrag >= 0);
+        bool draggingRevOut = (m_routingRevOutputDrag >= 0);
+
+        // Draw side (Input/Output) nodes.
+        for (int i = 0; i < (int)nodes.size(); i++) {
+            const RoutingNode& n = nodes[i];
+            auto r  = sideNodeRect(i);
             ImVec2 tl = r.first, br = r.second;
             ImU32 fill = (n.kind == RoutingNode::Kind::Input)
                        ? IM_COL32(45, 80, 130, 240)
-                       : IM_COL32(120, 55, 55, 240);
+                       : IM_COL32(45, 130, 80, 240);
             dl->AddRectFilled(tl, br, fill, 6.0f);
             dl->AddRect(tl, br, IM_COL32(200, 200, 200, 180), 6.0f, 0, 1.5f);
+            // Bright white outline for selected nodes.
+            bool isSel = false;
+            for (int si : m_routingSelectedNodes)
+                if (si == i) { isSel = true; break; }
+            if (isSel) {
+                dl->AddRect(ImVec2(tl.x - 1, tl.y - 1),
+                            ImVec2(br.x + 1, br.y + 1),
+                            IM_COL32(255, 255, 255, 245), 6.0f, 0, 2.5f);
+            }
+            char lbl[32];
+            if (n.kind == RoutingNode::Kind::Input) {
+                snprintf(lbl, sizeof(lbl), "Input %d", n.channelOrTrack + 1);
+            } else {
+                snprintf(lbl, sizeof(lbl), "Output %d", n.channelOrTrack + 1);
+            }
+            const std::string& userName =
+                (n.kind == RoutingNode::Kind::Input)
+                    ? m_audioEngine->getInputName(n.channelOrTrack)
+                    : m_audioEngine->getOutputName(n.channelOrTrack);
+            ImVec2 ts = ImGui::CalcTextSize(lbl);
+            // Two-column layout — label on one side, real editable
+            // InputText (dark-navy fill, matching the panel style) on
+            // the other. Mirrored between Input and Output so the blob
+            // (port) never overlaps the label.
+            (void)userName;   // consumed by drawNodeNameField below
+            float labelY = (tl.y + br.y) * 0.5f - ts.y * 0.5f;
+            float boxH   = ImGui::GetFrameHeight();
+            float boxT   = (tl.y + br.y) * 0.5f - boxH * 0.5f;
+
+            auto drawNodeNameField = [&](float boxL, float boxR) {
+                if (boxR <= boxL + 8) return;
+                ImGui::PushID(2000 + i);
+                const std::string& cur = (n.kind == RoutingNode::Kind::Input)
+                                        ? m_audioEngine->getInputName(n.channelOrTrack)
+                                        : m_audioEngine->getOutputName(n.channelOrTrack);
+                char nBuf[64];
+                snprintf(nBuf, sizeof(nBuf), "%s", cur.c_str());
+                float boxWn  = boxR - boxL;
+                float boxHn  = ImGui::GetFrameHeight();
+                float txtWn  = ImGui::CalcTextSize(nBuf).x;
+                ImVec2 padOn = ImGui::GetStyle().FramePadding;
+                float lpn    = (boxWn - txtWn) * 0.5f;
+                if (lpn < padOn.x) lpn = padOn.x;
+                // Background + live level bar (Input nodes only) drawn
+                // BEFORE the InputText, which then uses a transparent
+                // FrameBg so the meter shows through.
+                ImVec2 fpos(boxL, boxT);
+                drawInputMeter(dl, fpos, boxWn, boxHn,
+                               (n.kind == RoutingNode::Kind::Input)
+                                   ? n.channelOrTrack : -1);
+                ImGui::SetCursorScreenPos(fpos);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(lpn, padOn.y));
+                ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.18f, 0.30f, 0.35f));
+                ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0.14f, 0.22f, 0.36f, 0.45f));
+                ImGui::SetNextItemWidth(boxWn);
+                if (ImGui::InputText("##nodeName", nBuf, sizeof(nBuf),
+                                     ImGuiInputTextFlags_CharsUppercase)) {
+                    if (n.kind == RoutingNode::Kind::Input)
+                        m_audioEngine->setInputName(n.channelOrTrack, std::string(nBuf));
+                    else
+                        m_audioEngine->setOutputName(n.channelOrTrack, std::string(nBuf));
+                }
+                if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    mouseOverNodeText = true;
+                ImGui::PopStyleColor(3);
+                ImGui::PopStyleVar();
+                ImGui::PopID();
+            };
 
             if (n.kind == RoutingNode::Kind::Input) {
-                char lbl[32];
-                snprintf(lbl, sizeof(lbl), "Input %d", n.channelOrTrack + 1);
-                ImVec2 ts = ImGui::CalcTextSize(lbl);
-                dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f,
-                                   (tl.y+br.y)*0.5f - ts.y*0.5f),
-                            IM_COL32_WHITE, lbl);
-                ImVec2 p = inputOutPortPos(i);
-                bool hoveredHere = canvasHovered &&
-                    std::fabs(mouse.x - p.x) < 8 && std::fabs(mouse.y - p.y) < 8;
-                dl->AddCircleFilled(p, 5.0f,
-                    (dragging && hoveredHere) ? portBlue : portOrange, 12);
-                if (hoveredHere) hoveredOutputNode = i;
-                continue;
+                float labelX = tl.x + SIDE_INNER_PAD;
+                float boxL   = labelX + SIDE_LABEL_W + SIDE_INNER_PAD;
+                float boxR   = br.x - SIDE_BLOB_PAD;
+                dl->AddText(ImVec2(labelX, labelY), IM_COL32_WHITE, lbl);
+                drawNodeNameField(boxL, boxR);
+            } else {
+                float labelX = br.x - SIDE_INNER_PAD - ts.x;
+                float boxL   = tl.x + SIDE_BLOB_PAD;
+                float boxR   = labelX - SIDE_INNER_PAD;
+                dl->AddText(ImVec2(labelX, labelY), IM_COL32_WHITE, lbl);
+                drawNodeNameField(boxL, boxR);
             }
-
-            // Track node: header + one or two regions with stacked blobs.
-            const Track* t = m_audioEngine->getTrack(n.channelOrTrack);
-            char titleLbl[64];
-            snprintf(titleLbl, sizeof(titleLbl), "%s",
-                     t ? t->name.c_str() : "(track)");
-            ImVec2 ts = ImGui::CalcTextSize(titleLbl);
-            dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f, tl.y + 4),
-                        IM_COL32_WHITE, titleLbl);
-
-            TrackLayout L = computeTrackLayout(i);
-            for (int s = 0; s < L.numRegions; s++) {
-                float regTop = tl.y + L.regs[s].startY;
-                float regBot = tl.y + L.regs[s].endY;
-                if (s > 0) {
-                    dl->AddLine(ImVec2(tl.x + 4, regTop - 0.5f),
-                                ImVec2(br.x - 4, regTop - 0.5f),
-                                IM_COL32(200, 200, 200, 140), 1.0f);
-                }
-                // Region port label (top-right of region).
-                char portLbl[16];
-                trackNodePortLabel(i, s, portLbl, sizeof(portLbl));
-                char full[24];
-                snprintf(full, sizeof(full), "In %s", portLbl);
-                ImVec2 pts = ImGui::CalcTextSize(full);
-                dl->AddText(ImVec2(br.x - pts.x - 6, regTop + 3),
-                            IM_COL32(220, 220, 220, 220), full);
-                bool mouseInRegion = canvasHovered &&
+            if (n.kind == RoutingNode::Kind::Input) {
+                ImVec2 p = inputNodeOutPortPos(i);
+                bool hh = canvasMouseIn &&
+                    std::fabs(mouse.x - p.x) < 14 &&
+                    std::fabs(mouse.y - p.y) < 14;
+                dl->AddCircleFilled(p, 5.0f,
+                    ((draggingInput || draggingRevIn) && hh) ? portBlue : portOrange, 12);
+                if (hh) hoveredInputNodeOut = i;
+            } else {
+                ImVec2 p = outputNodeInPortPos(i);
+                int cnt = cablesToOutput(i);
+                bool connected  = (cnt > 0);
+                bool nodeMouseIn = canvasMouseIn &&
                     mouse.x >= tl.x && mouse.x <= br.x &&
-                    mouse.y >= regTop && mouse.y <= regBot;
-                int displayCount = (L.regs[s].cableCount > 0)
-                                 ? L.regs[s].cableCount : 1;
-                for (int slot = 0; slot < displayCount; slot++) {
-                    ImVec2 p = trackBlobPos(i, s, slot);
-                    int cableIdx = -1;
-                    for (int ci = 0; ci < (int)m_routingCables.size(); ci++) {
-                        const auto& c = m_routingCables[ci];
-                        if (c.dstNode == i && c.dstSide == s &&
-                            cableSlot[ci] == slot) {
-                            cableIdx = ci;
-                            break;
-                        }
-                    }
-                    bool blobHovered = canvasHovered &&
-                        std::fabs(mouse.x - p.x) < 8 &&
-                        std::fabs(mouse.y - p.y) < 8;
-                    if (blobHovered && cableIdx >= 0) hoveredBlobCable = cableIdx;
-                    if (cableIdx >= 0) {
-                        dl->AddCircleFilled(p, 5.0f,
-                            (dragging && blobHovered) ? portBlue : portOrange, 12);
-                    } else if (dragging && mouseInRegion) {
-                        // Empty placeholder while dragging over the
-                        // region — solid blue so it reads as "drop
-                        // here" (matches an existing-blob hover).
-                        dl->AddCircleFilled(p, 5.0f, portBlue, 12);
-                    } else {
-                        // Idle empty placeholder — hollow orange.
-                        dl->AddCircle(p, 5.0f, portOrangeHollow, 12, 1.5f);
-                    }
-                }
-                if (mouseInRegion) {
-                    hoveredRegionNode = i;
-                    hoveredRegionSide = s;
-                }
+                    mouse.y >= tl.y && mouse.y <= br.y;
+                bool blobHovered = canvasMouseIn &&
+                    std::fabs(mouse.x - p.x) < 14 &&
+                    std::fabs(mouse.y - p.y) < 14;
+                // Always solid orange (matches input node's blob look);
+                // turns blue when a drag drops directly on THIS blob.
+                ImU32 col = portOrange;
+                if (draggingOutput && blobHovered) col = portBlue;
+                dl->AddCircleFilled(p, 5.0f, col, 12);
+                if (nodeMouseIn)               hoveredOutputNode = i;
+                if (blobHovered)               hoveredOutputDrop = i;
+                if (blobHovered && connected)  hoveredOutputBlob = i;   // pickup path
+                if (blobHovered && !connected) hoveredOutputRev  = i;   // rev-drag start
             }
         }
 
-        // Drag-drop ghost: peek at any in-flight ROUTING_NODE payload
-        // and draw a greyscale preview of the node exactly where the
-        // cursor is. On drop the real node lands centred on the same
-        // cursor position, so "what you see" is "what you get" — no
-        // shift between preview and placed node.
+        // Draw the pinned track node.
+        {
+            auto r = trackNodeRect();
+            ImVec2 tl = r.first, br = r.second;
+            dl->AddRectFilled(tl, br, IM_COL32(120, 55, 55, 240), 6.0f);
+            dl->AddRect(tl, br, IM_COL32(200, 200, 200, 180), 6.0f, 0, 1.5f);
+            char titleLbl[64];
+            snprintf(titleLbl, sizeof(titleLbl), "%s", selTrack->name.c_str());
+            ImVec2 ts = ImGui::CalcTextSize(titleLbl);
+            dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f, tl.y + 4),
+                        IM_COL32_WHITE, titleLbl);
+            // Stem flow trace — on top of the body fill, under the blobs.
+            drawStemTraces();
+            // Left column: N filled input blobs (one per stem) PLUS one
+            // hollow placeholder at slot stemN — always visible so the
+            // user has an obvious drop target for the NEXT connection.
+            // Drop-detection is a CIRCLE centred on the placeholder blob
+            // (14-px radius, matching every other blob's hit tolerance)
+            // so the drop zone reads visually as the blob itself.
+            {
+                int disp = stemN + 1;   // real stems + one placeholder
+                for (int s = 0; s < disp; s++) {
+                    ImVec2 p = trackInputBlobPos(s);
+                    bool cabled = (s < stemN && inputCables[s] >= 0);
+                    bool bh = canvasMouseIn &&
+                        std::fabs(mouse.x - p.x) < 14 &&
+                        std::fabs(mouse.y - p.y) < 14;
+                    if (cabled) {
+                        dl->AddCircleFilled(p, 5.0f,
+                            (draggingInput && bh) ? portBlue : portOrange, 12);
+                        if (bh) hoveredTrackInStem = s;
+                    } else if (draggingInput && bh) {
+                        // Empty blob = drop target while a forward
+                        // input cable is being dragged in.
+                        dl->AddCircleFilled(p, 5.0f, portBlue, 12);
+                        overTrackInputRegion = true;
+                        if (s == stemN) hoveredTrackInEmpty = s;
+                    } else {
+                        dl->AddCircle(p, 5.0f, portOrangeHollow, 12, 1.5f);
+                        if (bh) hoveredTrackInEmpty = s;
+                    }
+                }
+            }
+            // Right column: N solid output blobs (one per stem) PLUS one
+            // hollow placeholder at slot stemN — always visible so the
+            // user can start wiring from the output side even before
+            // any input is connected (bidirectional flow).
+            {
+                int disp = stemN + 1;
+                for (int s = 0; s < disp; s++) {
+                    ImVec2 p = trackOutputBlobPos(s);
+                    bool valid = (s < stemN);
+                    bool bh = canvasMouseIn &&
+                        std::fabs(mouse.x - p.x) < 14 &&
+                        std::fabs(mouse.y - p.y) < 14;
+                    if (valid) {
+                        ImU32 col = ((draggingOutput || draggingRevOut) && bh)
+                                    ? portBlue : portOrange;
+                        dl->AddCircleFilled(p, 5.0f, col, 12);
+                    } else if (draggingRevOut && bh) {
+                        // Placeholder turns solid blue as a drop target
+                        // for a reverse-output drag.
+                        dl->AddCircleFilled(p, 5.0f, portBlue, 12);
+                    } else {
+                        dl->AddCircle(p, 5.0f, portOrangeHollow, 12, 1.5f);
+                    }
+                    if (bh) hoveredTrackOutStem = s;
+                }
+            }
+            overTrackOutputRegion = canvasMouseIn &&
+                mouse.x >= (tl.x + br.x) * 0.5f && mouse.x <= br.x &&
+                mouse.y >= tl.y + HEADER_H && mouse.y <= br.y;
+        }
+
+        // Drag-drop ghost — greyscale preview of the Input/Output pill
+        // floating at the cursor. If the drag started from a row that's
+        // part of a panel MULTI-selection, draw one ghost per selected
+        // channel, stacked vertically with the same spacing the drop
+        // will use — so the drag preview matches the drop layout.
         {
             const ImGuiPayload* peek = ImGui::GetDragDropPayload();
             if (peek && peek->IsDataType("ROUTING_NODE") &&
                 peek->DataSize == (int)sizeof(int) * 2) {
-                // Foreground drawlist so the ghost renders ON TOP of
-                // every window — visible whether the cursor is over
-                // the middle canvas, the input list on the left, or
-                // the track list on the right.
                 ImDrawList* fg = ImGui::GetForegroundDrawList();
                 const int* pl = (const int*)peek->Data;
-                int prevKind = pl[0];   // 0 = Input, 1 = Track
+                int prevKind = pl[0];   // 0 = Input, 1 = Output
                 int prevIdx  = pl[1];
-                float w = NODE_W;
-                float h = INPUT_NODE_H;
-                int numRegions = 1;
-                const Track* pt = nullptr;
-                if (prevKind == 1) {
-                    pt = m_audioEngine->getTrack(prevIdx);
-                    numRegions = (pt && pt->outputMono) ? 1 : 2;
-                    float regH = REGION_PAD_TOP + BLOB_STEP + REGION_PAD_BOT;
-                    if (regH < REGION_MIN_H) regH = REGION_MIN_H;
-                    h = HEADER_H + numRegions * regH
-                              + (numRegions - 1) * DIVIDER_H;
-                }
-                ImVec2 gtl(mouse.x - w * 0.5f, mouse.y - h * 0.5f);
-                ImVec2 gbr(mouse.x + w * 0.5f, mouse.y + h * 0.5f);
-                ImU32 gFill = (prevKind == 0)
-                            ? IM_COL32( 85,  85,  85, 220)
-                            : IM_COL32(110, 110, 110, 220);
-                ImU32 gEdge = IM_COL32(190, 190, 190, 200);
-                ImU32 gText = IM_COL32(215, 215, 215, 230);
-                ImU32 gPort = IM_COL32(180, 180, 180, 210);
-                fg->AddRectFilled(gtl, gbr, gFill, 6.0f);
-                fg->AddRect(gtl, gbr, gEdge, 6.0f, 0, 1.5f);
-                char lbl[64];
-                if (prevKind == 0) {
-                    snprintf(lbl, sizeof(lbl), "Input %d", prevIdx + 1);
-                    ImVec2 ts = ImGui::CalcTextSize(lbl);
-                    fg->AddText(ImVec2((gtl.x+gbr.x)*0.5f - ts.x*0.5f,
-                                       (gtl.y+gbr.y)*0.5f - ts.y*0.5f),
-                                gText, lbl);
-                    fg->AddCircleFilled(ImVec2(gbr.x,
-                                               (gtl.y+gbr.y)*0.5f),
-                                        5.0f, gPort, 12);
+                // Enumerate channels to preview.
+                const std::vector<int>& sel = (prevKind == 0)
+                    ? m_routingSelectedInputs : m_routingSelectedOutputs;
+                std::vector<int> chans;
+                if (sel.size() > 1 &&
+                    std::find(sel.begin(), sel.end(), prevIdx) != sel.end()) {
+                    chans = sel;
+                    std::sort(chans.begin(), chans.end());
                 } else {
-                    snprintf(lbl, sizeof(lbl), "%s",
-                             pt ? pt->name.c_str() : "(track)");
+                    chans = { prevIdx };
+                }
+                const float w = NODE_W;
+                const float h = SIDE_NODE_H;
+                // While the cursor is over a side panel, use the panel's
+                // own row-to-row spacing so the ghosts appear stacked
+                // exactly like they sit in the list (overlapping into
+                // a fan of pills). The moment the cursor enters the
+                // canvas rect, they snap to the wide 108-px drop layout.
+                bool overCanvas =
+                    mouse.x >= canvasPos.x && mouse.x < canvasPos.x + canvasSz.x &&
+                    mouse.y >= canvasPos.y && mouse.y < canvasPos.y + canvasSz.y;
+                // Non-overlapping stack while over a side panel — each
+                // ghost sits just below the previous with a 4-px gap.
+                const float V_STACK = overCanvas ? 108.0f : (h + 4.0f);
+                ImU32 gFill = (prevKind == 0)
+                            ? IM_COL32( 65,  90, 130, 220)
+                            : IM_COL32( 65, 130,  90, 220);
+                ImU32 gEdge = IM_COL32(200, 200, 200, 210);
+                ImU32 gText = IM_COL32(230, 230, 230, 230);
+                ImU32 boxFill = IM_COL32(15, 30, 55, 220);
+                ImU32 boxEdge = IM_COL32(80, 100, 130, 160);
+                for (size_t gi = 0; gi < chans.size(); gi++) {
+                    int c = chans[gi];
+                    float cy = mouse.y + (float)gi * V_STACK;
+                    ImVec2 gtl(mouse.x - w * 0.5f, cy - h * 0.5f);
+                    ImVec2 gbr(mouse.x + w * 0.5f, cy + h * 0.5f);
+                    fg->AddRectFilled(gtl, gbr, gFill, 6.0f);
+                    fg->AddRect(gtl, gbr, gEdge, 6.0f, 0, 1.5f);
+                    char lbl[32];
+                    snprintf(lbl, sizeof(lbl),
+                             (prevKind == 0) ? "Input %d" : "Output %d", c + 1);
+                    const std::string& userName =
+                        (prevKind == 0) ? m_audioEngine->getInputName(c)
+                                        : m_audioEngine->getOutputName(c);
                     ImVec2 ts = ImGui::CalcTextSize(lbl);
-                    fg->AddText(ImVec2((gtl.x+gbr.x)*0.5f - ts.x*0.5f,
-                                       gtl.y + 4),
-                                gText, lbl);
-                    float regH = REGION_PAD_TOP + BLOB_STEP + REGION_PAD_BOT;
-                    if (regH < REGION_MIN_H) regH = REGION_MIN_H;
-                    for (int s = 0; s < numRegions; s++) {
-                        float regTop = gtl.y + HEADER_H + s * (regH + DIVIDER_H);
-                        if (s > 0) {
-                            fg->AddLine(ImVec2(gtl.x + 4, regTop - 0.5f),
-                                        ImVec2(gbr.x - 4, regTop - 0.5f),
-                                        IM_COL32(200,200,200,140), 1.0f);
+                    float labelY = (gtl.y + gbr.y) * 0.5f - ts.y * 0.5f;
+                    float boxH   = ImGui::GetFrameHeight();
+                    float boxT   = (gtl.y + gbr.y) * 0.5f - boxH * 0.5f;
+                    if (prevKind == 0) {
+                        float labelX = gtl.x + SIDE_INNER_PAD;
+                        float boxL   = labelX + SIDE_LABEL_W + SIDE_INNER_PAD;
+                        float boxR   = gbr.x - SIDE_BLOB_PAD;
+                        fg->AddText(ImVec2(labelX, labelY), gText, lbl);
+                        if (boxR > boxL + 8) {
+                            fg->AddRectFilled(ImVec2(boxL, boxT),
+                                ImVec2(boxR, boxT + boxH), boxFill, 3.0f);
+                            fg->AddRect(ImVec2(boxL, boxT),
+                                ImVec2(boxR, boxT + boxH), boxEdge, 3.0f, 0, 1.0f);
+                            if (!userName.empty()) {
+                                fg->PushClipRect(ImVec2(boxL, boxT),
+                                                 ImVec2(boxR, boxT + boxH), true);
+                                fg->AddText(ImVec2(boxL + 4, boxT + 3),
+                                            gText, userName.c_str());
+                                fg->PopClipRect();
+                            }
                         }
-                        if (pt) {
-                            char portLbl[24];
-                            int ch = pt->outputMono
-                                     ? pt->outputMonoChan
-                                     : (s == 0 ? pt->outputLeftChan
-                                               : pt->outputRightChan);
-                            snprintf(portLbl, sizeof(portLbl), "In %d", ch + 1);
-                            ImVec2 pts = ImGui::CalcTextSize(portLbl);
-                            fg->AddText(ImVec2(gbr.x - pts.x - 6, regTop + 3),
-                                        gText, portLbl);
+                    } else {
+                        float labelX = gbr.x - SIDE_INNER_PAD - ts.x;
+                        float boxL   = gtl.x + SIDE_BLOB_PAD;
+                        float boxR   = labelX - SIDE_INNER_PAD;
+                        fg->AddText(ImVec2(labelX, labelY), gText, lbl);
+                        if (boxR > boxL + 8) {
+                            fg->AddRectFilled(ImVec2(boxL, boxT),
+                                ImVec2(boxR, boxT + boxH), boxFill, 3.0f);
+                            fg->AddRect(ImVec2(boxL, boxT),
+                                ImVec2(boxR, boxT + boxH), boxEdge, 3.0f, 0, 1.0f);
+                            if (!userName.empty()) {
+                                fg->PushClipRect(ImVec2(boxL, boxT),
+                                                 ImVec2(boxR, boxT + boxH), true);
+                                fg->AddText(ImVec2(boxL + 4, boxT + 3),
+                                            gText, userName.c_str());
+                                fg->PopClipRect();
+                            }
                         }
-                        ImVec2 blob(gtl.x, regTop + REGION_PAD_TOP);
-                        fg->AddCircle(blob, 5.0f, gPort, 12, 1.5f);
                     }
                 }
             }
         }
 
-        // Arrowhead — hidden when mouse is over any drop target
-        // (existing blob or region), since those already highlight blue.
-        bool overDropTarget = (hoveredBlobCable >= 0) || (hoveredRegionNode >= 0);
-        if (dragging && !overDropTarget) {
+        // MONO mixer node — draw + hover detect. Has N input blobs
+        // (one per stem, Y-aligned with the track's stem outputs) and
+        // ONE output blob at vertical centre.
+        bool draggingMixerOut = (m_routingMixerOutDrag >= 0);
+        if (modeMono) {
+            auto r = mixerRect();
+            ImVec2 tl = r.first, br = r.second;
+            dl->AddRectFilled(tl, br, IM_COL32(115, 100, 55, 240), 6.0f);
+            dl->AddRect(tl, br, IM_COL32(220, 220, 220, 200), 6.0f, 0, 1.5f);
+            const char* mxLbl = "MONO MIX";
+            ImVec2 ts = ImGui::CalcTextSize(mxLbl);
+            dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f, tl.y + 4),
+                        IM_COL32_WHITE, mxLbl);
+            for (int s = 0; s < stemN; s++) {
+                dl->AddCircleFilled(mixerInPos(s), 5.0f, portOrange, 12);
+            }
+            ImVec2 mOut = mixerOutPos();
+            bool mxOutBh = canvasMouseIn &&
+                std::fabs(mouse.x - mOut.x) < 14 &&
+                std::fabs(mouse.y - mOut.y) < 14;
+            ImU32 mxOutCol = (draggingMixerOut && mxOutBh) ? portBlue : portOrange;
+            dl->AddCircleFilled(mOut, 5.0f, mxOutCol, 12);
+            if (mxOutBh) hoveredMixerOut = true;
+            if (draggingMixerOut) {
+                ImVec2 a = mOut;
+                ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
+                float dx = (b.x - a.x) * 0.5f;
+                dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
+                                      ImVec2(b.x - dx, b.y), b,
+                                      IM_COL32(160, 220, 130, 180), 2.0f, 24);
+            }
+        }
+
+        // Arrowhead at cursor while dragging any cable — hidden when
+        // over a valid drop target.
+        bool dragOverInputTarget  = draggingInput  && overTrackInputRegion;
+        bool dragOverOutputTarget = draggingOutput && (hoveredOutputDrop >= 0);
+        bool dragOverRevInTarget  = draggingRevIn  && (hoveredInputNodeOut >= 0);
+        bool dragOverRevOutTarget = draggingRevOut && (hoveredTrackOutStem >= 0);
+        bool dragOverMixerTarget  = draggingMixerOut && (hoveredOutputDrop >= 0);
+        if ((draggingInput || draggingOutput || draggingRevIn || draggingRevOut ||
+             draggingMixerOut) &&
+            !dragOverInputTarget && !dragOverOutputTarget &&
+            !dragOverRevInTarget && !dragOverRevOutTarget && !dragOverMixerTarget) {
             const float ah = 5.0f, al = 8.0f;
-            ImU32 tipCol = IM_COL32(240, 170, 40, 230);
+            // Arrow tip always points AWAY from the drag source (toward
+            // the cursor's direction of travel). Cable colour matches
+            // its kind — yellow for input cables (forward + reverse),
+            // green for output cables (forward + reverse).
+            ImU32 tipCol = (draggingInput || draggingRevIn)
+                           ? IM_COL32(240, 170, 40, 230)
+                           : IM_COL32(140, 220, 100, 230);
+            float srcX = 0.0f;
+            if (draggingInput)
+                srcX = inputNodeOutPortPos(m_routingDragFromNode).x;
+            else if (draggingRevIn)
+                srcX = trackInputBlobPos(m_routingRevInputDrag).x;
+            else if (draggingOutput)
+                srcX = trackOutputBlobPos(m_routingDragFromStem).x;
+            else if (draggingRevOut)
+                srcX = outputNodeInPortPos(m_routingRevOutputDrag).x;
+            else /* draggingMixerOut */
+                srcX = mixerOutPos().x;
+            bool pointRight = (m_routingDragCursorX >= srcX);
+            float dir = pointRight ? 1.0f : -1.0f;
             dl->AddTriangleFilled(
-                ImVec2(m_routingDragCursorX,      m_routingDragCursorY),
-                ImVec2(m_routingDragCursorX - al, m_routingDragCursorY - ah),
-                ImVec2(m_routingDragCursorX - al, m_routingDragCursorY + ah),
+                ImVec2(m_routingDragCursorX,             m_routingDragCursorY),
+                ImVec2(m_routingDragCursorX - dir * al,  m_routingDragCursorY - ah),
+                ImVec2(m_routingDragCursorX - dir * al,  m_routingDragCursorY + ah),
                 tipCol);
         }
 
         // ---- Node-move interaction ----
-        auto nodeBodyAt = [&](float mx, float my) -> int {
-            for (int i = (int)m_routingNodes.size() - 1; i >= 0; i--) {
-                auto r = nodeRect(i);
+        // Track node moves too (persists via selTrack->routingTrackNodeX/Y).
+        // -2 = moving track node, otherwise index into nodes[].
+        auto sideBodyAt = [&](float mx, float my) -> int {
+            for (int i = (int)nodes.size() - 1; i >= 0; i--) {
+                auto r = sideNodeRect(i);
                 if (mx >= r.first.x && mx <= r.second.x &&
                     my >= r.first.y && my <= r.second.y) return i;
             }
             return -1;
         };
-        if (m_routingMoveNode < 0 && m_routingDragFromNode < 0 &&
-            canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-            hoveredOutputNode < 0 && hoveredBlobCable < 0) {
-            int bodyIdx = nodeBodyAt(mouse.x, mouse.y);
+        bool overTrackNodeBody = false;
+        {
+            auto r = trackNodeRect();
+            overTrackNodeBody = canvasMouseIn &&
+                mouse.x >= r.first.x && mouse.x <= r.second.x &&
+                mouse.y >= r.first.y && mouse.y <= r.second.y;
+        }
+        bool overMixerBody = false;
+        if (modeMono) {
+            auto r = mixerRect();
+            overMixerBody = canvasMouseIn &&
+                mouse.x >= r.first.x && mouse.x <= r.second.x &&
+                mouse.y >= r.first.y && mouse.y <= r.second.y;
+        }
+        if (m_routingMoveNode < 0 && !draggingInput && !draggingOutput &&
+            !draggingRevIn && !draggingRevOut && !draggingMixerOut &&
+            !m_routingRubberActive &&
+            canvasMouseIn && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !mouseOverNodeText &&           // don't hijack InputText clicks
+            hoveredInputNodeOut < 0 && hoveredTrackInStem < 0 &&
+            hoveredTrackInEmpty < 0 &&
+            hoveredTrackOutStem < 0 && hoveredOutputBlob < 0 &&
+            hoveredOutputRev < 0 && !hoveredMixerOut) {
+            int bodyIdx = sideBodyAt(mouse.x, mouse.y);
             if (bodyIdx >= 0) {
                 m_routingMoveNode = bodyIdx;
-                const RoutingNode& n = m_routingNodes[bodyIdx];
-                float cx = canvasPos.x + n.posX;
-                float cy = canvasPos.y + n.posY;
-                m_routingMoveOffsetX = mouse.x - cx;
-                m_routingMoveOffsetY = mouse.y - cy;
+                const RoutingNode& n = nodes[bodyIdx];
+                m_routingMoveOffsetX = mouse.x - (canvasPos.x + n.posX);
+                m_routingMoveOffsetY = mouse.y - (canvasPos.y + n.posY);
+                // Selecting this single node — Ctrl toggles instead.
+                bool ctrl = ImGui::GetIO().KeyCtrl;
+                auto it = std::find(m_routingSelectedNodes.begin(),
+                                    m_routingSelectedNodes.end(), bodyIdx);
+                if (ctrl) {
+                    if (it != m_routingSelectedNodes.end())
+                        m_routingSelectedNodes.erase(it);
+                    else
+                        m_routingSelectedNodes.push_back(bodyIdx);
+                } else {
+                    m_routingSelectedNodes = { bodyIdx };
+                }
+            } else if (overMixerBody) {
+                m_routingMoveNode = -3;   // mono mixer node
+                m_routingMoveOffsetX = mouse.x - (canvasPos.x + selTrack->routingMixerX);
+                m_routingMoveOffsetY = mouse.y - (canvasPos.y + selTrack->routingMixerY);
+            } else if (overTrackNodeBody) {
+                m_routingMoveNode = -2;   // track node
+                m_routingMoveOffsetX = mouse.x - (canvasPos.x + selTrack->routingTrackNodeX);
+                m_routingMoveOffsetY = mouse.y - (canvasPos.y + selTrack->routingTrackNodeY);
+            } else {
+                // Click on empty canvas → clear selection + start rubber-
+                // band. Rubber-band only draws if the user actually drags.
+                if (!ImGui::GetIO().KeyCtrl)
+                    m_routingSelectedNodes.clear();
+                m_routingRubberActive = true;
+                m_routingRubberStartX = mouse.x;
+                m_routingRubberStartY = mouse.y;
             }
         }
-        if (m_routingMoveNode >= 0 &&
-            m_routingMoveNode < (int)m_routingNodes.size()) {
-            RoutingNode& n = m_routingNodes[m_routingMoveNode];
+        // Rubber-band draw + canvas-node commit. Panel-side commit
+        // happens at the end of renderRoutingPage (both panels are
+        // rendered by then). The rect is drawn on the FOREGROUND
+        // drawlist so it stays visible when the drag extends outside
+        // the canvas into either side panel.
+        if (m_routingRubberActive) {
+            float x1 = std::min(m_routingRubberStartX, mouse.x);
+            float x2 = std::max(m_routingRubberStartX, mouse.x);
+            float y1 = std::min(m_routingRubberStartY, mouse.y);
+            float y2 = std::max(m_routingRubberStartY, mouse.y);
+            ImDrawList* fg = ImGui::GetForegroundDrawList();
+            fg->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2),
+                              IM_COL32(90, 130, 200, 45));
+            fg->AddRect(ImVec2(x1, y1), ImVec2(x2, y2),
+                        IM_COL32(140, 180, 240, 210), 0.0f, 0, 1.0f);
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                float dragW = x2 - x1, dragH = y2 - y1;
+                if (dragW > 3.0f || dragH > 3.0f) {
+                    // Nodes intersecting the rect join the selection.
+                    for (int ni = 0; ni < (int)nodes.size(); ni++) {
+                        auto rr = sideNodeRect(ni);
+                        if (rr.first.x < x2 && rr.second.x > x1 &&
+                            rr.first.y < y2 && rr.second.y > y1) {
+                            auto it = std::find(m_routingSelectedNodes.begin(),
+                                                m_routingSelectedNodes.end(), ni);
+                            if (it == m_routingSelectedNodes.end())
+                                m_routingSelectedNodes.push_back(ni);
+                        }
+                    }
+                }
+                // Note: don't clear m_routingRubberActive yet — the
+                // outer commit block (after the right panel) needs to
+                // see it still true this frame to apply panel selection.
+            }
+        }
+        // Delete / Backspace removes every currently-selected node,
+        // fixing up input-cable/stem/output-cable indices as we go
+        // (descending order so earlier indices stay valid).
+        if (!m_routingSelectedNodes.empty() &&
+            (ImGui::IsKeyPressed(ImGuiKey_Delete) ||
+             ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+            std::vector<int> victims = m_routingSelectedNodes;
+            std::sort(victims.begin(), victims.end(), std::greater<int>());
+            for (int idx : victims) {
+                if (idx < 0 || idx >= (int)nodes.size()) continue;
+                for (int s = (int)inputCables.size() - 1; s >= 0; s--) {
+                    if (inputCables[s] == idx) {
+                        inputCables.erase(inputCables.begin() + s);
+                        outputCables.erase(std::remove_if(
+                            outputCables.begin(), outputCables.end(),
+                            [s](const OutputCable& oc) { return oc.stemIdx == s; }),
+                            outputCables.end());
+                        for (auto& oc : outputCables)
+                            if (oc.stemIdx > s) oc.stemIdx--;
+                    }
+                }
+                outputCables.erase(std::remove_if(
+                    outputCables.begin(), outputCables.end(),
+                    [idx](const OutputCable& oc) {
+                        return oc.outputNodeIdx == idx;
+                    }),
+                    outputCables.end());
+                nodes.erase(nodes.begin() + idx);
+                for (auto& nc : inputCables)
+                    if (nc > idx) nc--;
+                for (auto& oc : outputCables)
+                    if (oc.outputNodeIdx > idx) oc.outputNodeIdx--;
+            }
+            m_routingSelectedNodes.clear();
+        }
+        if (m_routingMoveNode == -2) {
+            selTrack->routingTrackNodeX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
+            selTrack->routingTrackNodeY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) m_routingMoveNode = -1;
+        } else if (m_routingMoveNode == -3) {
+            selTrack->routingMixerX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
+            selTrack->routingMixerY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) m_routingMoveNode = -1;
+        } else if (m_routingMoveNode >= 0 && m_routingMoveNode < (int)nodes.size()) {
+            RoutingNode& n = nodes[m_routingMoveNode];
             n.posX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
             n.posY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
-            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                m_routingMoveNode = -1;
-            }
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) m_routingMoveNode = -1;
         }
 
         // ---- Cable-drag interaction ----
-        // Click priority: OUT port > existing blob (pickup) > else falls
-        // through to node-move (handled above).
-        if (m_routingDragFromNode < 0 && m_routingMoveNode < 0 &&
+        // Click priority:
+        //   • Input node's out port → start a new input cable drag.
+        //   • Track stem input blob (connected) → pick up that cable
+        //     (drag away to disconnect; drop back on input region to
+        //     re-cable at end).
+        //   • Output node's blob (connected) → pick up an output cable
+        //     landing there and drag it away.
+        //   • Track stem output port → start a new output cable drag.
+        if (!draggingInput && !draggingOutput && !draggingRevIn && !draggingRevOut &&
+            !draggingMixerOut && m_routingMoveNode < 0 &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (hoveredOutputNode >= 0) {
-                m_routingDragFromNode = hoveredOutputNode;
-            } else if (hoveredBlobCable >= 0) {
-                m_routingDragFromNode = m_routingCables[hoveredBlobCable].srcNode;
-                m_routingCables.erase(m_routingCables.begin() + hoveredBlobCable);
+            if (hoveredInputNodeOut >= 0) {
+                // Input OUT is a SOURCE port — click always starts a
+                // fresh forward input cable. Never picks up existing
+                // cables (that only happens at the receiving end:
+                // the Track input blob). Lets one Input feed multiple
+                // stems by dragging out repeatedly.
+                m_routingDragFromNode = hoveredInputNodeOut;
+            } else if (hoveredTrackInStem >= 0) {
+                int s = hoveredTrackInStem;
+                int srcNode = inputCables[s];
+                inputCables.erase(inputCables.begin() + s);
+                outputCables.erase(std::remove_if(
+                    outputCables.begin(), outputCables.end(),
+                    [s](const OutputCable& oc) { return oc.stemIdx == s; }),
+                    outputCables.end());
+                for (auto& oc : outputCables)
+                    if (oc.stemIdx > s) oc.stemIdx--;
+                m_routingDragFromNode = srcNode;
+            } else if (hoveredOutputBlob >= 0) {
+                // Pickup: remove the LAST cable landing here and start
+                // a REV-output drag from this Output node. Releasing
+                // on the same blob (or empty space) leaves the cable
+                // disconnected; dropping on a Track output blob re-
+                // wires to a different stem.
+                for (int oi = (int)outputCables.size() - 1; oi >= 0; oi--) {
+                    if (outputCables[oi].outputNodeIdx == hoveredOutputBlob) {
+                        outputCables.erase(outputCables.begin() + oi);
+                        m_routingRevOutputDrag = hoveredOutputBlob;
+                        break;
+                    }
+                }
+            } else if (hoveredMixerOut) {
+                // MONO mode: start a mixer-out cable drag. Drop on any
+                // Output node to route the mono mix there.
+                m_routingMixerOutDrag = 0;
+            } else if (hoveredTrackOutStem >= 0 && modeMulti) {
+                // MULTI mode only — per-stem output cabling.
+                m_routingDragFromStem = hoveredTrackOutStem;
             }
         }
-        if (m_routingDragFromNode >= 0) {
+        if (draggingInput || draggingOutput || draggingRevIn || draggingRevOut ||
+            draggingMixerOut) {
             m_routingDragCursorX = mouse.x;
             m_routingDragCursorY = mouse.y;
             if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                // Drop resolution:
-                //   • over any part of a region (existing blob OR empty
-                //     space) → add a new cable to that region. Multiple
-                //     cables per side are allowed, so an already-occupied
-                //     blob doesn't block a second connection landing
-                //     alongside it — it lands as the next blob in the
-                //     stack.
-                //   • elsewhere → discard
-                int dropNode = -1, dropSide = 0;
-                if (hoveredBlobCable >= 0) {
-                    dropNode = m_routingCables[hoveredBlobCable].dstNode;
-                    dropSide = m_routingCables[hoveredBlobCable].dstSide;
-                } else if (hoveredRegionNode >= 0) {
-                    dropNode = hoveredRegionNode;
-                    dropSide = hoveredRegionSide;
+                if (draggingInput) {
+                    // Bulk-cable shortcut: if the drag started from an
+                    // Input node that's part of a multi-selection of
+                    // Input nodes, cable ALL of them into the track in
+                    // top-to-bottom order (Y-sorted). Otherwise a single
+                    // cable is appended for just the dragged node.
+                    if (overTrackInputRegion) {
+                        std::vector<int> selInputs;
+                        for (int ni : m_routingSelectedNodes) {
+                            if (ni >= 0 && ni < (int)nodes.size() &&
+                                nodes[ni].kind == RoutingNode::Kind::Input)
+                                selInputs.push_back(ni);
+                        }
+                        bool bulk = selInputs.size() > 1 &&
+                            std::find(selInputs.begin(), selInputs.end(),
+                                      m_routingDragFromNode) != selInputs.end();
+                        if (bulk) {
+                            std::sort(selInputs.begin(), selInputs.end(),
+                                [&](int a, int b) {
+                                    return nodes[a].posY < nodes[b].posY;
+                                });
+                            for (int ni : selInputs)
+                                inputCables.push_back(ni);
+                        } else {
+                            inputCables.push_back(m_routingDragFromNode);
+                        }
+                    }
+                    m_routingDragFromNode = -1;
                 }
-                if (dropNode >= 0) {
-                    RoutingCable cbl;
-                    cbl.srcNode = m_routingDragFromNode;
-                    cbl.dstNode = dropNode;
-                    cbl.dstSide = dropSide;
-                    m_routingCables.push_back(cbl);
+                if (draggingOutput) {
+                    // If the drag started from the output PLACEHOLDER
+                    // (m_routingDragFromStem == stemN), create an empty
+                    // stem first so the output cable has a valid stem
+                    // index to reference. Recording on that stem will
+                    // just be silence until an input is wired.
+                    auto ensureStem = [&](int wantedStem) {
+                        while ((int)inputCables.size() <= wantedStem)
+                            inputCables.push_back(-1);
+                    };
+                    if (hoveredOutputDrop >= 0) {
+                        std::vector<int> selOutputs;
+                        for (int ni : m_routingSelectedNodes) {
+                            if (ni >= 0 && ni < (int)nodes.size() &&
+                                nodes[ni].kind == RoutingNode::Kind::Output)
+                                selOutputs.push_back(ni);
+                        }
+                        bool bulk = selOutputs.size() > 1 &&
+                            std::find(selOutputs.begin(), selOutputs.end(),
+                                      hoveredOutputDrop) != selOutputs.end();
+                        if (bulk) {
+                            std::sort(selOutputs.begin(), selOutputs.end(),
+                                [&](int a, int b) {
+                                    return nodes[a].posY < nodes[b].posY;
+                                });
+                            int startStem = m_routingDragFromStem;
+                            for (size_t i = 0; i < selOutputs.size(); i++) {
+                                int s = startStem + (int)i;
+                                ensureStem(s);
+                                OutputCable oc;
+                                oc.stemIdx       = s;
+                                oc.outputNodeIdx = selOutputs[i];
+                                outputCables.push_back(oc);
+                            }
+                        } else {
+                            ensureStem(m_routingDragFromStem);
+                            OutputCable oc;
+                            oc.stemIdx       = m_routingDragFromStem;
+                            oc.outputNodeIdx = hoveredOutputDrop;
+                            outputCables.push_back(oc);
+                        }
+                    }
+                    m_routingDragFromStem = -1;
                 }
-                m_routingDragFromNode = -1;
+                if (draggingRevIn) {
+                    // Reverse-input drop: released over an Input node's
+                    // OUT port → assign that node as the source of the
+                    // target stem, creating the stem if needed.
+                    if (hoveredInputNodeOut >= 0) {
+                        int s = m_routingRevInputDrag;
+                        if (s >= (int)inputCables.size()) {
+                            while ((int)inputCables.size() <= s)
+                                inputCables.push_back(-1);
+                        }
+                        inputCables[s] = hoveredInputNodeOut;
+                    }
+                    m_routingRevInputDrag = -1;
+                }
+                if (draggingRevOut) {
+                    // Reverse-output drop: released over a track output
+                    // blob → create a cable from that stem to the
+                    // Output node the drag started from. Placeholder
+                    // drop (stem == stemN) creates an empty stem.
+                    if (hoveredTrackOutStem >= 0) {
+                        int s = hoveredTrackOutStem;
+                        while ((int)inputCables.size() <= s)
+                            inputCables.push_back(-1);
+                        OutputCable oc;
+                        oc.stemIdx       = s;
+                        oc.outputNodeIdx = m_routingRevOutputDrag;
+                        outputCables.push_back(oc);
+                    }
+                    m_routingRevOutputDrag = -1;
+                }
+                if (draggingMixerOut) {
+                    // MONO mixer-out drop: append the Output node to
+                    // the track's mono-outputs list. Duplicates are OK
+                    // (same node cabled twice sums twice at playback).
+                    if (hoveredOutputDrop >= 0) {
+                        selTrack->routingMonoOutputs.push_back(hoveredOutputDrop);
+                    }
+                    m_routingMixerOutDrag = -1;
+                }
             }
         }
 
-        // Right-click on a node deletes it (and any cables touching it).
-        if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            for (int i = (int)m_routingNodes.size() - 1; i >= 0; i--) {
-                auto r = nodeRect(i);
-                if (mouse.x >= r.first.x && mouse.x <= r.second.x &&
-                    mouse.y >= r.first.y && mouse.y <= r.second.y) {
-                    m_routingNodes.erase(m_routingNodes.begin() + i);
-                    // Fix up cable refs — drop cables touching this node,
-                    // decrement indices > i.
-                    m_routingCables.erase(std::remove_if(
-                        m_routingCables.begin(), m_routingCables.end(),
-                        [i](const RoutingCable& c) {
-                            return c.srcNode == i || c.dstNode == i;
+        // Right-click deletion.
+        //   • on an Input node body → delete node + its stem entries +
+        //     shift subsequent stem indices in outputCables down.
+        //   • on an Output node body → delete node + its output cables.
+        //   • on a track input blob → delete that stem + shift indices.
+        //   • on an Output node blob → delete that specific output cable.
+        if (canvasMouseIn && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            // Blob deletions first (more specific than body).
+            bool handled = false;
+            // Track input blob → delete stem at that index.
+            for (int s = 0; s < stemN && !handled; s++) {
+                ImVec2 p = trackInputBlobPos(s);
+                if (std::fabs(mouse.x - p.x) < 14 && std::fabs(mouse.y - p.y) < 14) {
+                    inputCables.erase(inputCables.begin() + s);
+                    // Any output cable that was tied to a later stem
+                    // needs its stemIdx decremented; anything tied to
+                    // the removed stem itself gets dropped.
+                    outputCables.erase(std::remove_if(
+                        outputCables.begin(), outputCables.end(),
+                        [s](const OutputCable& oc) { return oc.stemIdx == s; }),
+                        outputCables.end());
+                    for (auto& oc : outputCables)
+                        if (oc.stemIdx > s) oc.stemIdx--;
+                    handled = true;
+                }
+            }
+            // Output node blob → drop ALL cables landing on it.
+            for (int i = 0; i < (int)nodes.size() && !handled; i++) {
+                if (nodes[i].kind != RoutingNode::Kind::Output) continue;
+                ImVec2 p = outputNodeInPortPos(i);
+                if (std::fabs(mouse.x - p.x) < 14 && std::fabs(mouse.y - p.y) < 14) {
+                    outputCables.erase(std::remove_if(
+                        outputCables.begin(), outputCables.end(),
+                        [i](const OutputCable& oc) {
+                            return oc.outputNodeIdx == i;
                         }),
-                        m_routingCables.end());
-                    for (auto& c : m_routingCables) {
-                        if (c.srcNode > i) c.srcNode--;
-                        if (c.dstNode > i) c.dstNode--;
+                        outputCables.end());
+                    handled = true;
+                }
+            }
+            // Fall-through: node body → delete node.
+            if (!handled) {
+                int bodyIdx = sideBodyAt(mouse.x, mouse.y);
+                if (bodyIdx >= 0) {
+                    // Drop any input cable referencing this node (removes
+                    // the stem entirely), fix later stem indices, drop
+                    // any output cable referencing this node.
+                    // 1. Purge from inputCables and shift output cables.
+                    for (int s = (int)inputCables.size() - 1; s >= 0; s--) {
+                        if (inputCables[s] == bodyIdx) {
+                            inputCables.erase(inputCables.begin() + s);
+                            outputCables.erase(std::remove_if(
+                                outputCables.begin(), outputCables.end(),
+                                [s](const OutputCable& oc) { return oc.stemIdx == s; }),
+                                outputCables.end());
+                            for (auto& oc : outputCables)
+                                if (oc.stemIdx > s) oc.stemIdx--;
+                        }
                     }
-                    break;
+                    // 2. Purge output cables pointing at this node.
+                    outputCables.erase(std::remove_if(
+                        outputCables.begin(), outputCables.end(),
+                        [bodyIdx](const OutputCable& oc) {
+                            return oc.outputNodeIdx == bodyIdx;
+                        }),
+                        outputCables.end());
+                    // 3. Erase the node and decrement all >= bodyIdx refs.
+                    nodes.erase(nodes.begin() + bodyIdx);
+                    for (auto& nc : inputCables)
+                        if (nc > bodyIdx) nc--;
+                    for (auto& oc : outputCables)
+                        if (oc.outputNodeIdx > bodyIdx) oc.outputNodeIdx--;
                 }
             }
         }
@@ -4300,36 +5187,139 @@ void GUIManager::renderRoutingPage() {
     drawVSplitter("routingSplitR", &m_routingRightW, true);
     ImGui::SameLine(0, 0);
 
-    // ---- RIGHT: tracks -----------------------------------------------
-    ImGui::BeginChild("routingTracks", ImVec2(m_routingRightW, contentH), true);
-    ImGui::TextUnformatted("TRACKS");
+    // ---- RIGHT: outputs ----------------------------------------------
+    ImGui::BeginChild("routingOutputs", ImVec2(m_routingRightW, contentH), true);
+    ImGui::TextUnformatted("OUTPUTS");
     ImGui::Separator();
-    int nTracks = m_audioEngine->getTrackCount();
+    int numOutputs = m_audioEngine->getNumStereoPairs() * 2;
     const ImGuiPayload* peekR = ImGui::GetDragDropPayload();
     const int* peekPR = (peekR && peekR->IsDataType("ROUTING_NODE") &&
                         peekR->DataSize == (int)sizeof(int) * 2)
                         ? (const int*)peekR->Data : nullptr;
     const ImU32 dragOrangeR = IM_COL32(240, 140, 40, 255);
     ImGuiID activeIdR = ImGui::GetActiveID();
-    for (int i = 0; i < nTracks; i++) {
-        const Track* t = m_audioEngine->getTrack(i);
-        char lbl[64];
-        snprintf(lbl, sizeof(lbl), "%d  %s", i + 1,
-                 t ? t->name.c_str() : "(track)");
-        bool isDragging = (peekPR && peekPR[0] == 1 && peekPR[1] == i);
+    const float rowHR = ImGui::GetFrameHeight();
+    const float labelWR = 78.0f;    // "Output NN" grabber column
+    for (int ch = 0; ch < numOutputs; ch++) {
+        ImGui::PushID(10000 + ch);
+        char lbl[32];
+        snprintf(lbl, sizeof(lbl), "Output %d", ch + 1);
+        bool isDragging  = (peekPR && peekPR[0] == 1 && peekPR[1] == ch);
         bool isMouseDown = (activeIdR != 0 && activeIdR == ImGui::GetID(lbl));
         bool showOrange  = isMouseDown || isDragging;
+        bool isSelected  = std::find(m_routingSelectedOutputs.begin(),
+                                     m_routingSelectedOutputs.end(), ch)
+                           != m_routingSelectedOutputs.end();
         if (showOrange) ImGui::PushStyleColor(ImGuiCol_Text, dragOrangeR);
-        ImGui::Selectable(lbl, false, 0, ImVec2(0, 22));
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+        ImGui::Selectable(lbl, false, 0, ImVec2(labelWR, rowHR));
+        ImGui::PopStyleVar();
         if (showOrange) ImGui::PopStyleColor();
+        ImVec2 rowMin = ImGui::GetItemRectMin();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            ImGuiIO& io = ImGui::GetIO();
+            if (io.KeyShift && m_routingLastOutputClicked >= 0) {
+                int a = std::min(m_routingLastOutputClicked, ch);
+                int b = std::max(m_routingLastOutputClicked, ch);
+                m_routingSelectedOutputs.clear();
+                for (int c = a; c <= b; c++) m_routingSelectedOutputs.push_back(c);
+            } else if (io.KeyCtrl) {
+                auto it = std::find(m_routingSelectedOutputs.begin(),
+                                    m_routingSelectedOutputs.end(), ch);
+                if (it != m_routingSelectedOutputs.end())
+                    m_routingSelectedOutputs.erase(it);
+                else
+                    m_routingSelectedOutputs.push_back(ch);
+            } else {
+                bool alreadyIn = std::find(m_routingSelectedOutputs.begin(),
+                                           m_routingSelectedOutputs.end(), ch)
+                                 != m_routingSelectedOutputs.end();
+                if (!alreadyIn) m_routingSelectedOutputs = { ch };
+            }
+            m_routingLastOutputClicked = ch;
+        }
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID |
                                        ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
-            int payload[2] = { 1, i };   // 1 = Track kind
+            int payload[2] = { 1, ch };   // 1 = Output kind
             ImGui::SetDragDropPayload("ROUTING_NODE", payload, sizeof(payload));
             ImGui::EndDragDropSource();
         }
+        ImGui::SameLine(0, 4);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.06f, 0.12f, 0.22f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.18f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0.14f, 0.22f, 0.36f, 1.0f));
+        char nameBuf[64];
+        const std::string& curName = m_audioEngine->getOutputName(ch);
+        snprintf(nameBuf, sizeof(nameBuf), "%s", curName.c_str());
+        float boxWo = ImGui::GetContentRegionAvail().x;
+        float txtWo = ImGui::CalcTextSize(nameBuf).x;
+        ImVec2 padOo = ImGui::GetStyle().FramePadding;
+        float lpado = (boxWo - txtWo) * 0.5f;
+        if (lpado < padOo.x) lpado = padOo.x;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(lpado, padOo.y));
+        ImGui::SetNextItemWidth(boxWo);
+        if (ImGui::InputText("##outName", nameBuf, sizeof(nameBuf),
+                             ImGuiInputTextFlags_CharsUppercase)) {
+            m_audioEngine->setOutputName(ch, std::string(nameBuf));
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+        ImVec2 rowMax = ImGui::GetItemRectMax();
+        PanelRowRect rr;
+        rr.ch = ch;
+        rr.mn = rowMin;
+        rr.mx = ImVec2(rowMax.x, std::max(rowMin.y, rowMax.y));
+        outputRowRects.push_back(rr);
+        if (isSelected) {
+            ImDrawList* sd = ImGui::GetWindowDrawList();
+            sd->AddRect(ImVec2(rr.mn.x - 1, rr.mn.y - 1),
+                        ImVec2(rr.mx.x + 1, rr.mx.y + 1),
+                        IM_COL32(240, 140, 40, 220), 2.0f, 0, 1.5f);
+        }
+        {
+            ImDrawList* sd = ImGui::GetWindowDrawList();
+            ImVec2 mn = ImGui::GetCursorScreenPos();
+            float aw  = ImGui::GetContentRegionAvail().x;
+            sd->AddLine(mn, ImVec2(mn.x + aw, mn.y),
+                        IM_COL32(70, 72, 78, 255), 1.0f);
+            ImGui::Dummy(ImVec2(1, 2));
+        }
+        ImGui::PopID();
     }
     ImGui::EndChild();
+
+    // ---- Rubber-band commit (end of frame so both panels have
+    // populated their row rects for this frame). Any node in the
+    // canvas or panel row in either side that intersects the drag
+    // rectangle joins its respective selection.
+    if (m_routingRubberActive && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        ImVec2 mp = ImGui::GetMousePos();
+        float x1 = std::min(m_routingRubberStartX, mp.x);
+        float x2 = std::max(m_routingRubberStartX, mp.x);
+        float y1 = std::min(m_routingRubberStartY, mp.y);
+        float y2 = std::max(m_routingRubberStartY, mp.y);
+        if (x2 - x1 > 3.0f || y2 - y1 > 3.0f) {
+            for (const auto& rr : inputRowRects) {
+                if (rr.mn.x < x2 && rr.mx.x > x1 &&
+                    rr.mn.y < y2 && rr.mx.y > y1) {
+                    if (std::find(m_routingSelectedInputs.begin(),
+                                  m_routingSelectedInputs.end(), rr.ch)
+                        == m_routingSelectedInputs.end())
+                        m_routingSelectedInputs.push_back(rr.ch);
+                }
+            }
+            for (const auto& rr : outputRowRects) {
+                if (rr.mn.x < x2 && rr.mx.x > x1 &&
+                    rr.mn.y < y2 && rr.mx.y > y1) {
+                    if (std::find(m_routingSelectedOutputs.begin(),
+                                  m_routingSelectedOutputs.end(), rr.ch)
+                        == m_routingSelectedOutputs.end())
+                        m_routingSelectedOutputs.push_back(rr.ch);
+                }
+            }
+        }
+        m_routingRubberActive = false;
+    }
 #endif
 }
 
@@ -5144,8 +6134,50 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
         file << "      \"inputMonoChan\": " << t->inputMonoChan << ",\n";
         file << "      \"inputLeftChan\": " << t->inputLeftChan  << ",\n";
         file << "      \"inputRightChan\":" << t->inputRightChan << ",\n";
-        file << "      \"inputMonitor\":  " << (t->inputMonitor ? "true" : "false") << "\n";
-        file << "    }" << (i + 1 < trackCount ? "," : "") << "\n";
+        file << "      \"inputMonitor\":  " << (t->inputMonitor ? "true" : "false");
+        // Per-track routing: nodes + input cables (per stem) + output
+        // cables (per stem→hw route). Skipped entirely when the track
+        // has neither cables nor nodes, so legacy sessions stay clean.
+        if (!t->routingNodes.empty() ||
+            !t->routingInputCables.empty() ||
+            !t->routingOutputCables.empty()) {
+            file << ",\n      \"routingTrackX\": " << t->routingTrackNodeX
+                 << ",\n      \"routingTrackY\": " << t->routingTrackNodeY;
+            file << ",\n      \"routingNodes\": [";
+            for (size_t ni = 0; ni < t->routingNodes.size(); ni++) {
+                const auto& n = t->routingNodes[ni];
+                file << "{\"k\":" << (int)n.kind
+                     << ",\"c\":" << n.channelOrTrack
+                     << ",\"x\":" << n.posX
+                     << ",\"y\":" << n.posY << "}"
+                     << (ni + 1 < t->routingNodes.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingInputCables\": [";
+            for (size_t si = 0; si < t->routingInputCables.size(); si++) {
+                file << t->routingInputCables[si]
+                     << (si + 1 < t->routingInputCables.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingOutputCables\": [";
+            for (size_t oi = 0; oi < t->routingOutputCables.size(); oi++) {
+                const auto& oc = t->routingOutputCables[oi];
+                file << "{\"s\":" << oc.stemIdx
+                     << ",\"n\":" << oc.outputNodeIdx << "}"
+                     << (oi + 1 < t->routingOutputCables.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingOutputMode\": " << t->routingOutputMode;
+            file << ",\n      \"routingMixerX\": "     << t->routingMixerX;
+            file << ",\n      \"routingMixerY\": "     << t->routingMixerY;
+            file << ",\n      \"routingMonoOutputs\": [";
+            for (size_t mi = 0; mi < t->routingMonoOutputs.size(); mi++) {
+                file << t->routingMonoOutputs[mi]
+                     << (mi + 1 < t->routingMonoOutputs.size() ? "," : "");
+            }
+            file << "]";
+        }
+        file << "\n    }" << (i + 1 < trackCount ? "," : "") << "\n";
     }
     file << "  ],\n";
 
@@ -5166,6 +6198,26 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
         file << "    { \"frame\": " << bookmarks[bi].frame
              << ", \"name\": \"" << escape(bookmarks[bi].name) << "\" }"
              << (bi + 1 < bookmarks.size() ? "," : "") << "\n";
+    }
+    file << "  ],\n";
+
+    // (Per-track routing is now emitted inside each track object above.)
+    file << "  \"inputNames\": [\n";
+    {
+        int nInputs = m_audioEngine->getNumInputStereoPairs() * 2;
+        for (int ic = 0; ic < nInputs; ic++) {
+            file << "    \"" << escape(m_audioEngine->getInputName(ic)) << "\""
+                 << (ic + 1 < nInputs ? "," : "") << "\n";
+        }
+    }
+    file << "  ],\n";
+    file << "  \"outputNames\": [\n";
+    {
+        int nOutputs = m_audioEngine->getNumStereoPairs() * 2;
+        for (int oc = 0; oc < nOutputs; oc++) {
+            file << "    \"" << escape(m_audioEngine->getOutputName(oc)) << "\""
+                 << (oc + 1 < nOutputs ? "," : "") << "\n";
+        }
     }
     file << "  ]\n";
     file << "}\n";
@@ -5268,12 +6320,40 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
         m_audioEngine->deleteTrack(i);
     }
 
+    // Brace-matched close finder — walks forward tracking nesting +
+    // string state so nested objects (routingNodes entries etc.) don't
+    // fool a naive first-'}' search into truncating the track object.
+    auto matchingBrace = [&](size_t openIdx) -> size_t {
+        int depth = 0;
+        bool inString = false, escape = false;
+        for (size_t i = openIdx; i < json.size(); i++) {
+            char c = json[i];
+            if (escape) { escape = false; continue; }
+            if (c == '\\') { escape = true; continue; }
+            if (c == '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return std::string::npos;
+    };
     size_t tracksKey = json.find("\"tracks\"");
     size_t cursor    = (tracksKey == std::string::npos) ? std::string::npos : tracksKey;
+    // Bound the loop to the closing ']' of the tracks array so nested
+    // objects that follow (bookmarks, etc.) don't get mis-parsed.
+    size_t tracksArrOpen  = (tracksKey == std::string::npos) ? std::string::npos
+                                                             : json.find('[', tracksKey);
+    size_t tracksArrClose = (tracksArrOpen == std::string::npos)
+                            ? std::string::npos
+                            : json.find(']', tracksArrOpen);
     while (cursor != std::string::npos) {
         size_t objStart = json.find('{', cursor);
         if (objStart == std::string::npos) break;
-        size_t objEnd = json.find('}', objStart);
+        if (tracksArrClose != std::string::npos && objStart >= tracksArrClose) break;
+        size_t objEnd = matchingBrace(objStart);
         if (objEnd == std::string::npos) break;
 
         // Read each field only within [objStart, objEnd].
@@ -5325,6 +6405,120 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
             t->inputLeftChan = inputLeftChan;
             t->inputRightChan= inputRightChan;
             t->inputMonitor  = inputMonitor;
+            // Per-track routing restore.
+            t->routingNodes.clear();
+            t->routingInputCables.clear();
+            t->routingOutputCables.clear();
+            size_t rxKey = keyIn("routingTrackX");
+            if (rxKey != std::string::npos) t->routingTrackNodeX = (float)readNumber(rxKey);
+            size_t ryKey = keyIn("routingTrackY");
+            if (ryKey != std::string::npos) t->routingTrackNodeY = (float)readNumber(ryKey);
+            // routingNodes: array of {"k":kind,"c":chan,"x":x,"y":y}.
+            size_t rnKey = keyIn("routingNodes");
+            if (rnKey != std::string::npos) {
+                size_t arrOp = json.find('[', rnKey);
+                size_t arrCl = (arrOp == std::string::npos)
+                               ? std::string::npos : json.find(']', arrOp);
+                size_t cur = (arrOp == std::string::npos) ? std::string::npos : arrOp;
+                while (cur != std::string::npos && cur < arrCl) {
+                    size_t oStart = json.find('{', cur);
+                    if (oStart == std::string::npos || oStart >= arrCl) break;
+                    size_t oEnd = json.find('}', oStart);
+                    if (oEnd == std::string::npos) break;
+                    auto ki = [&](const std::string& key) -> size_t {
+                        size_t p = findKeyAfter(key, oStart);
+                        return (p != std::string::npos && p < oEnd) ? p : std::string::npos;
+                    };
+                    Track::RoutingNode n;
+                    size_t kk = ki("k"), kc = ki("c"), kx = ki("x"), ky = ki("y");
+                    int kind = (kk != std::string::npos) ? (int)readNumber(kk) : 0;
+                    n.kind = (kind == 1) ? Track::RoutingNode::Kind::Output
+                                         : Track::RoutingNode::Kind::Input;
+                    n.channelOrTrack = (kc != std::string::npos) ? (int)readNumber(kc) : 0;
+                    n.posX = (kx != std::string::npos) ? (float)readNumber(kx) : 0.0f;
+                    n.posY = (ky != std::string::npos) ? (float)readNumber(ky) : 0.0f;
+                    t->routingNodes.push_back(n);
+                    cur = oEnd + 1;
+                }
+            }
+            // routingInputCables: array of ints.
+            size_t ricKey = keyIn("routingInputCables");
+            if (ricKey != std::string::npos) {
+                size_t arrOp = json.find('[', ricKey);
+                size_t arrCl = (arrOp == std::string::npos)
+                               ? std::string::npos : json.find(']', arrOp);
+                if (arrOp != std::string::npos && arrCl != std::string::npos) {
+                    size_t p = arrOp + 1;
+                    while (p < arrCl) {
+                        while (p < arrCl && (json[p] == ' ' || json[p] == ',' ||
+                                             json[p] == '\t' || json[p] == '\n' ||
+                                             json[p] == '\r')) p++;
+                        if (p >= arrCl) break;
+                        char* end = nullptr;
+                        long v = strtol(json.c_str() + p, &end, 10);
+                        if (end && end != json.c_str() + p) {
+                            t->routingInputCables.push_back((int)v);
+                            p = (size_t)(end - json.c_str());
+                        } else {
+                            p++;
+                        }
+                    }
+                }
+            }
+            // routingOutputCables: array of {"s":stem,"n":nodeIdx}.
+            size_t rocKey = keyIn("routingOutputCables");
+            if (rocKey != std::string::npos) {
+                size_t arrOp = json.find('[', rocKey);
+                size_t arrCl = (arrOp == std::string::npos)
+                               ? std::string::npos : json.find(']', arrOp);
+                size_t cur = (arrOp == std::string::npos) ? std::string::npos : arrOp;
+                while (cur != std::string::npos && cur < arrCl) {
+                    size_t oStart = json.find('{', cur);
+                    if (oStart == std::string::npos || oStart >= arrCl) break;
+                    size_t oEnd = json.find('}', oStart);
+                    if (oEnd == std::string::npos) break;
+                    auto ki = [&](const std::string& key) -> size_t {
+                        size_t p = findKeyAfter(key, oStart);
+                        return (p != std::string::npos && p < oEnd) ? p : std::string::npos;
+                    };
+                    Track::OutputCable oc;
+                    size_t ks = ki("s"), kn = ki("n");
+                    oc.stemIdx       = (ks != std::string::npos) ? (int)readNumber(ks) : 0;
+                    oc.outputNodeIdx = (kn != std::string::npos) ? (int)readNumber(kn) : -1;
+                    t->routingOutputCables.push_back(oc);
+                    cur = oEnd + 1;
+                }
+            }
+            // Mode + mono-mode extras.
+            size_t romKey = keyIn("routingOutputMode");
+            if (romKey != std::string::npos) t->routingOutputMode = (int)readNumber(romKey);
+            size_t mxKey = keyIn("routingMixerX");
+            if (mxKey != std::string::npos)  t->routingMixerX = (float)readNumber(mxKey);
+            size_t myKey = keyIn("routingMixerY");
+            if (myKey != std::string::npos)  t->routingMixerY = (float)readNumber(myKey);
+            size_t rmoKey = keyIn("routingMonoOutputs");
+            if (rmoKey != std::string::npos) {
+                size_t arrOp = json.find('[', rmoKey);
+                size_t arrCl = (arrOp == std::string::npos)
+                               ? std::string::npos : json.find(']', arrOp);
+                if (arrOp != std::string::npos && arrCl != std::string::npos) {
+                    size_t p = arrOp + 1;
+                    while (p < arrCl) {
+                        while (p < arrCl && (json[p] == ' ' || json[p] == ',' ||
+                                             json[p] == '\t' || json[p] == '\n' ||
+                                             json[p] == '\r')) p++;
+                        if (p >= arrCl) break;
+                        char* end = nullptr;
+                        long v = strtol(json.c_str() + p, &end, 10);
+                        if (end && end != json.c_str() + p) {
+                            t->routingMonoOutputs.push_back((int)v);
+                            p = (size_t)(end - json.c_str());
+                        } else {
+                            p++;
+                        }
+                    }
+                }
+            }
         }
         if (!filePath.empty()) {
             m_audioEngine->loadTrackAudio(newIdx, filePath);
@@ -5449,6 +6643,58 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
             }
             m_audioEngine->addBookmark(frame, name);
             cur = objEnd + 1;
+        }
+    }
+
+    // (Per-track routing is now parsed inside each track object above.)
+    // Input names — an array of strings, index = input channel.
+    {
+        size_t namesKey = json.find("\"inputNames\"");
+        if (namesKey != std::string::npos) {
+            size_t arrOpen  = json.find('[', namesKey);
+            size_t arrClose = (arrOpen == std::string::npos)
+                            ? std::string::npos : json.find(']', arrOpen);
+            size_t cur = (arrOpen == std::string::npos) ? std::string::npos : arrOpen;
+            int idx = 0;
+            while (cur != std::string::npos && cur < arrClose) {
+                size_t q1 = json.find('"', cur + 1);
+                if (q1 == std::string::npos || q1 >= arrClose) break;
+                q1++;
+                size_t q2 = q1;
+                while (q2 < arrClose) {
+                    if (json[q2] == '\\' && q2 + 1 < arrClose) { q2 += 2; continue; }
+                    if (json[q2] == '"') break;
+                    q2++;
+                }
+                std::string name = json.substr(q1, q2 - q1);
+                m_audioEngine->setInputName(idx++, name);
+                cur = q2 + 1;
+            }
+        }
+    }
+    // Output names — mirror of inputNames.
+    {
+        size_t namesKey = json.find("\"outputNames\"");
+        if (namesKey != std::string::npos) {
+            size_t arrOpen  = json.find('[', namesKey);
+            size_t arrClose = (arrOpen == std::string::npos)
+                            ? std::string::npos : json.find(']', arrOpen);
+            size_t cur = (arrOpen == std::string::npos) ? std::string::npos : arrOpen;
+            int idx = 0;
+            while (cur != std::string::npos && cur < arrClose) {
+                size_t q1 = json.find('"', cur + 1);
+                if (q1 == std::string::npos || q1 >= arrClose) break;
+                q1++;
+                size_t q2 = q1;
+                while (q2 < arrClose) {
+                    if (json[q2] == '\\' && q2 + 1 < arrClose) { q2 += 2; continue; }
+                    if (json[q2] == '"') break;
+                    q2++;
+                }
+                std::string name = json.substr(q1, q2 - q1);
+                m_audioEngine->setOutputName(idx++, name);
+                cur = q2 + 1;
+            }
         }
     }
 

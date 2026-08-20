@@ -40,6 +40,46 @@ struct Track {
     bool armed = false;     // Record-arm — armed tracks capture input during playback
     bool inputMonitor = false; // "I" button — reserved for input-monitor wiring
 
+    // ---- Per-track routing (patchbay) ----
+    // Each track owns its own routing canvas. Nodes are hardware Input
+    // or Output pills the user has dragged in. inputCables lists which
+    // Input node feeds each stem — its ORDER defines the stem index
+    // (and hence the channel layout of audioData / the recorded WAV).
+    // outputCables specify per-stem hardware routing at playback: each
+    // entry says "stem s goes to Output node o" (one hw channel).
+    // Multiple output cables from the same stem duplicate the signal;
+    // multiple stems cabled to the same output sum together.
+    struct RoutingNode {
+        enum class Kind { Input, Output };
+        Kind  kind = Kind::Input;
+        int   channelOrTrack = 0;    // hardware channel index (0-based)
+        float posX = 0.0f, posY = 0.0f;
+    };
+    struct OutputCable {
+        int stemIdx        = 0;      // 0..(inputCables.size()-1)
+        int outputNodeIdx  = -1;     // index into routingNodes[]
+    };
+    std::vector<RoutingNode>  routingNodes;
+    std::vector<int>          routingInputCables;   // per stem → routingNodes[] index of an Input node
+    std::vector<OutputCable>  routingOutputCables;
+    float routingTrackNodeX  = 0.0f;
+    float routingTrackNodeY  = 0.0f;
+    // ---- Output mode ----
+    // 0 = MULTI (per-stem output cables, uses routingOutputCables)
+    // 1 = STEREO (all stems summed to L/R via a stereo mixer)
+    // 2 = MONO (all stems summed to a mono mixer)
+    // Each mode keeps its own cable list so switching preserves state.
+    int  routingOutputMode = 0;
+    std::vector<int> routingMonoOutputs;    // indices into routingNodes[] (Output kind)
+    float routingMixerX = 0.0f;
+    float routingMixerY = 0.0f;
+    // Convenience: a track is "routed" (owned by patchbay) as soon as
+    // it has ANY cable, in either direction.
+    bool hasRouting() const {
+        return !routingInputCables.empty() || !routingOutputCables.empty();
+    }
+    int stemCount() const { return (int)routingInputCables.size(); }
+
     // Frame range covered by the most recent recording take. The renderer
     // paints this range in a distinct "fresh take" colour so the user can
     // see punch-in edits at a glance. Zero-length means no fresh take.

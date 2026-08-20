@@ -128,24 +128,27 @@ private:
     // to any track's L or R side. Toggled from a toolbar button.
     // Recording pipeline is NOT wired to this yet — mockup only.
     bool m_routingPageActive = false;
-    // Node model — inputs/tracks dragged into the middle become nodes,
-    // connections are stored as cables. Both persist across frames but
-    // NOT across sessions yet (that's part of the wire-up pass).
-    struct RoutingNode {
-        enum class Kind { Input, Track };
-        Kind   kind;
-        int    channelOrTrack = 0;   // input channel (0-based) or track index
-        float  posX = 0.0f;          // centre in middle-canvas coords
-        float  posY = 0.0f;
-    };
-    struct RoutingCable {
-        // Src is always an input node; dst is always a track node.
-        int  srcNode = -1;
-        int  dstNode = -1;
-        int  dstSide = 0;            // 0 = L, 1 = R (0 for mono tracks)
-    };
-    std::vector<RoutingNode>  m_routingNodes;
-    std::vector<RoutingCable> m_routingCables;
+    // Node/cable data now lives on AudioEngine (the audio thread reads
+    // it during record + monitor). Access via m_audioEngine->lockRouting();
+    // the render function grabs the lock at frame start and works
+    // through the aliased vectors below.
+    // Output-cable drag: pulling from the Track node's Nth stem output
+    // port to any Output node's IN port. -1 = not currently dragging.
+    // Coexists with m_routingDragFromNode (input-cable drag) as a
+    // mutually-exclusive state.
+    int   m_routingDragFromStem  = -1;
+    // Reverse-input cable drag: user grabbed a track input placeholder
+    // and is dragging OUT toward an Input node. -1 = not dragging;
+    // otherwise the stem index to fill (== stemN for a brand-new stem).
+    int   m_routingRevInputDrag  = -1;
+    // Reverse-output cable drag: user grabbed an Output node's blob and
+    // is dragging IN toward a track output port. -1 = not dragging;
+    // otherwise the Output node index being pulled.
+    int   m_routingRevOutputDrag = -1;
+    // Mixer-output cable drag (MONO/STEREO modes): user grabbed the
+    // mono/stereo mixer's OUT blob. -1 = not dragging. 0 = mono side
+    // or stereo L; 1 = stereo R (reserved for future).
+    int   m_routingMixerOutDrag  = -1;
     // In-progress cable drag state (from a node's output port to a
     // pending destination). -1 = not dragging.
     int   m_routingDragFromNode  = -1;
@@ -160,6 +163,28 @@ private:
     // Panel widths (draggable splitters between the three columns).
     float m_routingLeftW         = 180.0f;
     float m_routingRightW        = 180.0f;
+    // Per-input meter smoothing state (client-side ballistics on top
+    // of the engine's raw peak + RMS reads). Sized on first render.
+    std::vector<float> m_inputPeakHold;      // held peak (decays after hold)
+    std::vector<float> m_inputPeakHoldMs;    // ms remaining before decay
+    std::vector<float> m_inputRMSSm;         // smoothed RMS
+    // Routing canvas node selection (transient) + rubber-band state.
+    // Selection is scoped to the track currently being edited — resets
+    // whenever the selected track changes.
+    std::vector<int> m_routingSelectedNodes;
+    int   m_routingSelectionTrack = -1;
+    bool  m_routingRubberActive   = false;
+    float m_routingRubberStartX   = 0.0f;
+    float m_routingRubberStartY   = 0.0f;
+    // Panel selection for the routing page — separate sets for the
+    // input list (left) and output list (right). Purely a visual
+    // grouping for now; ctrl-click toggles, shift-click selects a
+    // range, plain click replaces. A rubber-band started in the
+    // canvas that spills into a panel also updates these.
+    std::vector<int> m_routingSelectedInputs;
+    std::vector<int> m_routingSelectedOutputs;
+    int  m_routingLastInputClicked  = -1;
+    int  m_routingLastOutputClicked = -1;
     void renderRoutingPage();
 
     // Cached arrangement-child frame-to-X mapping from the last render.
