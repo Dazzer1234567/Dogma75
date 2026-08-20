@@ -3862,6 +3862,17 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
     // the meter reflects the samples actually rendered THIS callback.
     const size_t bufStartPlayPos = m_playbackPosition.load();
 
+    // Reset per-callback per-stem playback peaks. If not playing, or a
+    // track's mode/routing skips the branch that fills these, the
+    // final store below will leave the atomic at 0 — meters read 0
+    // whenever the audio isn't actually flowing through that stem.
+    if (m_cbStemPeaks.size() < m_tracks.size()) {
+        m_cbStemPeaks.resize(m_tracks.size(),
+                             std::vector<float>(STEM_METERS_MAX, 0.0f));
+    }
+    for (auto& row : m_cbStemPeaks)
+        for (auto& v : row) v = 0.0f;
+
     // Per-input peak meters — cheap sweep of the input buffer, one
     // atomic store per channel. Read by the routing page for its
     // level bars.
@@ -4252,10 +4263,13 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     //            Output.
                     // Falls back to the legacy L/R distribution when
                     // routing has no cables configured for the mode.
-                    bool routedMulti = (track.routingOutputMode == 0) &&
-                                       !track.routingOutputCables.empty();
-                    bool routedMono  = (track.routingOutputMode == 2) &&
-                                       !track.routingMonoOutputs.empty();
+                    bool routedMulti  = (track.routingOutputMode == 0) &&
+                                        !track.routingOutputCables.empty();
+                    bool routedMono   = (track.routingOutputMode == 2) &&
+                                        !track.routingMonoOutputs.empty();
+                    bool routedStereo = (track.routingOutputMode == 1) &&
+                                        (!track.routingStereoOutputsL.empty() ||
+                                         !track.routingStereoOutputsR.empty());
                     if (routedMulti) {
                         float g = track.volume * m_playFadeGain;
                         for (const auto& oc : track.routingOutputCables) {
@@ -4273,8 +4287,27 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                         float g = track.volume * m_playFadeGain;
                         float mono = 0.0f;
                         int nC = track.channels;
-                        for (int c = 0; c < nC; c++) mono += track.getSample(playPos, c);
-                        if (nC > 0) mono /= (float)nC;
+                        int nG = (int)track.routingMonoGainsDb.size();
+                        // Peak scratch for this track (per-callback).
+                        // The enclosing loop is range-based, so recover
+                        // the index from the pointer offset (m_tracks
+                        // is a std::vector — contiguous, safe).
+                        size_t trackIdxL = (size_t)(&track - m_tracks.data());
+                        std::vector<float>* pkRow =
+                            (trackIdxL < m_cbStemPeaks.size())
+                            ? &m_cbStemPeaks[trackIdxL] : nullptr;
+                        for (int c = 0; c < nC; c++) {
+                            float s = track.getSample(playPos, c);
+                            if (c < nG) {
+                                float db = track.routingMonoGainsDb[c];
+                                s *= std::pow(10.0f, db / 20.0f);
+                            }
+                            mono += s;
+                            if (pkRow && c < (int)pkRow->size()) {
+                                float mag = std::fabs(s);
+                                if (mag > (*pkRow)[c]) (*pkRow)[c] = mag;
+                            }
+                        }
                         for (int outNodeIdx : track.routingMonoOutputs) {
                             if (outNodeIdx < 0 ||
                                 outNodeIdx >= (int)track.routingNodes.size()) continue;
@@ -4284,6 +4317,49 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                             if (hw < 0 || hw >= m_maxOutputChannels) continue;
                             out[i * m_maxOutputChannels + hw] += mono * g;
                         }
+                    } else if (routedStereo) {
+                        // STEREO mix: for each stem, apply gain and pan
+                        // (equal-power) to build an L bus and an R bus,
+                        // then distribute to whichever hardware outputs
+                        // the user has cabled per side.
+                        float g_track = track.volume * m_playFadeGain;
+                        float busL = 0.0f, busR = 0.0f;
+                        int nC = track.channels;
+                        int nG = (int)track.routingStereoGainsDb.size();
+                        int nP = (int)track.routingStereoPans.size();
+                        size_t trackIdxL = (size_t)(&track - m_tracks.data());
+                        std::vector<float>* pkRow =
+                            (trackIdxL < m_cbStemPeaks.size()) ? &m_cbStemPeaks[trackIdxL] : nullptr;
+                        for (int c = 0; c < nC; c++) {
+                            float sRaw = track.getSample(playPos, c);
+                            float g = 1.0f;
+                            if (c < nG) g = std::pow(10.0f, track.routingStereoGainsDb[c] / 20.0f);
+                            float pan = (c < nP) ? track.routingStereoPans[c] : 0.0f;
+                            // Equal-power pan: pan=-1 → all L, +1 → all R.
+                            float ang = (pan * 0.5f + 0.5f) * 1.5707963f;   // 0..π/2
+                            float gl = std::cos(ang);
+                            float gr = std::sin(ang);
+                            float post = sRaw * g;
+                            busL += post * gl;
+                            busR += post * gr;
+                            if (pkRow && c < (int)pkRow->size()) {
+                                float mag = std::fabs(post);
+                                if (mag > (*pkRow)[c]) (*pkRow)[c] = mag;
+                            }
+                        }
+                        auto sendBus = [&](const std::vector<int>& list, float sample) {
+                            for (int outNodeIdx : list) {
+                                if (outNodeIdx < 0 ||
+                                    outNodeIdx >= (int)track.routingNodes.size()) continue;
+                                const auto& on = track.routingNodes[outNodeIdx];
+                                if (on.kind != Track::RoutingNode::Kind::Output) continue;
+                                int hw = on.channelOrTrack;
+                                if (hw < 0 || hw >= m_maxOutputChannels) continue;
+                                out[i * m_maxOutputChannels + hw] += sample * g_track;
+                            }
+                        };
+                        sendBus(track.routingStereoOutputsL, busL);
+                        sendBus(track.routingStereoOutputsR, busR);
                     } else {
                         float leftSample  = track.getSample(playPos, 0) * track.volume;
                         float rightSample = (track.channels > 1) ?
@@ -4432,6 +4508,19 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                 }
             }
             m_trackMeters[ti]->store(peak);
+        }
+    }
+
+    // Publish per-track per-stem playback peaks. When playback wasn't
+    // running (or the branch wasn't entered) the scratch stays at 0
+    // so the meter reads 0.
+    for (size_t ti = 0; ti < m_cbStemPeaks.size() &&
+                          ti < m_trackStemPeaks.size(); ti++) {
+        const auto& src = m_cbStemPeaks[ti];
+        auto&       dst = m_trackStemPeaks[ti];
+        size_t n = std::min(src.size(), dst.size());
+        for (size_t s = 0; s < n; s++) {
+            if (dst[s]) dst[s]->store(src[s]);
         }
     }
 
@@ -4587,6 +4676,23 @@ int AudioEngine::addTrack(const std::string& name) {
     m_tracks.push_back(track);
     int newIndex = static_cast<int>(m_tracks.size()) - 1;
     m_selectedTrack = newIndex;
+
+    // Grow per-track meter arrays alongside the tracks vector so the
+    // audio callback and GUI can read/write by trackIdx without bounds
+    // checks each buffer.
+    while (m_trackMeters.size() < m_tracks.size()) {
+        m_trackMeters.emplace_back(std::make_unique<std::atomic<float>>(0.0f));
+    }
+    while (m_trackStemPeaks.size() < m_tracks.size()) {
+        std::vector<std::unique_ptr<std::atomic<float>>> row;
+        for (int s = 0; s < STEM_METERS_MAX; s++)
+            row.push_back(std::make_unique<std::atomic<float>>(0.0f));
+        m_trackStemPeaks.push_back(std::move(row));
+    }
+    if (m_cbStemPeaks.size() < m_tracks.size()) {
+        m_cbStemPeaks.resize(m_tracks.size(),
+                             std::vector<float>(STEM_METERS_MAX, 0.0f));
+    }
 
     std::cout << "Added track: " << track.name << " (index " << newIndex << ")" << std::endl;
     dawLog("addTrack idx=%d name='%s' totalTracks=%zu",

@@ -71,8 +71,18 @@ struct Track {
     // Each mode keeps its own cable list so switching preserves state.
     int  routingOutputMode = 0;
     std::vector<int> routingMonoOutputs;    // indices into routingNodes[] (Output kind)
+    // Per-stem gain in dB applied inside the mono mixer. Range −60 to
+    // +12 dB, default 0. Missing entries are treated as 0 dB (unity).
+    std::vector<float> routingMonoGainsDb;
+    // STEREO mode: independent gain/pan per stem + separate L / R
+    // output cable lists.
+    std::vector<float> routingStereoGainsDb;
+    std::vector<float> routingStereoPans;      // -1..+1, 0 = centre
+    std::vector<int>   routingStereoOutputsL;
+    std::vector<int>   routingStereoOutputsR;
     float routingMixerX = 0.0f;
     float routingMixerY = 0.0f;
+    float routingMixerW = 170.0f;  // resizable width for MONO/STEREO mixer
     // Convenience: a track is "routed" (owned by patchbay) as soon as
     // it has ANY cable, in either direction.
     bool hasRouting() const {

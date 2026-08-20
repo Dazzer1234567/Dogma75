@@ -205,6 +205,14 @@ public:
         const auto& m = m_inputMetersRMS[chan];
         return m ? m->load() : 0.0f;
     }
+    // Per-track per-stem playback peak (updated every audio callback,
+    // reads 0 when not playing).
+    float getTrackStemMeter(int trackIdx, int stem) const {
+        if (trackIdx < 0 || trackIdx >= (int)m_trackStemPeaks.size()) return 0.0f;
+        const auto& row = m_trackStemPeaks[trackIdx];
+        if (stem < 0 || stem >= (int)row.size()) return 0.0f;
+        return row[stem] ? row[stem]->load() : 0.0f;
+    }
     int getSelectedTrack() const { return m_selectedTrack; }
     void setSelectedTrack(int trackIndex) { m_selectedTrack = trackIndex; }
     bool loadTrackAudio(int trackIndex, const std::string& filepath);
@@ -621,6 +629,15 @@ private:
     // the GUI. Stored via unique_ptr because atomic<float> is neither
     // copyable nor movable, so a bare vector wouldn't support push_back.
     std::vector<std::unique_ptr<std::atomic<float>>> m_trackMeters;
+    // Per-track per-stem playback peak meters — set each callback from
+    // the actual samples routed through the track's routing (mixer
+    // faders applied). Read by the routing page's mixer meters.
+    // Fixed 32-slot rows per track; stems beyond that read 0.
+    static constexpr int STEM_METERS_MAX = 32;
+    std::vector<std::vector<std::unique_ptr<std::atomic<float>>>> m_trackStemPeaks;
+    // Scratch used by the audio callback to gather per-stem peaks
+    // across the buffer before storing them atomically at the end.
+    mutable std::vector<std::vector<float>>                       m_cbStemPeaks;
     // Per-input-channel instantaneous peaks + per-buffer RMS —
     // populated each buffer in the audio callback, read by the routing
     // page for its meters (peak marker + RMS bar respectively).

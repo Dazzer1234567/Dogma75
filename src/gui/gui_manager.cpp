@@ -4080,6 +4080,11 @@ void GUIManager::renderRoutingPage() {
                           ImVec2(canvasPos.x + canvasSz.x,
                                  canvasPos.y + canvasSz.y),
                           IM_COL32(20, 22, 28, 255));
+        // Allow items drawn AFTER the canvas InvisibleButton (mixer
+        // sliders, in-node InputTexts, etc.) to take hover/click
+        // priority over it. Without this the InvisibleButton captures
+        // every click in its rect and the widgets on top can't drag.
+        ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton("routingCanvasArea", canvasSz);
 
         // First-time positioning of the track node — centre of canvas.
@@ -4202,35 +4207,49 @@ void GUIManager::renderRoutingPage() {
                           r.first.y + HEADER_H + REGION_PAD_TOP + stem * BLOB_STEP);
         };
 
-        // Which output-side mode is active for this track. Only MULTI
-        // draws/uses routingOutputCables; MONO uses routingMonoOutputs
-        // and displays a Mono Mixer node between stems and outputs.
-        bool modeMulti = (selTrack->routingOutputMode == 0);
-        bool modeMono  = (selTrack->routingOutputMode == 2);
-        // Default-position the mono mixer to the right of the track
-        // node the first time this mode is entered.
-        if (modeMono && selTrack->routingMixerX == 0.0f &&
+        // Which output-side mode is active for this track. MULTI uses
+        // routingOutputCables. MONO shows a mixer node with 1 output
+        // blob; cables in routingMonoOutputs. STEREO shows a mixer
+        // node with 2 output blobs (L/R); cables in routingStereoOutputsL/R.
+        bool modeMulti  = (selTrack->routingOutputMode == 0);
+        bool modeStereo = (selTrack->routingOutputMode == 1);
+        bool modeMono   = (selTrack->routingOutputMode == 2);
+        bool modeHasMixer = modeMono || modeStereo;
+        // Default-position the mixer to the right of the track node
+        // the first time either mixed mode is entered.
+        if (modeHasMixer && selTrack->routingMixerX == 0.0f &&
             selTrack->routingMixerY == 0.0f) {
             selTrack->routingMixerX = selTrack->routingTrackNodeX + 220.0f;
             selTrack->routingMixerY = selTrack->routingTrackNodeY;
         }
         // Mixer node uses the same height and row-Y layout as the
         // track so its input blobs line up horizontally with the
-        // stems' output blobs — cables run straight across.
+        // stems' output blobs — cables run straight across. Width
+        // is per-track (routingMixerW) so the user can widen it to
+        // fit the faders / meters comfortably.
         auto mixerRect = [&]() -> std::pair<ImVec2, ImVec2> {
             float cx = canvasPos.x + selTrack->routingMixerX;
             float cy = canvasPos.y + selTrack->routingMixerY;
-            return { ImVec2(cx - NODE_W * 0.5f, cy - trackH * 0.5f),
-                     ImVec2(cx + NODE_W * 0.5f, cy + trackH * 0.5f) };
+            float w  = selTrack->routingMixerW;
+            if (w < 120.0f) w = 120.0f;
+            return { ImVec2(cx - w * 0.5f, cy - trackH * 0.5f),
+                     ImVec2(cx + w * 0.5f, cy + trackH * 0.5f) };
         };
         auto mixerInPos = [&](int stem) -> ImVec2 {
             auto r = mixerRect();
             return ImVec2(r.first.x,
                           r.first.y + HEADER_H + REGION_PAD_TOP + stem * BLOB_STEP);
         };
-        auto mixerOutPos = [&]() -> ImVec2 {
+        // MONO → single output blob at centre right. STEREO → 2 blobs,
+        // L in the upper-third of the right edge, R in the lower-third.
+        auto mixerOutPos = [&](int side) -> ImVec2 {
             auto r = mixerRect();
-            return ImVec2(r.second.x, (r.first.y + r.second.y) * 0.5f);
+            float ymid = (r.first.y + r.second.y) * 0.5f;
+            if (modeStereo) {
+                float dy = trackH * 0.22f;
+                return ImVec2(r.second.x, (side == 0) ? (ymid - dy) : (ymid + dy));
+            }
+            return ImVec2(r.second.x, ymid);
         };
 
         // Stem flow-trace lambda — for each stem row: either draw a
@@ -4320,12 +4339,10 @@ void GUIManager::renderRoutingPage() {
                                       IM_COL32(160, 220, 130, 220), 2.5f, 24);
             }
         }
-        // MONO mode: one cable per stem from the stem's output blob
-        // to its own dedicated blob on the mixer (same yellow style
-        // as input cables), plus user-created mono cables from the
-        // mixer output → Output nodes (green like other output cables).
-        if (modeMono) {
-            ImVec2 mOut = mixerOutPos();
+        // MONO / STEREO mode: yellow cables from each stem output blob
+        // to its own blob on the mixer, plus green cables from mixer
+        // OUT blob(s) to the cabled Output nodes.
+        if (modeHasMixer) {
             for (int s = 0; s < stemN; s++) {
                 ImVec2 a = trackOutputBlobPos(s);
                 ImVec2 b = mixerInPos(s);
@@ -4334,15 +4351,21 @@ void GUIManager::renderRoutingPage() {
                                       ImVec2(b.x - dx, b.y), b,
                                       IM_COL32(230, 200, 80, 220), 2.5f, 24);
             }
-            for (int outNodeIdx : selTrack->routingMonoOutputs) {
-                if (outNodeIdx < 0 || outNodeIdx >= (int)nodes.size()) continue;
-                if (nodes[outNodeIdx].kind != RoutingNode::Kind::Output) continue;
-                ImVec2 b = outputNodeInPortPos(outNodeIdx);
-                float dx = (b.x - mOut.x) * 0.5f;
-                dl->AddBezierCubic(mOut, ImVec2(mOut.x + dx, mOut.y),
-                                        ImVec2(b.x - dx, b.y), b,
-                                        IM_COL32(160, 220, 130, 220), 2.5f, 24);
-            }
+            auto drawOutCables = [&](const std::vector<int>& list, int side) {
+                ImVec2 mOut = mixerOutPos(side);
+                for (int outNodeIdx : list) {
+                    if (outNodeIdx < 0 || outNodeIdx >= (int)nodes.size()) continue;
+                    if (nodes[outNodeIdx].kind != RoutingNode::Kind::Output) continue;
+                    ImVec2 b = outputNodeInPortPos(outNodeIdx);
+                    float dx = (b.x - mOut.x) * 0.5f;
+                    dl->AddBezierCubic(mOut, ImVec2(mOut.x + dx, mOut.y),
+                                            ImVec2(b.x - dx, b.y), b,
+                                            IM_COL32(160, 220, 130, 220), 2.5f, 24);
+                }
+            };
+            if (modeMono)   drawOutCables(selTrack->routingMonoOutputs,    0);
+            if (modeStereo) drawOutCables(selTrack->routingStereoOutputsL, 0);
+            if (modeStereo) drawOutCables(selTrack->routingStereoOutputsR, 1);
         }
         // In-progress input cable (dragging from an Input node).
         if (m_routingDragFromNode >= 0 &&
@@ -4707,36 +4730,177 @@ void GUIManager::renderRoutingPage() {
             }
         }
 
-        // MONO mixer node — draw + hover detect. Has N input blobs
-        // (one per stem, Y-aligned with the track's stem outputs) and
-        // ONE output blob at vertical centre.
+        // MONO / STEREO mixer node — draw + hover detect. Has N input
+        // blobs (one per stem, Y-aligned with the track's stem outputs)
+        // and 1 (MONO) or 2 (STEREO L/R) output blobs.
         bool draggingMixerOut = (m_routingMixerOutDrag >= 0);
-        if (modeMono) {
+        int  hoveredMixerOutSide = -1;   // 0 = L/mono, 1 = R (stereo)
+        if (modeHasMixer) {
             auto r = mixerRect();
             ImVec2 tl = r.first, br = r.second;
             dl->AddRectFilled(tl, br, IM_COL32(115, 100, 55, 240), 6.0f);
             dl->AddRect(tl, br, IM_COL32(220, 220, 220, 200), 6.0f, 0, 1.5f);
-            const char* mxLbl = "MONO MIX";
+            const char* mxLbl = modeStereo ? "STEREO MIX" : "MONO MIX";
             ImVec2 ts = ImGui::CalcTextSize(mxLbl);
             dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f, tl.y + 4),
                         IM_COL32_WHITE, mxLbl);
-            for (int s = 0; s < stemN; s++) {
-                dl->AddCircleFilled(mixerInPos(s), 5.0f, portOrange, 12);
+            // Grow the mode-specific gain (and pan) vectors to cover
+            // the current stem count so the slider bindings stay valid.
+            std::vector<float>& gainVec = modeStereo
+                ? selTrack->routingStereoGainsDb
+                : selTrack->routingMonoGainsDb;
+            while ((int)gainVec.size() < stemN) gainVec.push_back(0.0f);
+            if (modeStereo) {
+                while ((int)selTrack->routingStereoPans.size() < stemN)
+                    selTrack->routingStereoPans.push_back(0.0f);
             }
-            ImVec2 mOut = mixerOutPos();
-            bool mxOutBh = canvasMouseIn &&
-                std::fabs(mouse.x - mOut.x) < 14 &&
-                std::fabs(mouse.y - mOut.y) < 14;
-            ImU32 mxOutCol = (draggingMixerOut && mxOutBh) ? portBlue : portOrange;
-            dl->AddCircleFilled(mOut, 5.0f, mxOutCol, 12);
-            if (mxOutBh) hoveredMixerOut = true;
+            for (int s = 0; s < stemN; s++) {
+                ImVec2 blobPos = mixerInPos(s);
+                dl->AddCircleFilled(blobPos, 5.0f, portOrange, 12);
+                // Row layout inside the mixer.
+                //   MONO:   [blob][fader ~50%][meter ~50%]
+                //   STEREO: [blob][fader ~40%][pan ~20%][meter ~40%]
+                float rowY     = blobPos.y;
+                float rowLeft  = tl.x + 14.0f;
+                float rowRight = br.x - 8.0f;
+                float rowW     = rowRight - rowLeft;
+                if (rowW < 20.0f) continue;
+                float meterH   = 10.0f;
+                float faderW, panW, meterW;
+                if (modeStereo) {
+                    float avail = rowW - 8.0f;   // two 4-px gaps
+                    faderW = avail * 0.42f;
+                    meterW = avail * 0.42f;
+                    panW   = avail * 0.16f;
+                    if (panW < 24.0f) panW = 24.0f;
+                } else {
+                    float halfW = (rowW - 6.0f) * 0.5f;
+                    if (halfW < 20.0f) halfW = 20.0f;
+                    faderW = halfW;
+                    meterW = halfW;
+                    panW   = 0.0f;
+                }
+                float faderH   = ImGui::GetFrameHeight();
+                float faderY   = rowY - faderH * 0.5f;
+                float panX     = rowLeft + faderW + 4.0f;
+                float meterX   = modeStereo ? (panX + panW + 4.0f)
+                                            : (rowLeft + faderW + 6.0f);
+                float meterY   = rowY - meterH * 0.5f;
+                // ---- Fader ----
+                ImGui::PushID(3000 + s);
+                ImGui::SetCursorScreenPos(ImVec2(rowLeft, faderY));
+                ImGui::SetNextItemWidth(faderW);
+                float dbVal = gainVec[s];
+                if (ImGui::SliderFloat("##mixFader", &dbVal, -60.0f, 12.0f,
+                                       "%.1f dB", ImGuiSliderFlags_AlwaysClamp)) {
+                    gainVec[s] = dbVal;
+                }
+                if (ImGui::IsItemHovered() &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    gainVec[s] = 0.0f;
+                }
+                if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    mouseOverNodeText = true;
+                ImGui::PopID();
+                // ---- Pan knob (STEREO only) ----
+                if (modeStereo) {
+                    ImGui::PushID(4000 + s);
+                    ImGui::SetCursorScreenPos(ImVec2(panX, faderY));
+                    ImGui::SetNextItemWidth(panW);
+                    float panVal = selTrack->routingStereoPans[s];
+                    if (ImGui::SliderFloat("##mixPan", &panVal, -1.0f, 1.0f,
+                                           "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+                        selTrack->routingStereoPans[s] = panVal;
+                    }
+                    if (ImGui::IsItemHovered() &&
+                        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        selTrack->routingStereoPans[s] = 0.0f;
+                    }
+                    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                        mouseOverNodeText = true;
+                    ImGui::PopID();
+                }
+                // ---- Level meter — uses the hardware-input peak that
+                // feeds this stem. Solid dark frame with a green→yellow
+                // →red level fill.
+                dl->AddRectFilled(ImVec2(meterX, meterY),
+                                  ImVec2(meterX + meterW, meterY + meterH),
+                                  IM_COL32(15, 30, 55, 255), 2.0f);
+                // Playback level for this stem (post per-stem gain).
+                // Reads 0 whenever the transport isn't playing.
+                float lvl = m_audioEngine->isPlaying()
+                            ? m_audioEngine->getTrackStemMeter(selIdx, s)
+                            : 0.0f;
+                if (lvl > 1.0f) lvl = 1.0f;
+                if (lvl > 0.0f) {
+                    ImU32 c = (lvl < 0.7f)
+                              ? IM_COL32( 60, 190, 100, 220)
+                              : (lvl < 0.95f)
+                                  ? IM_COL32(210, 190,  40, 220)
+                                  : IM_COL32(230,  70,  60, 230);
+                    dl->AddRectFilled(ImVec2(meterX, meterY),
+                                      ImVec2(meterX + meterW * lvl,
+                                             meterY + meterH),
+                                      c, 2.0f);
+                }
+            }
+            // Output blob(s): 1 for MONO, 2 (L/R) for STEREO.
+            int nOutBlobs = modeStereo ? 2 : 1;
+            for (int side = 0; side < nOutBlobs; side++) {
+                ImVec2 mOut = mixerOutPos(side);
+                bool bh = canvasMouseIn &&
+                    std::fabs(mouse.x - mOut.x) < 14 &&
+                    std::fabs(mouse.y - mOut.y) < 14;
+                ImU32 col = (draggingMixerOut && bh) ? portBlue : portOrange;
+                dl->AddCircleFilled(mOut, 5.0f, col, 12);
+                if (bh) { hoveredMixerOut = true; hoveredMixerOutSide = side; }
+                if (modeStereo) {
+                    const char* lbl = (side == 0) ? "L" : "R";
+                    ImVec2 ts = ImGui::CalcTextSize(lbl);
+                    dl->AddText(ImVec2(mOut.x - 12 - ts.x, mOut.y - ts.y * 0.5f),
+                                IM_COL32(220, 220, 220, 220), lbl);
+                }
+            }
             if (draggingMixerOut) {
-                ImVec2 a = mOut;
+                ImVec2 a = mixerOutPos(m_routingMixerOutDrag);
                 ImVec2 b(m_routingDragCursorX, m_routingDragCursorY);
                 float dx = (b.x - a.x) * 0.5f;
                 dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
                                       ImVec2(b.x - dx, b.y), b,
                                       IM_COL32(160, 220, 130, 180), 2.0f, 24);
+            }
+            // Horizontal resize grip — small square at the bottom-right
+            // corner. Dragging horizontally adjusts routingMixerW. Uses
+            // an InvisibleButton with AllowOverlap so the canvas doesn't
+            // steal the click.
+            {
+                const float gripSz = 12.0f;
+                ImVec2 gripTl(br.x - gripSz, br.y - gripSz);
+                ImVec2 gripBr(br.x, br.y);
+                ImGui::SetCursorScreenPos(gripTl);
+                ImGui::PushID(3900);
+                ImGui::SetNextItemAllowOverlap();
+                ImGui::InvisibleButton("##mxResize", ImVec2(gripSz, gripSz));
+                bool hov = ImGui::IsItemHovered();
+                bool act = ImGui::IsItemActive();
+                if (hov || act) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                if (act) {
+                    float dx = ImGui::GetIO().MouseDelta.x;
+                    // Grip sits on the right edge — dragging right widens
+                    // by 2×dx (mixer is centre-anchored on routingMixerX).
+                    selTrack->routingMixerW += dx * 2.0f;
+                    if (selTrack->routingMixerW < 120.0f) selTrack->routingMixerW = 120.0f;
+                    if (selTrack->routingMixerW > 600.0f) selTrack->routingMixerW = 600.0f;
+                }
+                if (hov || act) mouseOverNodeText = true;
+                ImU32 gripCol = act ? IM_COL32(180, 200, 240, 240)
+                              : hov ? IM_COL32(140, 160, 200, 220)
+                                    : IM_COL32( 80,  95, 130, 200);
+                dl->AddTriangleFilled(ImVec2(gripBr.x - gripSz, gripBr.y),
+                                      ImVec2(gripBr.x,          gripBr.y),
+                                      ImVec2(gripBr.x,          gripBr.y - gripSz),
+                                      gripCol);
+                ImGui::PopID();
             }
         }
 
@@ -4769,7 +4933,7 @@ void GUIManager::renderRoutingPage() {
             else if (draggingRevOut)
                 srcX = outputNodeInPortPos(m_routingRevOutputDrag).x;
             else /* draggingMixerOut */
-                srcX = mixerOutPos().x;
+                srcX = mixerOutPos(m_routingMixerOutDrag).x;
             bool pointRight = (m_routingDragCursorX >= srcX);
             float dir = pointRight ? 1.0f : -1.0f;
             dl->AddTriangleFilled(
@@ -4978,9 +5142,10 @@ void GUIManager::renderRoutingPage() {
                     }
                 }
             } else if (hoveredMixerOut) {
-                // MONO mode: start a mixer-out cable drag. Drop on any
-                // Output node to route the mono mix there.
-                m_routingMixerOutDrag = 0;
+                // MONO / STEREO: start a mixer-out cable drag. Side
+                // records which blob was clicked (0 = L / mono, 1 = R).
+                m_routingMixerOutDrag = (hoveredMixerOutSide >= 0)
+                                        ? hoveredMixerOutSide : 0;
             } else if (hoveredTrackOutStem >= 0 && modeMulti) {
                 // MULTI mode only — per-stem output cabling.
                 m_routingDragFromStem = hoveredTrackOutStem;
@@ -5095,11 +5260,18 @@ void GUIManager::renderRoutingPage() {
                     m_routingRevOutputDrag = -1;
                 }
                 if (draggingMixerOut) {
-                    // MONO mixer-out drop: append the Output node to
-                    // the track's mono-outputs list. Duplicates are OK
-                    // (same node cabled twice sums twice at playback).
+                    // MONO / STEREO mixer-out drop: append the target
+                    // Output node to the appropriate cable list for
+                    // the current mode + side.
                     if (hoveredOutputDrop >= 0) {
-                        selTrack->routingMonoOutputs.push_back(hoveredOutputDrop);
+                        if (modeStereo) {
+                            if (m_routingMixerOutDrag == 1)
+                                selTrack->routingStereoOutputsR.push_back(hoveredOutputDrop);
+                            else
+                                selTrack->routingStereoOutputsL.push_back(hoveredOutputDrop);
+                        } else {
+                            selTrack->routingMonoOutputs.push_back(hoveredOutputDrop);
+                        }
                     }
                     m_routingMixerOutDrag = -1;
                 }
@@ -6170,10 +6342,41 @@ void GUIManager::saveSessionToPath(const std::string& filenameStr) {
             file << ",\n      \"routingOutputMode\": " << t->routingOutputMode;
             file << ",\n      \"routingMixerX\": "     << t->routingMixerX;
             file << ",\n      \"routingMixerY\": "     << t->routingMixerY;
+            file << ",\n      \"routingMixerW\": "     << t->routingMixerW;
             file << ",\n      \"routingMonoOutputs\": [";
             for (size_t mi = 0; mi < t->routingMonoOutputs.size(); mi++) {
                 file << t->routingMonoOutputs[mi]
                      << (mi + 1 < t->routingMonoOutputs.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingMonoGainsDb\": [";
+            for (size_t gi = 0; gi < t->routingMonoGainsDb.size(); gi++) {
+                file << t->routingMonoGainsDb[gi]
+                     << (gi + 1 < t->routingMonoGainsDb.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingStereoGainsDb\": [";
+            for (size_t gi = 0; gi < t->routingStereoGainsDb.size(); gi++) {
+                file << t->routingStereoGainsDb[gi]
+                     << (gi + 1 < t->routingStereoGainsDb.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingStereoPans\": [";
+            for (size_t pi = 0; pi < t->routingStereoPans.size(); pi++) {
+                file << t->routingStereoPans[pi]
+                     << (pi + 1 < t->routingStereoPans.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingStereoOutputsL\": [";
+            for (size_t i = 0; i < t->routingStereoOutputsL.size(); i++) {
+                file << t->routingStereoOutputsL[i]
+                     << (i + 1 < t->routingStereoOutputsL.size() ? "," : "");
+            }
+            file << "]";
+            file << ",\n      \"routingStereoOutputsR\": [";
+            for (size_t i = 0; i < t->routingStereoOutputsR.size(); i++) {
+                file << t->routingStereoOutputsR[i]
+                     << (i + 1 < t->routingStereoOutputsR.size() ? "," : "");
             }
             file << "]";
         }
@@ -6496,6 +6699,8 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
             if (mxKey != std::string::npos)  t->routingMixerX = (float)readNumber(mxKey);
             size_t myKey = keyIn("routingMixerY");
             if (myKey != std::string::npos)  t->routingMixerY = (float)readNumber(myKey);
+            size_t mwKey = keyIn("routingMixerW");
+            if (mwKey != std::string::npos)  t->routingMixerW = (float)readNumber(mwKey);
             size_t rmoKey = keyIn("routingMonoOutputs");
             if (rmoKey != std::string::npos) {
                 size_t arrOp = json.find('[', rmoKey);
@@ -6519,6 +6724,57 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
                     }
                 }
             }
+            auto readIntArrayInto = [&](const char* key, std::vector<int>& dst) {
+                size_t k = keyIn(key);
+                if (k == std::string::npos) return;
+                size_t arrOp = json.find('[', k);
+                size_t arrCl = (arrOp == std::string::npos)
+                               ? std::string::npos : json.find(']', arrOp);
+                if (arrOp == std::string::npos || arrCl == std::string::npos) return;
+                size_t p = arrOp + 1;
+                while (p < arrCl) {
+                    while (p < arrCl && (json[p] == ' ' || json[p] == ',' ||
+                                         json[p] == '\t' || json[p] == '\n' ||
+                                         json[p] == '\r')) p++;
+                    if (p >= arrCl) break;
+                    char* end = nullptr;
+                    long v = strtol(json.c_str() + p, &end, 10);
+                    if (end && end != json.c_str() + p) {
+                        dst.push_back((int)v);
+                        p = (size_t)(end - json.c_str());
+                    } else {
+                        p++;
+                    }
+                }
+            };
+            auto readFloatArrayInto = [&](const char* key, std::vector<float>& dst) {
+                size_t k = keyIn(key);
+                if (k == std::string::npos) return;
+                size_t arrOp = json.find('[', k);
+                size_t arrCl = (arrOp == std::string::npos)
+                               ? std::string::npos : json.find(']', arrOp);
+                if (arrOp == std::string::npos || arrCl == std::string::npos) return;
+                size_t p = arrOp + 1;
+                while (p < arrCl) {
+                    while (p < arrCl && (json[p] == ' ' || json[p] == ',' ||
+                                         json[p] == '\t' || json[p] == '\n' ||
+                                         json[p] == '\r')) p++;
+                    if (p >= arrCl) break;
+                    char* end = nullptr;
+                    double v = strtod(json.c_str() + p, &end);
+                    if (end && end != json.c_str() + p) {
+                        dst.push_back((float)v);
+                        p = (size_t)(end - json.c_str());
+                    } else {
+                        p++;
+                    }
+                }
+            };
+            readFloatArrayInto("routingMonoGainsDb",   t->routingMonoGainsDb);
+            readFloatArrayInto("routingStereoGainsDb", t->routingStereoGainsDb);
+            readFloatArrayInto("routingStereoPans",    t->routingStereoPans);
+            readIntArrayInto  ("routingStereoOutputsL", t->routingStereoOutputsL);
+            readIntArrayInto  ("routingStereoOutputsR", t->routingStereoOutputsR);
         }
         if (!filePath.empty()) {
             m_audioEngine->loadTrackAudio(newIdx, filePath);
