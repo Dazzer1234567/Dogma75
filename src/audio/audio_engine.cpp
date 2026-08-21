@@ -157,6 +157,13 @@ bool AudioEngine::initialize() {
         std::lock_guard<std::mutex> lock(m_pendingAntelopeMuteMutex);
         m_pendingAntelopeMutes.emplace_back(channel, muted);
     });
+    // Same for level: any change to the Antelope mixer's channel level
+    // (from the CP, a physical fader, or another authoritative client)
+    // gets queued and picked up on the main thread.
+    m_antelope->setLevelChangeCallback([this](int mixerId, int channel, int level) {
+        std::lock_guard<std::mutex> lock(m_pendingAntelopeLevelMutex);
+        m_pendingAntelopeLevels.push_back({mixerId, channel, level});
+    });
 
     return true;
 }
@@ -1819,6 +1826,43 @@ void AudioEngine::handleEncoderDelta(int encoder, long delta, float rpm, float v
         pushPlaybackStateToOled();
     }
 
+    // Pad-24 Vol/Pan mode overrides E1/E2 normal jobs.
+    if (m_volPanMode.load() && (encoder == 1 || encoder == 2)) {
+        int idx = getSelectedTrack();
+        Track* t = getTrack(idx);
+        if (!t) return;
+        if (encoder == 1) {
+            // Volume: 100× less sensitive than "1 dB per tick" — the
+            // encoder emits large bursts under velocity-curve, so we
+            // accumulate and only step by whole dBs.
+            m_volPanE1Accum += (float)delta * 0.01f;
+            int dbDelta = (int)m_volPanE1Accum;
+            if (dbDelta != 0) {
+                m_volPanE1Accum -= (float)dbDelta;
+                float v = t->volume;
+                int db = (v <= 0.0001f)
+                         ? -95
+                         : (int)std::round(20.0f * std::log10(v));
+                db += dbDelta;
+                if (db < -95) db = -95;
+                if (db >   0) db =   0;
+                t->volume = (db <= -95) ? 0.0f
+                                        : std::pow(10.0f, (float)db / 20.0f);
+                pushTrackVolume(idx);
+                markSessionDirty();
+            }
+        } else {
+            // Pan: 100× less sensitive to match the volume-fader feel
+            // (was 0.05 per tick, now 0.0005). Clamped to [-1..+1].
+            float p = t->pan + (float)delta * 0.0005f;
+            if (p < -1.0f) p = -1.0f;
+            if (p >  1.0f) p =  1.0f;
+            t->pan = p;
+            markSessionDirty();
+        }
+        return;
+    }
+
     if (encoder == 1) {
         // (Pad-13 + E1 bookmark navigation was retired — replaced by
         // pad-13 + pad 0/4 combos in the touch dispatcher.)
@@ -2602,6 +2646,73 @@ static bool channelShouldBeMuted(const std::vector<Track>& tracks, int channelId
     return anyRoutedHere ? true : true;
 }
 
+void AudioEngine::pushTrackVolume(int trackIndex) {
+    if (!m_antelope) return;
+    Track* t = getTrack(trackIndex);
+    if (!t) return;
+    // Resolve every distinct hardware output channel this track feeds
+    // (per-mode routing where present, else legacy combo).
+    std::set<int> chans1Based;
+    auto addNodeIdxChan = [&](int nodeIdx) {
+        if (nodeIdx < 0 || nodeIdx >= (int)t->routingNodes.size()) return;
+        const auto& n = t->routingNodes[nodeIdx];
+        if (n.kind != Track::RoutingNode::Kind::Output) return;
+        if (n.channelOrTrack < 0 || n.channelOrTrack >= m_maxOutputChannels) return;
+        chans1Based.insert(n.channelOrTrack + 1);
+    };
+    {
+        std::lock_guard<std::mutex> g(m_routingMutex);
+        int mode = t->routingOutputMode;
+        if (mode == 0) {   // MULTI
+            for (const auto& oc : t->routingOutputCables) addNodeIdxChan(oc.outputNodeIdx);
+        } else if (mode == 1) {   // STEREO
+            for (int ni : t->routingStereoOutputsL) addNodeIdxChan(ni);
+            for (int ni : t->routingStereoOutputsR) addNodeIdxChan(ni);
+        } else if (mode == 2) {   // MONO
+            for (int ni : t->routingMonoOutputs)    addNodeIdxChan(ni);
+        }
+    }
+    if (chans1Based.empty()) {
+        // No routing (or OFF) → fall back to the legacy I/O combo channels.
+        if (t->outputMono) {
+            if (t->outputMonoChan >= 0 && t->outputMonoChan < m_maxOutputChannels)
+                chans1Based.insert(t->outputMonoChan + 1);
+        } else {
+            if (t->outputLeftChan  >= 0 && t->outputLeftChan  < m_maxOutputChannels)
+                chans1Based.insert(t->outputLeftChan  + 1);
+            if (t->outputRightChan >= 0 && t->outputRightChan < m_maxOutputChannels)
+                chans1Based.insert(t->outputRightChan + 1);
+        }
+    }
+    // Volume → Antelope 0..95 dB attenuation scale. 0 = unity (0 dB),
+    // 95 = −∞. Linear 0..1 slider mapped through 20·log10.
+    int level;
+    if (t->volume <= 0.0001f) {
+        level = 95;
+    } else {
+        float db = -20.0f * std::log10(t->volume);
+        int l = (int)std::round(db);
+        if (l < 0) l = 0;
+        if (l > 95) l = 95;
+        level = l;
+    }
+    // Push to BOTH Antelope mixers (Mixer 1 = id 0, Mixer 2 = id 1)
+    // so the level stays in lock-step across the two independent buses
+    // — matches what physical fader movements do in the CP.
+    std::string chList;
+    for (int ch : chans1Based) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d ", ch);
+        chList += buf;
+    }
+    dawLog("pushTrackVolume: track=%d '%s' volume=%.4f → level=%d chans=[ %s]",
+           trackIndex, t->name.c_str(), t->volume, level, chList.c_str());
+    for (int ch : chans1Based) {
+        m_antelope->setChannelLevel(0, ch, level);
+        m_antelope->setChannelLevel(1, ch, level);
+    }
+}
+
 void AudioEngine::setTrackInputMonitor(int trackIndex, bool on) {
     Track* t = getTrack(trackIndex);
     if (!t) return;
@@ -2881,13 +2992,8 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
             pushPlaybackStateToOled();
             return;
         }
-        if (pad == 24) {
-            // Pan modifier â€” mirror the normal handler so E2 can pan
-            // while nav mode is on. Skips the LED-8 toggle since all
-            // non-mute LEDs are dark in scroll mode.
-            m_panModifierHeld.store(pressed);
-            return;
-        }
+        // Pad 24 pan-modifier removed (2026-08-21): pad reserved for
+        // future use. E2 always zooms; scrub-via-pad-24 also gone.
         if (pad != 13) return;
         // pad 13: fall through to the existing press/release handling
         // below (which knows how to exit scroll mode on press).
@@ -3026,7 +3132,22 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
 
     // Simple modifier pads (both press and release update state):
     if (pad == 26) { touchHandlePad26(pressed); return; }
-    if (pad == 24) { m_panModifierHeld.store(pressed); return; }
+    // Pad 24: press-release TOGGLES a Vol/Pan mode. While the mode
+    // is on, E1 changes the selected track's volume and E2 changes
+    // its pan; LED 8 flashes as the on-state indicator. Press again
+    // to leave the mode.
+    if (pad == 24) {
+        if (!pressed) {
+            bool newState = !m_volPanMode.load();
+            m_volPanMode.store(newState);
+            m_volPanFlashOn = newState;   // start bright, or turn off
+            m_volPanE1Accum = 0.0f;       // discard any partial dB
+            if (m_serialController) {
+                m_serialController->sendMessage(newState ? "LED:8:ON" : "LED:8:OFF");
+            }
+        }
+        return;
+    }
     if (pad == 3)  { m_pad3Held.store(pressed);        return; }
     if (pad == 14) { m_pad14Held.store(pressed);       return; }
 
@@ -3210,6 +3331,14 @@ void AudioEngine::handleTouch(int pad, bool pressed) {
         return;
     }
 
+    // Routing-page focus: while the routing canvas is open, pads 0/4
+    // navigate the canvas's Input-node selection (up/down by Y) rather
+    // than the DAW's track selection. Intent is queued via an atomic
+    // and consumed by GUIManager on the next frame.
+    if ((pad == 0 || pad == 4) && m_routingPageActive.load()) {
+        m_routingNavIntent.store(pad == 0 ? -1 : +1);
+        return;
+    }
     // Track selection: pad 0 = previous, pad 4 = next, clamped.
     if (pad == 0 || pad == 4) {
         int n = getTrackCount();
@@ -3286,11 +3415,149 @@ void AudioEngine::applyPendingAntelopeMutes() {
     }
 }
 
+// Antelope broadcasts channel-level changes from every authoritative
+// client (including our own writes). Same idempotence rule as mutes:
+// if the incoming level matches what the track's current volume would
+// already map to, we don't touch anything — otherwise we'd ping-pong
+// forever with our own echo. We map channel → tracks by scanning
+// pushTrackVolume's channel enumeration in reverse.
+void AudioEngine::applyPendingAntelopeLevels() {
+    std::vector<PendingLevel> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingAntelopeLevelMutex);
+        if (m_pendingAntelopeLevels.empty()) return;
+        pending.swap(m_pendingAntelopeLevels);
+    }
+    bool changedAny = false;
+    auto trackFeedsChannel = [&](Track& t, int channel1Based) -> bool {
+        // Same enumeration as pushTrackVolume, folded into a lookup.
+        std::set<int> chans;
+        auto addNode = [&](int nodeIdx) {
+            if (nodeIdx < 0 || nodeIdx >= (int)t.routingNodes.size()) return;
+            const auto& n = t.routingNodes[nodeIdx];
+            if (n.kind != Track::RoutingNode::Kind::Output) return;
+            if (n.channelOrTrack < 0 || n.channelOrTrack >= m_maxOutputChannels) return;
+            chans.insert(n.channelOrTrack + 1);
+        };
+        {
+            std::lock_guard<std::mutex> g(m_routingMutex);
+            int mode = t.routingOutputMode;
+            if (mode == 0)      for (const auto& oc : t.routingOutputCables) addNode(oc.outputNodeIdx);
+            else if (mode == 1) { for (int ni : t.routingStereoOutputsL) addNode(ni);
+                                  for (int ni : t.routingStereoOutputsR) addNode(ni); }
+            else if (mode == 2) for (int ni : t.routingMonoOutputs)    addNode(ni);
+        }
+        if (chans.empty()) {
+            if (t.outputMono) {
+                if (t.outputMonoChan >= 0 && t.outputMonoChan < m_maxOutputChannels)
+                    chans.insert(t.outputMonoChan + 1);
+            } else {
+                if (t.outputLeftChan  >= 0 && t.outputLeftChan  < m_maxOutputChannels)
+                    chans.insert(t.outputLeftChan  + 1);
+                if (t.outputRightChan >= 0 && t.outputRightChan < m_maxOutputChannels)
+                    chans.insert(t.outputRightChan + 1);
+            }
+        }
+        return chans.count(channel1Based) != 0;
+    };
+    dawLog("applyPendingAntelopeLevels: draining %zu events", pending.size());
+    for (const auto& pl : pending) {
+        int mixerId = pl.mixerId;
+        int channel = pl.channel;
+        int level   = pl.level;
+        float newVolume = (level >= 95) ? 0.0f
+                                        : std::pow(10.0f, -(float)level / 20.0f);
+        for (size_t ti = 0; ti < m_tracks.size(); ti++) {
+            Track& t = m_tracks[ti];
+            if (!trackFeedsChannel(t, channel)) continue;
+            int currentPushLevel;
+            if (t.volume <= 0.0001f) currentPushLevel = 95;
+            else {
+                float db = -20.0f * std::log10(t.volume);
+                int l = (int)std::round(db);
+                if (l < 0) l = 0;
+                if (l > 95) l = 95;
+                currentPushLevel = l;
+            }
+            if (currentPushLevel == level) {
+                dawLog("  skip: mix=%d ch=%d level=%d track=%zu '%s' curVol=%.4f curPushLvl=%d (echo)",
+                       mixerId, channel, level, ti, t.name.c_str(), t.volume, currentPushLevel);
+                continue;
+            }
+            dawLog("  apply: mix=%d ch=%d level=%d track=%zu '%s' curVol=%.4f (was level %d) → newVol=%.4f",
+                   mixerId, channel, level, ti, t.name.c_str(),
+                   t.volume, currentPushLevel, newVolume);
+            t.volume = newVolume;
+            changedAny = true;
+            // Sync the OTHER mixer only — don't push back to the mixer
+            // that originated the change, or we'd fight the user's own
+            // drag on that fader. The originating mixer already has
+            // this level; only the other bus needs to follow.
+            int otherMixer = (mixerId == 0) ? 1 : 0;
+            // Enumerate hw channels for this track and push to the
+            // other mixer at each of them (same behaviour as
+            // pushTrackVolume, but half of it).
+            std::set<int> chans;
+            auto addNode = [&](int nodeIdx) {
+                if (nodeIdx < 0 || nodeIdx >= (int)t.routingNodes.size()) return;
+                const auto& n = t.routingNodes[nodeIdx];
+                if (n.kind != Track::RoutingNode::Kind::Output) return;
+                if (n.channelOrTrack < 0 || n.channelOrTrack >= m_maxOutputChannels) return;
+                chans.insert(n.channelOrTrack + 1);
+            };
+            {
+                std::lock_guard<std::mutex> g(m_routingMutex);
+                int mode = t.routingOutputMode;
+                if (mode == 0)      for (const auto& oc : t.routingOutputCables) addNode(oc.outputNodeIdx);
+                else if (mode == 1) { for (int ni : t.routingStereoOutputsL) addNode(ni);
+                                      for (int ni : t.routingStereoOutputsR) addNode(ni); }
+                else if (mode == 2) for (int ni : t.routingMonoOutputs)    addNode(ni);
+            }
+            if (chans.empty()) {
+                if (t.outputMono) {
+                    if (t.outputMonoChan >= 0 && t.outputMonoChan < m_maxOutputChannels)
+                        chans.insert(t.outputMonoChan + 1);
+                } else {
+                    if (t.outputLeftChan  >= 0 && t.outputLeftChan  < m_maxOutputChannels)
+                        chans.insert(t.outputLeftChan  + 1);
+                    if (t.outputRightChan >= 0 && t.outputRightChan < m_maxOutputChannels)
+                        chans.insert(t.outputRightChan + 1);
+                }
+            }
+            std::string chList;
+            for (int ch : chans) {
+                char b[16];
+                snprintf(b, sizeof(b), "%d ", ch);
+                chList += b;
+            }
+            dawLog("  → push otherMixer=%d level=%d chans=[ %s]",
+                   otherMixer, level, chList.c_str());
+            for (int ch : chans) m_antelope->setChannelLevel(otherMixer, ch, level);
+        }
+    }
+    if (changedAny) markSessionDirty();
+}
+
 void AudioEngine::updateController() {
     if (!m_serialController) return;
 
     // Fold in anything the Antelope mixer changed under us.
     applyPendingAntelopeMutes();
+    applyPendingAntelopeLevels();
+
+    // Pad-24 Vol/Pan mode: flash LED 8 at ~2 Hz while active.
+    {
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (m_volPanMode.load()) {
+            if (nowMs - m_volPanFlashLastMs >= 250) {
+                m_volPanFlashLastMs = nowMs;
+                m_volPanFlashOn = !m_volPanFlashOn;
+                m_serialController->sendMessage(
+                    m_volPanFlashOn ? "LED:8:ON" : "LED:8:OFF");
+            }
+        }
+    }
 
     // Periodic controller-state re-assert. Corrects any drift between
     // the DAW's LED shadow model and the firmware's actual pad LEDs
@@ -4096,7 +4363,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     // the legacy L/R output distribution.
                     bool routedOut = !track.routingOutputCables.empty();
                     if (routedOut) {
-                        float g = track.volume;
+                        float g = 1.0f;   // volume lives on the Antelope mixer
                         for (const auto& oc : track.routingOutputCables) {
                             if (oc.outputNodeIdx < 0 ||
                                 oc.outputNodeIdx >= (int)track.routingNodes.size()) continue;
@@ -4113,12 +4380,12 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                     } else {
                         float left0 = track.getSample(pos0, 0);
                         float left1 = track.getSample(pos1, 0);
-                        float leftSample = (left0 + frac * (left1 - left0)) * track.volume;
+                        float leftSample = (left0 + frac * (left1 - left0));   // volume on Antelope
                         float rightSample;
                         if (track.channels > 1) {
                             float right0 = track.getSample(pos0, 1);
                             float right1 = track.getSample(pos1, 1);
-                            rightSample = (right0 + frac * (right1 - right0)) * track.volume;
+                            rightSample = (right0 + frac * (right1 - right0));
                         } else {
                             rightSample = leftSample;
                         }
@@ -4271,7 +4538,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                                         (!track.routingStereoOutputsL.empty() ||
                                          !track.routingStereoOutputsR.empty());
                     if (routedMulti) {
-                        float g = track.volume * m_playFadeGain;
+                        float g = m_playFadeGain;   // volume lives on the Antelope mixer
                         for (const auto& oc : track.routingOutputCables) {
                             if (oc.outputNodeIdx < 0 ||
                                 oc.outputNodeIdx >= (int)track.routingNodes.size()) continue;
@@ -4284,7 +4551,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                                 track.getSample(playPos, oc.stemIdx) * g;
                         }
                     } else if (routedMono) {
-                        float g = track.volume * m_playFadeGain;
+                        float g = m_playFadeGain;   // volume lives on the Antelope mixer
                         float mono = 0.0f;
                         int nC = track.channels;
                         int nG = (int)track.routingMonoGainsDb.size();
@@ -4322,7 +4589,7 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                         // (equal-power) to build an L bus and an R bus,
                         // then distribute to whichever hardware outputs
                         // the user has cabled per side.
-                        float g_track = track.volume * m_playFadeGain;
+                        float g_track = m_playFadeGain;   // volume lives on the Antelope mixer
                         float busL = 0.0f, busR = 0.0f;
                         int nC = track.channels;
                         int nG = (int)track.routingStereoGainsDb.size();
@@ -4361,9 +4628,9 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                         sendBus(track.routingStereoOutputsL, busL);
                         sendBus(track.routingStereoOutputsR, busR);
                     } else {
-                        float leftSample  = track.getSample(playPos, 0) * track.volume;
+                        float leftSample  = track.getSample(playPos, 0);
                         float rightSample = (track.channels > 1) ?
-                            track.getSample(playPos, 1) * track.volume : leftSample;
+                            track.getSample(playPos, 1) : leftSample;
                         float panLeft = (track.pan <= 0) ? 1.0f : (1.0f - track.pan);
                         float panRight = (track.pan >= 0) ? 1.0f : (1.0f + track.pan);
                         leftSample  *= panLeft  * m_playFadeGain;
@@ -4458,10 +4725,16 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
             if (t.inputMonitor && in != nullptr && m_maxInputChannels > 0) {
                 std::vector<int> mChans;
                 trackInputChannels((int)ti, mChans);
-                bool useRouting = !mChans.empty();
+                // Only treat as "routed" when at least one cabled entry
+                // resolves to a valid hardware channel. Otherwise fall
+                // back to the legacy track-properties combo (avoids the
+                // silent-meter case where a stem exists in MONO/STEREO
+                // via an output-first drag but no input is cabled yet).
+                bool useRouting = false;
+                for (int ch : mChans) {
+                    if (ch >= 0 && ch < m_maxInputChannels) { useRouting = true; break; }
+                }
                 if (useRouting) {
-                    // Meter the loudest cabled input — matches what
-                    // the record path would actually capture.
                     for (unsigned long f = 0; f < framesPerBuffer; f++) {
                         for (int ch : mChans) {
                             if (ch < 0 || ch >= m_maxInputChannels) continue;
@@ -4499,10 +4772,10 @@ int AudioEngine::audioCallback(const void* inputBuffer, void* outputBuffer,
                 for (unsigned long f = 0; f < framesPerBuffer; f++) {
                     size_t p = bufStartPlayPos + f;
                     if (p >= trackFrames) break;
-                    float aL = std::fabs(t.getSample(p, 0)) * t.volume;
+                    float aL = std::fabs(t.getSample(p, 0));   // meter shows raw playback level
                     if (aL > peak) peak = aL;
                     if (t.channels > 1) {
-                        float aR = std::fabs(t.getSample(p, 1)) * t.volume;
+                        float aR = std::fabs(t.getSample(p, 1));
                         if (aR > peak) peak = aR;
                     }
                 }
@@ -4769,7 +5042,9 @@ AudioEngine::RoutingLock AudioEngine::lockRouting() const {
 bool AudioEngine::trackHasRouting(int trackIdx) const {
     std::lock_guard<std::mutex> g(m_routingMutex);
     const Track* t = getTrack(trackIdx);
-    return t && t->hasRouting();
+    // Mode 3 (OFF) means the routing graph is inactive — the track
+    // behaves as if it had no routing at all (legacy I/O combos win).
+    return t && t->hasRouting() && t->routingOutputMode != 3;
 }
 
 void AudioEngine::trackInputChannels(int trackIdx,
@@ -4778,6 +5053,7 @@ void AudioEngine::trackInputChannels(int trackIdx,
     std::lock_guard<std::mutex> g(m_routingMutex);
     const Track* t = getTrack(trackIdx);
     if (!t) return;
+    if (t->routingOutputMode == 3) return;    // OFF → no routed inputs
     outChans.reserve(t->routingInputCables.size());
     for (int nodeIdx : t->routingInputCables) {
         if (nodeIdx < 0 || nodeIdx >= (int)t->routingNodes.size()) {

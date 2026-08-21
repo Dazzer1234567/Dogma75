@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <chrono>
+#include <algorithm>
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -251,6 +253,11 @@ void AntelopeClient::setMuteChangeCallback(MuteChangeCallback cb) {
     m_onMuteChanged = std::move(cb);
 }
 
+void AntelopeClient::setLevelChangeCallback(LevelChangeCallback cb) {
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onLevelChanged = std::move(cb);
+}
+
 void AntelopeClient::setChannelMute(int channelId1Based, bool muted) {
     if (channelId1Based <= 0) return;
     ChState s = stateFor(/*mixerId*/ 0, channelId1Based);
@@ -262,6 +269,59 @@ void AntelopeClient::setChannelMute(int channelId1Based, bool muted) {
                     s.level, s.pan,
                     muted ? 1 : 0,
                     s.solo, s.send);
+}
+
+void AntelopeClient::setChannelLevel(int mixerId, int channelId1Based, int level0to95) {
+    if (channelId1Based <= 0) return;
+    if (level0to95 < 0)  level0to95 = 0;
+    if (level0to95 > 95) level0to95 = 95;
+    ChState s = stateFor(mixerId, channelId1Based);
+    dawLog("AntelopeClient: setChannelLevel mix=%d ch=%d L=%d (cached L=%d P=%d M=%d S=%d Snd=%d valid=%d)",
+           mixerId, channelId1Based, level0to95,
+           s.level, s.pan, s.mute, s.solo, s.send, s.valid ? 1 : 0);
+    notePushedLevel(mixerId, channelId1Based, level0to95);
+    sendSetMixerCfg(mixerId,
+                    channelId1Based,
+                    level0to95, s.pan,
+                    s.mute, s.solo, s.send);
+}
+
+static int64_t nowMsSteady() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void AntelopeClient::notePushedLevel(int mixerId, int channelId1Based, int level) {
+    uint32_t key = stateKey(mixerId, channelId1Based);
+    int64_t now = nowMsSteady();
+    std::lock_guard<std::mutex> lock(m_pendingEchoMutex);
+    auto& v = m_pendingEchoes[key];
+    // Drop any entries older than the TTL — the server clearly never
+    // echoed them back and we don't want a stale entry ambushing a
+    // real user change later.
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [&](const PendingEcho& e) { return now - e.ts > kPendingEchoTtlMs; }),
+            v.end());
+    v.push_back({level, now});
+}
+
+bool AntelopeClient::consumePendingEcho(int mixerId, int channelId1Based, int level) {
+    uint32_t key = stateKey(mixerId, channelId1Based);
+    int64_t now = nowMsSteady();
+    std::lock_guard<std::mutex> lock(m_pendingEchoMutex);
+    auto it = m_pendingEchoes.find(key);
+    if (it == m_pendingEchoes.end()) return false;
+    auto& v = it->second;
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [&](const PendingEcho& e) { return now - e.ts > kPendingEchoTtlMs; }),
+            v.end());
+    for (auto vi = v.begin(); vi != v.end(); ++vi) {
+        if (vi->level == level) {
+            v.erase(vi);
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------- Reader thread ----------------
@@ -409,18 +469,22 @@ void AntelopeClient::readerLoop() {
                     // overwriting the cache. Only mute transitions are
                     // reported — level/pan/send churn from the CP would
                     // otherwise fire the callback constantly.
-                    bool muteChanged = false;
+                    bool muteChanged  = false;
+                    bool levelChanged = false;
                     {
                         std::lock_guard<std::mutex> lock(m_stateMutex);
                         uint32_t key = stateKey(vals[0], vals[1]);
                         auto it = m_state.find(key);
-                        muteChanged = (it == m_state.end()) ||
-                                      (it->second.mute != st.mute);
+                        muteChanged  = (it == m_state.end()) ||
+                                       (it->second.mute  != st.mute);
+                        levelChanged = (it == m_state.end()) ||
+                                       (it->second.level != st.level);
                         m_state[key] = st;
                     }
-                    dawLog("AntelopeClient: rx set_mixer_cfg mix=%d ch=%d L=%d P=%d M=%d S=%d Snd=%d%s",
+                    dawLog("AntelopeClient: rx set_mixer_cfg mix=%d ch=%d L=%d P=%d M=%d S=%d Snd=%d%s%s",
                            vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6],
-                           muteChanged ? " [mute changed]" : "");
+                           muteChanged  ? " [mute changed]"  : "",
+                           levelChanged ? " [level changed]" : "");
                     if (muteChanged) {
                         MuteChangeCallback cb;
                         {
@@ -430,6 +494,27 @@ void AntelopeClient::readerLoop() {
                         // Called on the reader thread — the handler must
                         // not touch DAW state directly.
                         if (cb) cb(vals[1], st.mute != 0);
+                    }
+                    if (levelChanged) {
+                        // Suppress our own echoes. Every setChannelLevel
+                        // logs an expected level; the reader consumes
+                        // the first matching entry here. Prevents the
+                        // "delayed echo causes phantom apply → we push
+                        // back → oscillation" ping-pong we hit when
+                        // rapid CP-drag broadcasts and our writes are
+                        // both in flight at once.
+                        bool isEcho = consumePendingEcho(vals[0], vals[1], st.level);
+                        if (isEcho) {
+                            dawLog("AntelopeClient: rx mix=%d ch=%d L=%d — matched pending echo, suppressed",
+                                   vals[0], vals[1], st.level);
+                        } else {
+                            LevelChangeCallback cb;
+                            {
+                                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                                cb = m_onLevelChanged;
+                            }
+                            if (cb) cb(vals[0], vals[1], st.level);
+                        }
                     }
                 }
 

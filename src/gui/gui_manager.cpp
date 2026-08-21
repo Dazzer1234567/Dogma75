@@ -1160,6 +1160,14 @@ void GUIManager::processFrame() {
     }
     spaceWasPressed = spaceIsPressed;
 
+    // 'R' key: toggle the routing (patchbay) page. Ignored while any
+    // text input has keyboard focus so typing an "R" into a name field
+    // doesn't kick us in/out of the routing view.
+    if (ImGui::IsKeyPressed(ImGuiKey_R, false) &&
+        !io.WantTextInput && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt) {
+        m_routingPageActive = !m_routingPageActive;
+    }
+
     // 'A' key: open a WAV file dialog and load into the selected track.
     // Ctrl+A: clear the audio from the selected track (strip stays).
     // Uses ImGui's event-based IsKeyPressed (not the poll-based SDL keystate)
@@ -1245,6 +1253,11 @@ void GUIManager::processFrame() {
     float transportBarHeight = m_bloomEnabled ? 80.0f : 50.0f;
     float contentHeight = ImGui::GetContentRegionAvail().y - transportBarHeight - 10;
 
+    // Mirror the page-active flag onto the AudioEngine every frame so
+    // the controller's pad 0/4 handler knows whether to route those
+    // presses into the canvas's Input-node selection instead of the
+    // DAW's track selection.
+    if (m_audioEngine) m_audioEngine->setRoutingPageActive(m_routingPageActive);
     if (m_routingPageActive) {
         // Full-width routing page in place of the arrangement + track
         // panel. Transport bar still shows at the bottom so playback
@@ -1777,20 +1790,21 @@ void GUIManager::renderToolbar() {
     float rightButtonsX = io.DisplaySize.x - 155;
     ImGui::SetCursorPosX(rightButtonsX);
 
-    // "⇄" — toggles the routing (patchbay) page. Highlighted while
-    // active so it reads as a toggle, not a one-shot action.
+    // "R" — toggles the routing (patchbay) page. When active, a blue
+    // outline is drawn around the button so the letter stays readable
+    // (was a solid fill that hid the label).
     {
         bool routing = m_routingPageActive;
-        if (routing) {
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                  ImVec4(0.25f, 0.60f, 0.95f, 1.0f));
-        }
         if (ImGui::Button("R", ImVec2(30, 0))) {
             m_routingPageActive = !m_routingPageActive;
         }
-        if (routing) ImGui::PopStyleColor(2);
+        if (routing) {
+            ImVec2 mn = ImGui::GetItemRectMin();
+            ImVec2 mx = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRect(
+                mn, mx, IM_COL32(90, 170, 255, 255),
+                3.0f, 0, 2.5f);
+        }
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Toggle input-to-track routing view");
@@ -2202,15 +2216,27 @@ void GUIManager::renderTrackPanel(float width, float height) {
             ImGui::Text("Vol");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::SliderFloat("##vol", &track->volume, 0.0f, 1.0f, "%.2f"))
+            // Volume slider matches the Antelope fader: whole dB values
+            // from 0 (top / unity) down to −95 (silence). Backing store
+            // is still linear (track->volume 0..1) for compatibility;
+            // the slider converts to/from dB on the fly.
+            int volDb = (track->volume <= 0.0001f)
+                        ? -95
+                        : (int)std::round(20.0f * std::log10(track->volume));
+            if (volDb < -95) volDb = -95;
+            if (volDb >   0) volDb =   0;
+            if (ImGui::SliderInt("##vol", &volDb, -95, 0, "%d dB")) {
+                track->volume = (volDb <= -95) ? 0.0f
+                                               : std::pow(10.0f, (float)volDb / 20.0f);
                 m_audioEngine->markSessionDirty();
-            // Snapshot on drag start so a whole drag coalesces to one undo.
+                m_audioEngine->pushTrackVolume(i);
+            }
             if (ImGui::IsItemActivated()) m_audioEngine->undoSnapshot();
-            // Double-click to reset to unity gain.
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                 m_audioEngine->undoSnapshot();
-                track->volume = 1.0f;
+                track->volume = 1.0f;    // 0 dB = unity
                 m_audioEngine->markSessionDirty();
+                m_audioEngine->pushTrackVolume(i);
             }
 
             // --- Pan slider ---
@@ -2523,9 +2549,17 @@ void GUIManager::renderTrackPanel(float width, float height) {
                 // Fill up to `bar`, coloured by which dB band the tip is in.
                 float fillW = avail * bar;
                 ImU32 col;
-                if (bar >= 1.0f - 6.0f/60.0f)       col = IM_COL32(220,  60,  40, 255); // -6..0
-                else if (bar >= 1.0f - 18.0f/60.0f) col = IM_COL32(210, 180,  40, 255); // -18..-6
-                else                                col = IM_COL32( 40, 180,  70, 255); // below -18
+                // Colour by MODE, not by level:
+                //   Recording (armed + transport recording) → red
+                //   Playing back                             → green
+                //   Monitoring only (I on, no play/record)   → blue
+                bool isRec  = track->armed && m_audioEngine->isRecording();
+                bool isPlay = m_audioEngine->isPlaying() && !isRec;
+                bool isMon  = track->inputMonitor && !isRec && !isPlay;
+                if (isRec)      col = IM_COL32(220,  60,  40, 255);   // red
+                else if (isPlay) col = IM_COL32( 40, 180,  70, 255);  // green
+                else if (isMon)  col = IM_COL32( 80, 160, 255, 255);  // blue
+                else             col = IM_COL32(120, 130, 150, 200);  // idle grey
                 if (fillW > 1.0f) {
                     dl->AddRectFilled(p0, ImVec2(p0.x + fillW, p1.y), col, 2.0f);
                 }
@@ -3794,6 +3828,42 @@ void GUIManager::renderRoutingPage() {
         m_routingRubberActive = false;
         m_routingSelectionTrack = selIdx;
     }
+    // Ensure exactly one Input node is always selected when Inputs
+    // exist. Also honour any pad-0/4 nav intent from the controller.
+    if (selTrack) {
+        auto& _nodes = selTrack->routingNodes;
+        // Collect Input node indices sorted by Y (topmost first).
+        std::vector<int> inputsByY;
+        for (int i = 0; i < (int)_nodes.size(); i++)
+            if (_nodes[i].kind == Track::RoutingNode::Kind::Input)
+                inputsByY.push_back(i);
+        std::sort(inputsByY.begin(), inputsByY.end(),
+            [&](int a, int b) { return _nodes[a].posY < _nodes[b].posY; });
+        if (!inputsByY.empty()) {
+            // Determine which Input (if any) is currently selected.
+            int selInputIdx = -1;   // position in inputsByY
+            for (size_t p = 0; p < inputsByY.size(); p++) {
+                for (int ni : m_routingSelectedNodes) {
+                    if (ni == inputsByY[p]) { selInputIdx = (int)p; break; }
+                }
+                if (selInputIdx >= 0) break;
+            }
+            int nav = m_audioEngine->consumeRoutingNavIntent();
+            if (nav != 0) {
+                if (selInputIdx < 0) selInputIdx = 0;
+                selInputIdx += nav;
+                if (selInputIdx < 0) selInputIdx = 0;
+                if (selInputIdx >= (int)inputsByY.size())
+                    selInputIdx = (int)inputsByY.size() - 1;
+                m_routingSelectedNodes = { inputsByY[selInputIdx] };
+            } else if (m_routingSelectedNodes.empty()) {
+                // Nothing at all selected → auto-select the topmost
+                // Input. If the user has deliberately selected only
+                // the track/mixer, we leave their selection alone.
+                m_routingSelectedNodes = { inputsByY[0] };
+            }
+        }
+    }
     // Per-frame captured row rects for the input + output panels — used
     // by the rubber-band commit at the end of this function to test
     // which channel rows fell under the drag rectangle.
@@ -4050,25 +4120,29 @@ void GUIManager::renderRoutingPage() {
         {
             const ImVec2 btnSz(110.0f, 32.0f);
             const float  btnGap = 24.0f;
-            float totalW = btnSz.x * 3.0f + btnGap * 2.0f;
+            float totalW = btnSz.x * 4.0f + btnGap * 3.0f;
             float avail  = ImGui::GetContentRegionAvail().x;
             float leftX  = ImGui::GetCursorPosX() + std::max(0.0f, (avail - totalW) * 0.5f);
             ImGui::SetCursorPosX(leftX);
             auto modeBtn = [&](const char* lbl, int mode) {
                 bool active = (selTrack->routingOutputMode == mode);
-                if (active) {
-                    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.50f, 0.85f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.60f, 0.95f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.30f, 0.65f, 1.00f, 1.0f));
-                }
                 if (ImGui::Button(lbl, btnSz)) selTrack->routingOutputMode = mode;
-                if (active) ImGui::PopStyleColor(3);
+                if (active) {
+                    // Blue OUTLINE (not fill) so the label stays readable.
+                    ImVec2 mn = ImGui::GetItemRectMin();
+                    ImVec2 mx = ImGui::GetItemRectMax();
+                    ImGui::GetWindowDrawList()->AddRect(
+                        mn, mx, IM_COL32(90, 170, 255, 255),
+                        3.0f, 0, 2.5f);
+                }
             };
             modeBtn("MULTI",  0);
             ImGui::SameLine(0, btnGap);
             modeBtn("STEREO", 1);
             ImGui::SameLine(0, btnGap);
             modeBtn("MONO",   2);
+            ImGui::SameLine(0, btnGap);
+            modeBtn("OFF",    3);
         }
 
         ImVec2 canvasPos = ImGui::GetCursorScreenPos();
@@ -4086,6 +4160,17 @@ void GUIManager::renderRoutingPage() {
         // every click in its rect and the widgets on top can't drag.
         ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton("routingCanvasArea", canvasSz);
+
+        // OFF mode → skip all routing rendering + interaction. Track
+        // reverts to its legacy I/O combos (audio engine already
+        // treats mode == 3 as unrouted).
+        if (selTrack->routingOutputMode == 3) {
+            const char* offMsg = "Routing OFF — track uses I/O properties";
+            ImVec2 offTs = ImGui::CalcTextSize(offMsg);
+            dl->AddText(ImVec2(canvasPos.x + (canvasSz.x - offTs.x) * 0.5f,
+                               canvasPos.y + (canvasSz.y - offTs.y) * 0.5f),
+                        IM_COL32(160, 160, 170, 200), offMsg);
+        } else {
 
         // First-time positioning of the track node — centre of canvas.
         if (selTrack->routingTrackNodeX == 0.0f &&
@@ -4146,7 +4231,7 @@ void GUIManager::renderRoutingPage() {
         const float BLOB_STEP       = 55.0f;   // +30% row height
         const float REGION_MIN_H    = 32.0f;
         const ImU32 portOrange       = IM_COL32(240, 200,  60, 255);
-        const ImU32 portBlue         = IM_COL32( 90, 170, 255, 255);
+        const ImU32 portBlue         = IM_COL32(210, 235, 255, 255);   // drag-hover highlight
         const ImU32 portOrangeHollow = IM_COL32(240, 200,  60, 110);
 
         // How many cables land on a given Output node — Output nodes
@@ -4215,6 +4300,35 @@ void GUIManager::renderRoutingPage() {
         bool modeStereo = (selTrack->routingOutputMode == 1);
         bool modeMono   = (selTrack->routingOutputMode == 2);
         bool modeHasMixer = modeMono || modeStereo;
+        // Selection-aware colouring — the currently selected Input
+        // node's cables and its stem's flow trace / waveform light up
+        // orange; every other input-side wire and stem trace defaults
+        // to blue. Output-side cables (green) are unaffected.
+        int selectedInputNode = -1;
+        for (int ni : m_routingSelectedNodes) {
+            if (ni >= 0 && ni < (int)selTrack->routingNodes.size() &&
+                selTrack->routingNodes[ni].kind ==
+                    Track::RoutingNode::Kind::Input) {
+                selectedInputNode = ni;
+                break;
+            }
+        }
+        int selectedStem = -1;
+        for (int s = 0; s < (int)selTrack->routingInputCables.size(); s++) {
+            if (selTrack->routingInputCables[s] == selectedInputNode) {
+                selectedStem = s;
+                break;
+            }
+        }
+        const ImU32 wireBlue    = IM_COL32( 80, 160, 255, 220);
+        const ImU32 wireOrange  = IM_COL32(230, 200,  80, 220);
+        const ImU32 wireOrangeDim = IM_COL32(230, 200, 80, 110);
+        const ImU32 wireBlueDim = IM_COL32( 80, 160, 255, 110);
+        auto colForStem = [&](int stem, bool dim) {
+            if (stem == selectedStem)
+                return dim ? wireOrangeDim : wireOrange;
+            return dim ? wireBlueDim : wireBlue;
+        };
         // Default-position the mixer to the right of the track node
         // the first time either mixed mode is entered.
         if (modeHasMixer && selTrack->routingMixerX == 0.0f &&
@@ -4258,9 +4372,6 @@ void GUIManager::renderRoutingPage() {
         // orange trace. Placeholder row (s == stemN) always gets the
         // dimmer dashed line.
         auto drawStemTraces = [&]() {
-            const ImU32 traceCol     = IM_COL32(240, 170, 50, 220);
-            const ImU32 tracePlaceCol = IM_COL32(240, 170, 50, 110);
-            const ImU32 wfCol         = IM_COL32(240, 170, 50, 220);
             const float dashLen  = 3.0f;
             const float gapLen   = 3.0f;
             size_t totalFrames = selTrack->getTotalFrames();
@@ -4271,10 +4382,8 @@ void GUIManager::renderRoutingPage() {
                 bool hasWave = (s < stemN) && (s < audioChans) &&
                                (totalFrames > 0);
                 if (hasWave) {
-                    // Down-sampled envelope: 1 vertical line per pixel
-                    // column across the node, sparse-sampled to keep
-                    // the per-frame cost trivial.
-                    float halfMax = BLOB_STEP * 0.80f;   // 2× waveform gain
+                    ImU32 wfCol = colForStem(s, false);
+                    float halfMax = BLOB_STEP * 0.80f;
                     int nB = (int)(b.x - a.x);
                     if (nB < 1) nB = 1;
                     for (int bx = 0; bx < nB; bx++) {
@@ -4296,7 +4405,7 @@ void GUIManager::renderRoutingPage() {
                         dl->AddLine(ImVec2(x, y1), ImVec2(x, y2), wfCol, 1.0f);
                     }
                 } else {
-                    ImU32 col = (s < stemN) ? traceCol : tracePlaceCol;
+                    ImU32 col = colForStem(s, s >= stemN);   // dim on placeholder
                     float x = a.x;
                     while (x < b.x) {
                         float x2 = x + dashLen;
@@ -4320,7 +4429,7 @@ void GUIManager::renderRoutingPage() {
             float dx = (b.x - a.x) * 0.5f;   // signed — mirrors on back-drags
             dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
                                   ImVec2(b.x - dx, b.y), b,
-                                  IM_COL32(230, 200, 80, 220), 2.5f, 24);
+                                  colForStem(si, false), 2.5f, 24);
         }
         // Output cables (MULTI mode only): track's stem output blob →
         // Output node's single blob. Multiple cables landing on the
@@ -4349,7 +4458,7 @@ void GUIManager::renderRoutingPage() {
                 float dx = (b.x - a.x) * 0.5f;
                 dl->AddBezierCubic(a, ImVec2(a.x + dx, a.y),
                                       ImVec2(b.x - dx, b.y), b,
-                                      IM_COL32(230, 200, 80, 220), 2.5f, 24);
+                                      colForStem(s, false), 2.5f, 24);
             }
             auto drawOutCables = [&](const std::vector<int>& list, int side) {
                 ImVec2 mOut = mixerOutPos(side);
@@ -4529,8 +4638,9 @@ void GUIManager::renderRoutingPage() {
                 bool hh = canvasMouseIn &&
                     std::fabs(mouse.x - p.x) < 14 &&
                     std::fabs(mouse.y - p.y) < 14;
+                ImU32 idle = (i == selectedInputNode) ? portOrange : wireBlue;
                 dl->AddCircleFilled(p, 5.0f,
-                    ((draggingInput || draggingRevIn) && hh) ? portBlue : portOrange, 12);
+                    ((draggingInput || draggingRevIn) && hh) ? portBlue : idle, 12);
                 if (hh) hoveredInputNodeOut = i;
             } else {
                 ImVec2 p = outputNodeInPortPos(i);
@@ -4542,9 +4652,10 @@ void GUIManager::renderRoutingPage() {
                 bool blobHovered = canvasMouseIn &&
                     std::fabs(mouse.x - p.x) < 14 &&
                     std::fabs(mouse.y - p.y) < 14;
-                // Always solid orange (matches input node's blob look);
-                // turns blue when a drag drops directly on THIS blob.
-                ImU32 col = portOrange;
+                // Output-node blob: always blue idle (not tied to any
+                // specific input); brightens on drag-hover as the drop
+                // target.
+                ImU32 col = wireBlue;
                 if (draggingOutput && blobHovered) col = portBlue;
                 dl->AddCircleFilled(p, 5.0f, col, 12);
                 if (nodeMouseIn)               hoveredOutputNode = i;
@@ -4560,6 +4671,13 @@ void GUIManager::renderRoutingPage() {
             ImVec2 tl = r.first, br = r.second;
             dl->AddRectFilled(tl, br, IM_COL32(120, 55, 55, 240), 6.0f);
             dl->AddRect(tl, br, IM_COL32(200, 200, 200, 180), 6.0f, 0, 1.5f);
+            if (std::find(m_routingSelectedNodes.begin(),
+                          m_routingSelectedNodes.end(), -2)
+                != m_routingSelectedNodes.end()) {
+                dl->AddRect(ImVec2(tl.x - 1, tl.y - 1),
+                            ImVec2(br.x + 1, br.y + 1),
+                            IM_COL32(255, 255, 255, 245), 6.0f, 0, 2.5f);
+            }
             char titleLbl[64];
             snprintf(titleLbl, sizeof(titleLbl), "%s", selTrack->name.c_str());
             ImVec2 ts = ImGui::CalcTextSize(titleLbl);
@@ -4582,17 +4700,16 @@ void GUIManager::renderRoutingPage() {
                         std::fabs(mouse.x - p.x) < 14 &&
                         std::fabs(mouse.y - p.y) < 14;
                     if (cabled) {
+                        ImU32 idle = (s == selectedStem) ? portOrange : wireBlue;
                         dl->AddCircleFilled(p, 5.0f,
-                            (draggingInput && bh) ? portBlue : portOrange, 12);
+                            (draggingInput && bh) ? portBlue : idle, 12);
                         if (bh) hoveredTrackInStem = s;
                     } else if (draggingInput && bh) {
-                        // Empty blob = drop target while a forward
-                        // input cable is being dragged in.
                         dl->AddCircleFilled(p, 5.0f, portBlue, 12);
                         overTrackInputRegion = true;
                         if (s == stemN) hoveredTrackInEmpty = s;
                     } else {
-                        dl->AddCircle(p, 5.0f, portOrangeHollow, 12, 1.5f);
+                        dl->AddCircle(p, 5.0f, wireBlueDim, 12, 1.5f);
                         if (bh) hoveredTrackInEmpty = s;
                     }
                 }
@@ -4610,15 +4727,14 @@ void GUIManager::renderRoutingPage() {
                         std::fabs(mouse.x - p.x) < 14 &&
                         std::fabs(mouse.y - p.y) < 14;
                     if (valid) {
+                        ImU32 idle = (s == selectedStem) ? portOrange : wireBlue;
                         ImU32 col = ((draggingOutput || draggingRevOut) && bh)
-                                    ? portBlue : portOrange;
+                                    ? portBlue : idle;
                         dl->AddCircleFilled(p, 5.0f, col, 12);
                     } else if (draggingRevOut && bh) {
-                        // Placeholder turns solid blue as a drop target
-                        // for a reverse-output drag.
                         dl->AddCircleFilled(p, 5.0f, portBlue, 12);
                     } else {
-                        dl->AddCircle(p, 5.0f, portOrangeHollow, 12, 1.5f);
+                        dl->AddCircle(p, 5.0f, wireBlueDim, 12, 1.5f);
                     }
                     if (bh) hoveredTrackOutStem = s;
                 }
@@ -4740,6 +4856,13 @@ void GUIManager::renderRoutingPage() {
             ImVec2 tl = r.first, br = r.second;
             dl->AddRectFilled(tl, br, IM_COL32(115, 100, 55, 240), 6.0f);
             dl->AddRect(tl, br, IM_COL32(220, 220, 220, 200), 6.0f, 0, 1.5f);
+            if (std::find(m_routingSelectedNodes.begin(),
+                          m_routingSelectedNodes.end(), -3)
+                != m_routingSelectedNodes.end()) {
+                dl->AddRect(ImVec2(tl.x - 1, tl.y - 1),
+                            ImVec2(br.x + 1, br.y + 1),
+                            IM_COL32(255, 255, 255, 245), 6.0f, 0, 2.5f);
+            }
             const char* mxLbl = modeStereo ? "STEREO MIX" : "MONO MIX";
             ImVec2 ts = ImGui::CalcTextSize(mxLbl);
             dl->AddText(ImVec2((tl.x+br.x)*0.5f - ts.x*0.5f, tl.y + 4),
@@ -4756,7 +4879,8 @@ void GUIManager::renderRoutingPage() {
             }
             for (int s = 0; s < stemN; s++) {
                 ImVec2 blobPos = mixerInPos(s);
-                dl->AddCircleFilled(blobPos, 5.0f, portOrange, 12);
+                ImU32 mxInCol = (s == selectedStem) ? portOrange : wireBlue;
+                dl->AddCircleFilled(blobPos, 5.0f, mxInCol, 12);
                 // Row layout inside the mixer.
                 //   MONO:   [blob][fader ~50%][meter ~50%]
                 //   STEREO: [blob][fader ~40%][pan ~20%][meter ~40%]
@@ -4851,7 +4975,7 @@ void GUIManager::renderRoutingPage() {
                 bool bh = canvasMouseIn &&
                     std::fabs(mouse.x - mOut.x) < 14 &&
                     std::fabs(mouse.y - mOut.y) < 14;
-                ImU32 col = (draggingMixerOut && bh) ? portBlue : portOrange;
+                ImU32 col = (draggingMixerOut && bh) ? portBlue : wireBlue;
                 dl->AddCircleFilled(mOut, 5.0f, col, 12);
                 if (bh) { hoveredMixerOut = true; hoveredMixerOutSide = side; }
                 if (modeStereo) {
@@ -4869,39 +4993,41 @@ void GUIManager::renderRoutingPage() {
                                       ImVec2(b.x - dx, b.y), b,
                                       IM_COL32(160, 220, 130, 180), 2.0f, 24);
             }
-            // Horizontal resize grip — small square at the bottom-right
-            // corner. Dragging horizontally adjusts routingMixerW. Uses
-            // an InvisibleButton with AllowOverlap so the canvas doesn't
-            // steal the click.
-            {
-                const float gripSz = 12.0f;
-                ImVec2 gripTl(br.x - gripSz, br.y - gripSz);
-                ImVec2 gripBr(br.x, br.y);
-                ImGui::SetCursorScreenPos(gripTl);
-                ImGui::PushID(3900);
+            // Edge-drag resize strips — full-height thin bands along the
+            // LEFT and RIGHT edges. Dragging an edge moves ONLY that
+            // edge (opposite edge stays put). Mixer is centre-anchored
+            // on routingMixerX, so width and X are updated together:
+            //   right edge dx: width += dx, X += dx/2
+            //   left  edge dx: width -= dx, X += dx/2
+            auto edgeResize = [&](const char* id, ImVec2 tlPos, float sign) {
+                ImGui::SetCursorScreenPos(tlPos);
+                ImGui::PushID(id);
                 ImGui::SetNextItemAllowOverlap();
-                ImGui::InvisibleButton("##mxResize", ImVec2(gripSz, gripSz));
+                ImGui::InvisibleButton(id, ImVec2(6.0f, trackH));
                 bool hov = ImGui::IsItemHovered();
                 bool act = ImGui::IsItemActive();
                 if (hov || act) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
                 if (act) {
                     float dx = ImGui::GetIO().MouseDelta.x;
-                    // Grip sits on the right edge — dragging right widens
-                    // by 2×dx (mixer is centre-anchored on routingMixerX).
-                    selTrack->routingMixerW += dx * 2.0f;
+                    selTrack->routingMixerW += sign * dx;
+                    selTrack->routingMixerX += dx * 0.5f;
                     if (selTrack->routingMixerW < 120.0f) selTrack->routingMixerW = 120.0f;
                     if (selTrack->routingMixerW > 600.0f) selTrack->routingMixerW = 600.0f;
                 }
-                if (hov || act) mouseOverNodeText = true;
-                ImU32 gripCol = act ? IM_COL32(180, 200, 240, 240)
-                              : hov ? IM_COL32(140, 160, 200, 220)
-                                    : IM_COL32( 80,  95, 130, 200);
-                dl->AddTriangleFilled(ImVec2(gripBr.x - gripSz, gripBr.y),
-                                      ImVec2(gripBr.x,          gripBr.y),
-                                      ImVec2(gripBr.x,          gripBr.y - gripSz),
-                                      gripCol);
+                if (hov || act) {
+                    mouseOverNodeText = true;
+                    ImU32 col = act ? IM_COL32(180, 200, 240, 220)
+                                     : IM_COL32(140, 160, 200, 180);
+                    dl->AddRectFilled(ImGui::GetItemRectMin(),
+                                       ImGui::GetItemRectMax(), col);
+                }
                 ImGui::PopID();
-            }
+            };
+            // Sign convention matches the derivation above.
+            //   Right edge — dragging right widens (sign = +1).
+            //   Left edge  — dragging right narrows (sign = -1).
+            edgeResize("##mxResizeR", ImVec2(br.x - 3, tl.y), +1.0f);
+            edgeResize("##mxResizeL", ImVec2(tl.x - 3, tl.y), -1.0f);
         }
 
         // Arrowhead at cursor while dragging any cable — hidden when
@@ -4962,7 +5088,7 @@ void GUIManager::renderRoutingPage() {
                 mouse.y >= r.first.y && mouse.y <= r.second.y;
         }
         bool overMixerBody = false;
-        if (modeMono) {
+        if (modeHasMixer) {
             auto r = mixerRect();
             overMixerBody = canvasMouseIn &&
                 mouse.x >= r.first.x && mouse.x <= r.second.x &&
@@ -4983,7 +5109,11 @@ void GUIManager::renderRoutingPage() {
                 const RoutingNode& n = nodes[bodyIdx];
                 m_routingMoveOffsetX = mouse.x - (canvasPos.x + n.posX);
                 m_routingMoveOffsetY = mouse.y - (canvasPos.y + n.posY);
-                // Selecting this single node — Ctrl toggles instead.
+                // Selection rules mirror the panel behaviour:
+                //   Ctrl-click            → toggle in/out of selection
+                //   Plain click on selected node → KEEP the selection
+                //                                  (so drag moves the group)
+                //   Plain click on unselected    → replace with just this
                 bool ctrl = ImGui::GetIO().KeyCtrl;
                 auto it = std::find(m_routingSelectedNodes.begin(),
                                     m_routingSelectedNodes.end(), bodyIdx);
@@ -4992,17 +5122,39 @@ void GUIManager::renderRoutingPage() {
                         m_routingSelectedNodes.erase(it);
                     else
                         m_routingSelectedNodes.push_back(bodyIdx);
-                } else {
+                } else if (it == m_routingSelectedNodes.end()) {
                     m_routingSelectedNodes = { bodyIdx };
                 }
             } else if (overMixerBody) {
-                m_routingMoveNode = -3;   // mono mixer node
+                m_routingMoveNode = -3;   // mono/stereo mixer node
                 m_routingMoveOffsetX = mouse.x - (canvasPos.x + selTrack->routingMixerX);
                 m_routingMoveOffsetY = mouse.y - (canvasPos.y + selTrack->routingMixerY);
+                bool ctrl = ImGui::GetIO().KeyCtrl;
+                auto it = std::find(m_routingSelectedNodes.begin(),
+                                    m_routingSelectedNodes.end(), -3);
+                if (ctrl) {
+                    if (it != m_routingSelectedNodes.end())
+                        m_routingSelectedNodes.erase(it);
+                    else
+                        m_routingSelectedNodes.push_back(-3);
+                } else if (it == m_routingSelectedNodes.end()) {
+                    m_routingSelectedNodes = { -3 };
+                }
             } else if (overTrackNodeBody) {
                 m_routingMoveNode = -2;   // track node
                 m_routingMoveOffsetX = mouse.x - (canvasPos.x + selTrack->routingTrackNodeX);
                 m_routingMoveOffsetY = mouse.y - (canvasPos.y + selTrack->routingTrackNodeY);
+                bool ctrl = ImGui::GetIO().KeyCtrl;
+                auto it = std::find(m_routingSelectedNodes.begin(),
+                                    m_routingSelectedNodes.end(), -2);
+                if (ctrl) {
+                    if (it != m_routingSelectedNodes.end())
+                        m_routingSelectedNodes.erase(it);
+                    else
+                        m_routingSelectedNodes.push_back(-2);
+                } else if (it == m_routingSelectedNodes.end()) {
+                    m_routingSelectedNodes = { -2 };
+                }
             } else {
                 // Click on empty canvas → clear selection + start rubber-
                 // band. Rubber-band only draws if the user actually drags.
@@ -5031,16 +5183,33 @@ void GUIManager::renderRoutingPage() {
             if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 float dragW = x2 - x1, dragH = y2 - y1;
                 if (dragW > 3.0f || dragH > 3.0f) {
-                    // Nodes intersecting the rect join the selection.
+                    auto addSel = [&](int idx) {
+                        auto it = std::find(m_routingSelectedNodes.begin(),
+                                            m_routingSelectedNodes.end(), idx);
+                        if (it == m_routingSelectedNodes.end())
+                            m_routingSelectedNodes.push_back(idx);
+                    };
+                    // Regular Input/Output nodes.
                     for (int ni = 0; ni < (int)nodes.size(); ni++) {
                         auto rr = sideNodeRect(ni);
                         if (rr.first.x < x2 && rr.second.x > x1 &&
-                            rr.first.y < y2 && rr.second.y > y1) {
-                            auto it = std::find(m_routingSelectedNodes.begin(),
-                                                m_routingSelectedNodes.end(), ni);
-                            if (it == m_routingSelectedNodes.end())
-                                m_routingSelectedNodes.push_back(ni);
-                        }
+                            rr.first.y < y2 && rr.second.y > y1)
+                            addSel(ni);
+                    }
+                    // Track node (sentinel -2) + mixer node (sentinel
+                    // -3) so they can be rubber-banded and moved with
+                    // the rest of a group.
+                    {
+                        auto rr = trackNodeRect();
+                        if (rr.first.x < x2 && rr.second.x > x1 &&
+                            rr.first.y < y2 && rr.second.y > y1)
+                            addSel(-2);
+                    }
+                    if (modeHasMixer) {
+                        auto rr = mixerRect();
+                        if (rr.first.x < x2 && rr.second.x > x1 &&
+                            rr.first.y < y2 && rr.second.y > y1)
+                            addSel(-3);
                     }
                 }
                 // Note: don't clear m_routingRubberActive yet — the
@@ -5083,18 +5252,44 @@ void GUIManager::renderRoutingPage() {
             }
             m_routingSelectedNodes.clear();
         }
-        if (m_routingMoveNode == -2) {
-            selTrack->routingTrackNodeX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
-            selTrack->routingTrackNodeY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
-            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) m_routingMoveNode = -1;
-        } else if (m_routingMoveNode == -3) {
-            selTrack->routingMixerX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
-            selTrack->routingMixerY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
-            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) m_routingMoveNode = -1;
-        } else if (m_routingMoveNode >= 0 && m_routingMoveNode < (int)nodes.size()) {
-            RoutingNode& n = nodes[m_routingMoveNode];
-            n.posX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
-            n.posY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+        if (m_routingMoveNode != -1) {
+            // Group move if the moved node is part of a multi-selection.
+            bool inSel = std::find(m_routingSelectedNodes.begin(),
+                                   m_routingSelectedNodes.end(),
+                                   m_routingMoveNode)
+                         != m_routingSelectedNodes.end();
+            if (inSel && m_routingSelectedNodes.size() > 1) {
+                ImVec2 d = ImGui::GetIO().MouseDelta;
+                if (d.x != 0.0f || d.y != 0.0f) {
+                    for (int ni : m_routingSelectedNodes) {
+                        if (ni == -2) {
+                            selTrack->routingTrackNodeX += d.x;
+                            selTrack->routingTrackNodeY += d.y;
+                        } else if (ni == -3 && modeHasMixer) {
+                            selTrack->routingMixerX += d.x;
+                            selTrack->routingMixerY += d.y;
+                        } else if (ni >= 0 && ni < (int)nodes.size()) {
+                            nodes[ni].posX += d.x;
+                            nodes[ni].posY += d.y;
+                        }
+                    }
+                }
+            } else {
+                // Single-node move keeps the click-point pinned under
+                // the cursor via the offset that was captured on click.
+                if (m_routingMoveNode == -2) {
+                    selTrack->routingTrackNodeX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
+                    selTrack->routingTrackNodeY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+                } else if (m_routingMoveNode == -3) {
+                    selTrack->routingMixerX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
+                    selTrack->routingMixerY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+                } else if (m_routingMoveNode >= 0 &&
+                           m_routingMoveNode < (int)nodes.size()) {
+                    RoutingNode& n = nodes[m_routingMoveNode];
+                    n.posX = (mouse.x - m_routingMoveOffsetX) - canvasPos.x;
+                    n.posY = (mouse.y - m_routingMoveOffsetY) - canvasPos.y;
+                }
+            }
             if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) m_routingMoveNode = -1;
         }
 
@@ -5353,6 +5548,7 @@ void GUIManager::renderRoutingPage() {
                 }
             }
         }
+        }   // end: else-branch of OFF-mode guard
     }
     ImGui::EndChild();
     ImGui::SameLine(0, 0);
@@ -6962,6 +7158,11 @@ void GUIManager::loadSessionFromFile(const std::string& path) {
             m_audioEngine->setSelectedTrack(sel);
         }
     }
+
+    // Push every track's freshly-loaded volume to the Antelope mixer
+    // so the hardware level immediately matches the session.
+    for (int i = 0; i < m_audioEngine->getTrackCount(); i++)
+        m_audioEngine->pushTrackVolume(i);
 
     std::cout << "Session loaded from " << filename << std::endl;
     dawLog("Session LOADED: %s (totalMixMuted=%s)",

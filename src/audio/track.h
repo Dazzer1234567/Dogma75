@@ -68,6 +68,7 @@ struct Track {
     // 0 = MULTI (per-stem output cables, uses routingOutputCables)
     // 1 = STEREO (all stems summed to L/R via a stereo mixer)
     // 2 = MONO (all stems summed to a mono mixer)
+    // 3 = OFF (routing graph ignored — track uses legacy I/O combos)
     // Each mode keeps its own cable list so switching preserves state.
     int  routingOutputMode = 0;
     std::vector<int> routingMonoOutputs;    // indices into routingNodes[] (Output kind)

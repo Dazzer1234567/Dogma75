@@ -195,6 +195,13 @@ public:
     float getTrackMeter(int trackIndex) const;
     // Instantaneous peak level (0..1) for a hardware input channel.
     // Returns 0 for out-of-range or when no input stream is active.
+    // Routing-page state (set from GUIManager each frame). When true,
+    // controller pads 0/4 stop navigating tracks and instead queue a
+    // nav intent for the GUI to consume (moves the routing canvas's
+    // Input-node selection up/down by vertical position).
+    void setRoutingPageActive(bool active) { m_routingPageActive.store(active); }
+    bool getRoutingPageActive() const      { return m_routingPageActive.load(); }
+    int  consumeRoutingNavIntent()         { return m_routingNavIntent.exchange(0); }
     float getInputMeter(int chan) const {
         if (chan < 0 || chan >= (int)m_inputMeters.size()) return 0.0f;
         const auto& m = m_inputMeters[chan];
@@ -638,6 +645,10 @@ private:
     // Scratch used by the audio callback to gather per-stem peaks
     // across the buffer before storing them atomically at the end.
     mutable std::vector<std::vector<float>>                       m_cbStemPeaks;
+    // Routing page focus + nav intent (set by pad 0/4 when the page
+    // is active, consumed by GUIManager).
+    std::atomic<bool> m_routingPageActive{false};
+    std::atomic<int>  m_routingNavIntent{0};   // -1 up, +1 down, 0 none
     // Per-input-channel instantaneous peaks + per-buffer RMS —
     // populated each buffer in the audio callback, read by the routing
     // page for its meters (peak marker + RMS bar respectively).
@@ -909,6 +920,17 @@ private:
     // Pad 24 pan-modifier. While held, E2 pans the timeline instead of
     // zooming. Firmware lights LED 8 directly on press/release.
     std::atomic<bool> m_panModifierHeld{false};
+    // Pad-24 toggled "Vol/Pan" mode: while active, encoders E1/E2 stop
+    // their normal jobs and instead adjust the selected track's volume
+    // (E1) and pan (E2). LED 8 flashes at ~2 Hz to signal the mode.
+    std::atomic<bool> m_volPanMode{false};
+    int64_t           m_volPanFlashLastMs = 0;
+    bool              m_volPanFlashOn     = false;
+    // Fine-grained encoder accumulator for E1 (volume). One dB step is
+    // applied only when the accumulated (scaled) delta crosses ±1 —
+    // needs ~100 ticks per dB, so a tiny encoder movement no longer
+    // slams the fader to its limit.
+    float             m_volPanE1Accum     = 0.0f;
 
     // Pad 3 held state — combines with pad 23 to toggle the OLED display
     // mode on the controller (firmware also tracks this locally). While
@@ -934,6 +956,12 @@ public:
     // to. Sync sites (pad 35, GUI "I" button, session load) all funnel
     // through this so the CP and our LED stay consistent.
     void setTrackInputMonitor(int trackIndex, bool on);
+    // Volume is a hardware-mixer control — the DAW plays audio at
+    // unity through ASIO and the Antelope mixer applies the level.
+    // Call this whenever a track's `volume` changes (slider drag,
+    // session load, undo restore) to push the new level to every
+    // hw output channel this track routes to.
+    void pushTrackVolume(int trackIndex);
     // Re-push every track's monitor→mute mapping to Antelope. Call after
     // AntelopeClient connects or a session loads.
     void syncAllInputMonitorsToAntelope();
@@ -945,6 +973,12 @@ private:
     std::mutex                        m_pendingAntelopeMuteMutex;
     std::vector<std::pair<int, bool>> m_pendingAntelopeMutes;  // channel, muted
     void applyPendingAntelopeMutes();
+    // Level changes from the Antelope reader thread — same queue-then
+    // -drain pattern as mutes. Second value is the 0..95 dB scale.
+    std::mutex                                          m_pendingAntelopeLevelMutex;
+    struct PendingLevel { int mixerId; int channel; int level; };
+    std::vector<PendingLevel>                           m_pendingAntelopeLevels;
+    void applyPendingAntelopeLevels();
     // Toggle one TotalMix strip mute via /1/mute/1/<stripIndex>. TotalMix
     // strips are already stereo-linked in the mixer, so one message mutes
     // the whole pair. Strip index maps to the current bank layout — with

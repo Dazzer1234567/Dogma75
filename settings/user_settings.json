@@ -1,6 +1,6 @@
 {
   "_comment": "Dogma75 User Settings - Give this file to Claude to update defaults",
-  "_saved_at": "Aug 20 2026 15:07:23",
+  "_saved_at": "Aug 21 2026 11:55:50",
 
   "gui": {
     "colorScheme": 1,
@@ -42,7 +42,7 @@
 
   "defaultSessionPath": "C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\session.json",
 
-  "recentSessions": ["C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\session.json", "C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\MULTI.json", "C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\sesh 1.json"],
+  "recentSessions": ["C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\basic.json", "C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\session.json", "C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\MULTI.json", "C:\\0_CODE\\Dogma75\\Workspace\\SESSIONS\\sesh 1.json"],
 
   "ledBrightness": [0.17, 0.62, 0.43, 0.17, 1, 0.34, 0.34, 0.51, 0.51],
 

@@ -41,6 +41,12 @@ public:
     // fields. If nothing is cached yet (we've never observed the channel
     // in a broadcast), we fall back to unity level / centre pan.
     void setChannelMute(int channelId1Based, bool muted);
+    // Set the hardware-mixer LEVEL for a channel on a specific mixer
+    // (mixerId 0 = "Mixer 1", 1 = "Mixer 2" in the Antelope UI).
+    // Antelope scale is 0 = unity/top (0 dB) up to 95 = −∞ silence.
+    // Reuses the cached pan/mute/solo/send so we don't clobber other
+    // fields.
+    void setChannelLevel(int mixerId, int channelId1Based, int level0to95);
 
     // Fired from the READER THREAD whenever an observed channel's mute
     // state changes — including changes made in the Antelope Control
@@ -53,6 +59,11 @@ public:
     // anything back, or the two ends will ping-pong forever.
     using MuteChangeCallback = std::function<void(int channelId1Based, bool muted)>;
     void setMuteChangeCallback(MuteChangeCallback cb);
+    // Level-change hook — fires from the reader thread whenever an
+    // observed channel's mixer LEVEL changes. Same threading contract
+    // as the mute callback (queue then apply on the main thread).
+    using LevelChangeCallback = std::function<void(int mixerId, int channelId1Based, int level0to95)>;
+    void setLevelChangeCallback(LevelChangeCallback cb);
 
 private:
     // Send one raw set_mixer_cfg request `[cmd, args, {}]` on our
@@ -101,7 +112,24 @@ private:
 
     mutable std::mutex                     m_stateMutex;
     std::unordered_map<uint32_t, ChState>  m_state;
+    // Outstanding echoes we're expecting back from our own writes.
+    // For each key (mixer, channel), a list of {level, timestamp_ms}.
+    // On rx, the FIRST entry matching the incoming level is popped and
+    // the callback is skipped — properly handles the case where our
+    // writes come back out-of-order or after the DAW's track.volume
+    // has moved on (which otherwise fools the naive "does track.volume
+    // == incoming level?" echo check in the caller).
+    struct PendingEcho { int level; int64_t ts; };
+    mutable std::mutex                                           m_pendingEchoMutex;
+    std::unordered_map<uint32_t, std::vector<PendingEcho>>       m_pendingEchoes;
+    static constexpr int64_t kPendingEchoTtlMs = 2000;
+    // Called from setChannelLevel to remember an expected echo.
+    void notePushedLevel(int mixerId, int channelId1Based, int level);
+    // Called from the reader BEFORE firing the callback; if the level
+    // matches an outstanding push, pops the entry and returns true.
+    bool consumePendingEcho(int mixerId, int channelId1Based, int level);
 
-    mutable std::mutex m_callbackMutex;
-    MuteChangeCallback m_onMuteChanged;
+    mutable std::mutex   m_callbackMutex;
+    MuteChangeCallback   m_onMuteChanged;
+    LevelChangeCallback  m_onLevelChanged;
 };
